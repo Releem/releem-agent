@@ -104,7 +104,7 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 				result.MethodUsed = "pt-online-schema-change"
 				return result, nil
 			}
-			return nil, fmt.Errorf("schema change execution failed: %w", err)
+			return nil, fmt.Errorf("%w", err)
 		}
 		// <<<<< TEST ONLINE DDL AGAINST EMPTY TABLE with SAME ENGINE AND SCHEMA
 		result.ChangeExecuted = true
@@ -299,6 +299,17 @@ func (e *Executor) backupWithMysqldump(options ExecuteOptions) (string, error) {
 	return backupPath, nil
 }
 
+func buildXtrabackupConnectionArgs(host, port, user, password string) []string {
+	args := []string{
+		"--user=" + user,
+		"--password=" + password,
+	}
+	if strings.HasPrefix(host, "/") {
+		return append(args, "--socket="+host)
+	}
+	return append(args, "--host="+host, "--port="+port)
+}
+
 func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) {
 	if options.Config == nil {
 		return "", fmt.Errorf("config is required for backup")
@@ -349,11 +360,8 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 		"--ftwrl-wait-timeout=15",
 		"--tables=" + tableSpec,
 		"--target-dir=" + backupDir,
-		"--user=" + user,
-		"--password=" + password,
-		"--host=" + host,
-		"--port=" + port,
 	}
+	backupArgs = append(backupArgs, buildXtrabackupConnectionArgs(host, port, user, password)...)
 
 	if options.Debug {
 		// Mask password in debug output

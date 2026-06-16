@@ -37,6 +37,36 @@ func TestBackupMethod(t *testing.T) {
 	}
 }
 
+func TestBuildXtrabackupConnectionArgsSocket(t *testing.T) {
+	args := buildXtrabackupConnectionArgs("/var/run/mysqld/mysqld.sock", "3306", "releem", "secret")
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--socket=/var/run/mysqld/mysqld.sock") {
+		t.Fatalf("xtrabackup socket args missing --socket, got %q", joined)
+	}
+	if strings.Contains(joined, "--host=") {
+		t.Fatalf("xtrabackup socket args must not include --host, got %q", joined)
+	}
+	if strings.Contains(joined, "--port=") {
+		t.Fatalf("xtrabackup socket args must not include --port, got %q", joined)
+	}
+}
+
+func TestBuildXtrabackupConnectionArgsTCP(t *testing.T) {
+	args := buildXtrabackupConnectionArgs("127.0.0.1", "3307", "releem", "secret")
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--host=127.0.0.1") {
+		t.Fatalf("xtrabackup tcp args missing --host, got %q", joined)
+	}
+	if !strings.Contains(joined, "--port=3307") {
+		t.Fatalf("xtrabackup tcp args missing --port, got %q", joined)
+	}
+	if strings.Contains(joined, "--socket=") {
+		t.Fatalf("xtrabackup tcp args must not include --socket, got %q", joined)
+	}
+}
+
 func TestRewriteDDLTargetTable(t *testing.T) {
 	testTable := "`releem_ddl_test`.`_releem_ddl_test_prerecommend_config_1`"
 
@@ -138,5 +168,3 @@ func TestRewriteDDLTargetTable_EndToEnd(t *testing.T) {
 		t.Fatalf("test SQL should not reference source table, got %q", testSQL)
 	}
 }
-
-
