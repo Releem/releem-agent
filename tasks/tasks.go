@@ -39,7 +39,9 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 		return
 	}
 
-	metrics.ReleemAgent.Tasks = models.Task{ID: TaskStruct.ID, TypeID: TaskStruct.TypeID, Status: 3}
+	startedTask := *TaskStruct
+	startedTask.Status = 3
+	metrics.ReleemAgent.Tasks = startedTask
 	utils.ProcessRepeaters(metrics, repeaters, configuration, logger, models.ModeType{Name: "Task", Type: "Status"})
 	logger.Infof(" * Task with id - %d and type id - %d is being started...", TaskStruct.ID, TaskStruct.TypeID)
 

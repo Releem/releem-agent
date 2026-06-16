@@ -39,6 +39,14 @@ func TestProcessTaskSkipsTaskType6WhenDisabled(t *testing.T) {
 		t.Fatalf("status updates = %d, want 2", len(repeater.statuses))
 	}
 
+	wantDetails := taskDetailsFromPayload(t, repeater.taskPayload)
+	if repeater.statuses[0].Details != wantDetails {
+		t.Fatalf("started status task_details = %q, want original task_details", repeater.statuses[0].Details)
+	}
+	if repeater.statuses[1].Details != wantDetails {
+		t.Fatalf("final status task_details = %q, want original task_details", repeater.statuses[1].Details)
+	}
+
 	finalStatus := repeater.statuses[1]
 	if finalStatus.ExitCode != 10 {
 		t.Fatalf("final exit code = %d, want 10", finalStatus.ExitCode)
@@ -68,6 +76,14 @@ func TestProcessTaskRunsTaskType6WhenEnabled(t *testing.T) {
 		t.Fatalf("status updates = %d, want 2", len(repeater.statuses))
 	}
 
+	wantDetails := taskDetailsFromPayload(t, repeater.taskPayload)
+	if repeater.statuses[0].Details != wantDetails {
+		t.Fatalf("started status task_details = %q, want original task_details", repeater.statuses[0].Details)
+	}
+	if repeater.statuses[1].Details != wantDetails {
+		t.Fatalf("final status task_details = %q, want original task_details", repeater.statuses[1].Details)
+	}
+
 	finalStatus := repeater.statuses[1]
 	if finalStatus.ExitCode != 2 {
 		t.Fatalf("final exit code = %d, want 2 from ApplySchemaChanges validation", finalStatus.ExitCode)
@@ -89,11 +105,12 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 	logger := *logging.Init("tasks-test", true, false, io.Discard)
 
 	tests := []struct {
-		name          string
-		details       string
-		cfg           *config.Config
-		wantExitCode  int
-		wantErrorText string
+		name           string
+		details        string
+		cfg            *config.Config
+		wantExitCode   int
+		wantErrorText  string
+		wantOutputText string
 	}{
 		{
 			name:          "invalid payload",
@@ -158,9 +175,10 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 				"ok_pitr": true,
 				"ok_online_physical_backup": true
 			}`),
-			cfg:           &config.Config{DisableSpaceChecks: true},
-			wantExitCode:  7,
-			wantErrorText: "Statement 0 failed: schema change execution failed: test schema is required for online DDL preflight",
+			cfg:            &config.Config{DisableSpaceChecks: true},
+			wantExitCode:   7,
+			wantErrorText:  "schema change execution failed: test schema is required for online DDL preflight",
+			wantOutputText: "Statement 0 failed: schema change execution failed: test schema is required for online DDL preflight",
 		},
 	}
 
@@ -177,8 +195,12 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 			if !strings.Contains(taskError, tt.wantErrorText) {
 				t.Fatalf("task error = %q, want to contain %q", taskError, tt.wantErrorText)
 			}
-			if !strings.Contains(output, tt.wantErrorText) {
-				t.Fatalf("task output = %q, want to contain %q", output, tt.wantErrorText)
+			wantOutputText := tt.wantOutputText
+			if wantOutputText == "" {
+				wantOutputText = tt.wantErrorText
+			}
+			if !strings.Contains(output, wantOutputText) {
+				t.Fatalf("task output = %q, want to contain %q", output, wantOutputText)
 			}
 		})
 	}
@@ -203,4 +225,16 @@ func boolLiteral(value bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+func taskDetailsFromPayload(t *testing.T, payload string) string {
+	t.Helper()
+
+	var rawTask struct {
+		Details string `json:"task_details"`
+	}
+	if err := json.Unmarshal([]byte(payload), &rawTask); err != nil {
+		t.Fatalf("task payload must stay valid JSON: %v", err)
+	}
+	return rawTask.Details
 }
