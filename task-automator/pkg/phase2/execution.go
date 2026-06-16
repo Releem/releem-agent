@@ -104,7 +104,7 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 				result.MethodUsed = "pt-online-schema-change"
 				return result, nil
 			}
-			return nil, fmt.Errorf("%w", err)
+			return nil, fmt.Errorf("schema change execution failed: %w", err)
 		}
 		// <<<<< TEST ONLINE DDL AGAINST EMPTY TABLE with SAME ENGINE AND SCHEMA
 		result.ChangeExecuted = true

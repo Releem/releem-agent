@@ -297,7 +297,7 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 			Debug:        configuration.Debug,
 		})
 		if err != nil {
-			logger.Info("* Schema changes execution failed: ", err.Error())
+			logger.Infof("* Statement %d failed: %s\n", i, err.Error())
 			return fail(7, fmt.Sprintf("Statement %d failed: %s\n", i, err.Error()), err.Error())
 
 		}
