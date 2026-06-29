@@ -41,41 +41,39 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 
 	var queryid, datname, query string
 	var calls int
-	var rowsSent int64
+	var rowsSent uint64
 	var total_exec_time, mean_exec_time float64
 	output_digest := make(map[string]models.MetricGroupValue)
 	var output []models.MetricGroupValue
 
 	ver_current, _ := version.NewVersion(metrics.DB.Info["Version"].(string))
-	ver_postgresql, _ := version.NewVersion("13")
 	ver_plan_cache_mode, _ := version.NewVersion("12")
 	supportsParameterizedExplain := !ver_current.LessThan(ver_plan_cache_mode)
-	// Collect DBMS internal metrics
-	pgStatStatements := PG_STAT_STATEMENTS
-	if ver_current.LessThan(ver_postgresql) {
-		pgStatStatements = PG_STAT_STATEMENTS_OLD_VERSION
+	if models.PgStatStatementsEnabled {
+		DetectPgStatStatementsSupportsRows(models.DB, DBCollectQueriesOptimization.logger)
 	}
+	pgStatStatements := PgStatStatementsQuery(ver_current)
 
 	// Collect query statistics from pg_stat_statements
 	rows, err := models.DB.Query(pgStatStatements)
 
 	if err != nil {
 		DBCollectQueriesOptimization.logger.Error(err)
-	} else {
-		defer rows.Close()
-		for rows.Next() {
-			err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rowsSent)
-			if err != nil {
-				DBCollectQueriesOptimization.logger.Error(err)
-				return err
-			}
-			queryid = normalizePgQueryID(queryid)
-
-			// Convert to microseconds for compatibility with MySQL metrics
-			total_exec_time_us := total_exec_time * 1000
-			mean_exec_time_us := mean_exec_time * 1000
-			output_digest[datname+queryid] = pgQueryMetric(datname, queryid, query, calls, total_exec_time_us, mean_exec_time_us, rowsSent)
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rowsSent)
+		if err != nil {
+			DBCollectQueriesOptimization.logger.Error(err)
+			return err
 		}
+		queryid = normalizePgQueryID(queryid)
+
+		// Convert to microseconds for compatibility with MySQL metrics
+		total_exec_time_us := total_exec_time * 1000
+		mean_exec_time_us := mean_exec_time * 1000
+		output_digest[datname+queryid] = pgQueryMetric(datname, queryid, query, calls, total_exec_time_us, mean_exec_time_us, rowsSent)
 	}
 
 	if DBCollectQueriesOptimization.configuration.QueryOptimization {
@@ -97,14 +95,9 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 		if u.IsSchemaNameExclude(database, DBCollectQueriesOptimization.configuration.DatabasesQueryOptimization) {
 			continue
 		}
-		db := u.ConnectionDatabase(DBCollectQueriesOptimization.configuration, DBCollectQueriesOptimization.logger, database)
-		if db == nil {
-			return fmt.Errorf("failed to connect to database %s", database)
-		}
-		err := CollectDbSchema(db, database, DBCollectQueriesOptimization.logger, metrics)
-		db.Close()
-		if err != nil {
-			return err
+		if err := collectDatabaseSchema(DBCollectQueriesOptimization.configuration, DBCollectQueriesOptimization.logger, database, metrics); err != nil {
+			DBCollectQueriesOptimization.logger.Error(err)
+			continue
 		}
 
 		i += 1
@@ -118,14 +111,14 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 	return nil
 }
 
-func pgQueryMetric(datname, queryid, query string, calls int, totalExecTimeUs, meanExecTimeUs float64, rowsSent int64) models.MetricGroupValue {
+func pgQueryMetric(datname, queryid, query string, calls int, totalExecTimeUs, meanExecTimeUs float64, rowsSent uint64) models.MetricGroupValue {
 	metric := pgQueryMetricLatency(datname, queryid, calls, totalExecTimeUs, meanExecTimeUs, rowsSent)
 	metric["query"] = query
 	metric["query_text"] = query
 	return metric
 }
 
-func pgQueryMetricLatency(datname, queryid string, calls int, totalExecTimeUs, meanExecTimeUs float64, rowsSent int64) models.MetricGroupValue {
+func pgQueryMetricLatency(datname, queryid string, calls int, totalExecTimeUs, meanExecTimeUs float64, rowsSent uint64) models.MetricGroupValue {
 	return models.MetricGroupValue{
 		"datname":            datname,
 		"queryid":            queryid,
@@ -134,6 +127,15 @@ func pgQueryMetricLatency(datname, queryid string, calls int, totalExecTimeUs, m
 		"mean_exec_time_us":  meanExecTimeUs,
 		"SUM_ROWS_SENT":      rowsSent,
 	}
+}
+
+func collectDatabaseSchema(configuration *config.Config, logger logging.Logger, database string, metrics *models.Metrics) error {
+	db := u.ConnectionDatabase(configuration, logger, database)
+	if db == nil {
+		return fmt.Errorf("failed to connect to database %s", database)
+	}
+	defer db.Close()
+	return CollectDbSchema(db, database, logger, metrics)
 }
 
 func pgTableSchemaMetric(tableSchema, tableName, tableType, engine, tableRows, avgRowLength, dataLength, indexLength, tableCollation string) models.MetricGroupValue {
@@ -196,6 +198,10 @@ func pgIndexSchemaMetric(tableSchema, tableName, indexName, nonUnique, seqInInde
 	}
 }
 
+func pgUserSchemaPredicate(schemaNameExpr string) string {
+	return fmt.Sprintf("%s NOT IN ('information_schema', 'pg_catalog') AND %s NOT LIKE 'pg_toast%%' AND %s NOT LIKE 'pg_temp_%%'", schemaNameExpr, schemaNameExpr, schemaNameExpr)
+}
+
 func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics *models.Metrics) error {
 	if db == nil {
 		return fmt.Errorf("database connection is nil for %s", database)
@@ -235,7 +241,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 			'NULL' AS table_collation
 		FROM information_schema.tables t
 		LEFT JOIN pg_namespace n ON n.nspname = t.table_schema
-		LEFT JOIN pg_class c ON c.relname = t.table_name AND c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+		LEFT JOIN pg_class c ON c.relname = t.table_name AND c.relnamespace = n.oid AND c.relkind IN ('r', 'v', 'm', 'f')
 		LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
 		WHERE t.table_catalog = $1
 			AND t.table_schema NOT IN ('information_schema', 'pg_catalog')
@@ -328,7 +334,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 		PREDICATE    string
 	}
 	var information_schema_index information_schema_index_type
-	rows, err = db.Query(`
+	indexSchemaQuery := fmt.Sprintf(`
 		SELECT
 			n.nspname AS table_schema,
 			tc.relname AS table_name,
@@ -367,9 +373,10 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 		JOIN pg_am am ON am.oid = ic.relam
 		CROSS JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS key_info(attnum, seq_in_index)
 		LEFT JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = key_info.attnum AND key_info.attnum > 0
-		WHERE n.nspname NOT IN ('information_schema', 'pg_catalog')
+		WHERE %s
 			AND current_database() = $1
-		ORDER BY n.nspname, tc.relname, ic.relname, key_info.seq_in_index`, database)
+		ORDER BY n.nspname, tc.relname, ic.relname, key_info.seq_in_index`, pgUserSchemaPredicate("n.nspname"))
+	rows, err = db.Query(indexSchemaQuery, database)
 	if err != nil {
 		logger.Error(err)
 		return err

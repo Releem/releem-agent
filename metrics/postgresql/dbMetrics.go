@@ -44,6 +44,8 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 		err := models.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')").Scan(&models.PgStatStatementsEnabled)
 		if err != nil {
 			DBMetricsBase.logger.Error("Error checking pg_stat_statements extension: ", err)
+		} else if models.PgStatStatementsEnabled {
+			DetectPgStatStatementsSupportsRows(models.DB, DBMetricsBase.logger)
 		}
 	}
 	{
@@ -109,12 +111,7 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 	// Query latency from pg_stat_statements if available
 	{
 		ver_current, _ := version.NewVersion(metrics.DB.Info["Version"].(string))
-		ver_postgresql, _ := version.NewVersion("13")
-		// Collect DBMS internal metrics
-		pgStatStatements := PG_STAT_STATEMENTS
-		if ver_current.LessThan(ver_postgresql) {
-			pgStatStatements = PG_STAT_STATEMENTS_OLD_VERSION
-		}
+		pgStatStatements := PgStatStatementsQuery(ver_current)
 		if models.PgStatStatementsEnabled {
 			var dealloc uint64
 			var stats_reset string
@@ -144,7 +141,7 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 			var queryid, datname string
 			var calls int
 			var total_exec_time, mean_exec_time float64
-			var rows_sent int64
+			var rows_sent uint64
 			// Collect query statistics from pg_stat_statements
 			rows, err := models.DB.Query(pgStatStatements)
 

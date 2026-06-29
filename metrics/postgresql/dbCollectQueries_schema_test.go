@@ -3,6 +3,9 @@ package postgresql
 import (
 	"strings"
 	"testing"
+
+	"github.com/Releem/mysqlconfigurer/models"
+	"github.com/hashicorp/go-version"
 )
 
 func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
@@ -53,25 +56,65 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 	}
 }
 
+func TestPostgresqlUserSchemaPredicateExcludesInternalSchemas(t *testing.T) {
+	predicate := pgUserSchemaPredicate("n.nspname")
+	for _, condition := range []string{
+		"n.nspname NOT IN ('information_schema', 'pg_catalog')",
+		"n.nspname NOT LIKE 'pg_toast%'",
+		"n.nspname NOT LIKE 'pg_temp_%'",
+	} {
+		if !strings.Contains(predicate, condition) {
+			t.Fatalf("postgresql user schema predicate should include %q: %s", condition, predicate)
+		}
+	}
+}
+
 func TestPostgresqlQueryMetricIncludesRowsSentForPlatformCollector(t *testing.T) {
 	query := pgQueryMetric("appdb", "42", "select * from orders", 3, 9000, 3000, 12)
 
-	if query["SUM_ROWS_SENT"] != int64(12) {
+	if query["SUM_ROWS_SENT"] != uint64(12) {
 		t.Fatalf("query metric should expose SUM_ROWS_SENT for rows_sent calculation: %#v", query)
 	}
 }
 
 func TestPgStatStatementsQueriesCollectRows(t *testing.T) {
 	for name, query := range map[string]string{
-		"new": PG_STAT_STATEMENTS,
-		"old": PG_STAT_STATEMENTS_OLD_VERSION,
+		"new":         PG_STAT_STATEMENTS,
+		"old":         PG_STAT_STATEMENTS_OLD_VERSION,
+		"newFallback": PG_STAT_STATEMENTS_NO_ROWS,
+		"oldFallback": PG_STAT_STATEMENTS_OLD_VERSION_NO_ROWS,
 	} {
-		if !strings.Contains(query, "sum(s.rows)") {
-			t.Fatalf("%s pg_stat_statements query should collect rows: %s", name, query)
+		if !strings.Contains(query, "rows_sent") {
+			t.Fatalf("%s pg_stat_statements query should expose rows_sent: %s", name, query)
 		}
 		if !strings.Contains(query, "NULLIF(sum(s.calls), 0)") {
 			t.Fatalf("%s pg_stat_statements query should guard mean_exec_time division: %s", name, query)
 		}
+	}
+	if !strings.Contains(PG_STAT_STATEMENTS, "sum(s.rows)") {
+		t.Fatalf("pg_stat_statements query should collect rows when supported: %s", PG_STAT_STATEMENTS)
+	}
+	if strings.Contains(PG_STAT_STATEMENTS_NO_ROWS, "sum(s.rows)") {
+		t.Fatalf("pg_stat_statements fallback query should not reference rows column: %s", PG_STAT_STATEMENTS_NO_ROWS)
+	}
+}
+
+func TestPgStatStatementsQuerySelectsRowsFallback(t *testing.T) {
+	models.PgStatStatementsSupportsRows = false
+	query := PgStatStatementsQuery(version.Must(version.NewVersion("14.0")))
+	if query != PG_STAT_STATEMENTS_NO_ROWS {
+		t.Fatalf("expected rows fallback query for PG 14, got: %s", query)
+	}
+
+	models.PgStatStatementsSupportsRows = true
+	query = PgStatStatementsQuery(version.Must(version.NewVersion("14.0")))
+	if query != PG_STAT_STATEMENTS {
+		t.Fatalf("expected rows-enabled query for PG 14, got: %s", query)
+	}
+
+	query = PgStatStatementsQuery(version.Must(version.NewVersion("12.0")))
+	if query != PG_STAT_STATEMENTS_OLD_VERSION {
+		t.Fatalf("expected old timing query for PG 12, got: %s", query)
 	}
 }
 
@@ -81,7 +124,7 @@ func TestPostgresqlBaseQueryMetricLatencyExcludesQueryText(t *testing.T) {
 	if _, ok := query["query"]; ok {
 		t.Fatalf("base query metric should not include query text: %#v", query)
 	}
-	if query["SUM_ROWS_SENT"] != int64(12) {
+	if query["SUM_ROWS_SENT"] != uint64(12) {
 		t.Fatalf("base query metric should expose SUM_ROWS_SENT: %#v", query)
 	}
 }
