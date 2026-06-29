@@ -44,8 +44,6 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 		err := models.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')").Scan(&models.PgStatStatementsEnabled)
 		if err != nil {
 			DBMetricsBase.logger.Error("Error checking pg_stat_statements extension: ", err)
-		} else if models.PgStatStatementsEnabled {
-			DetectPgStatStatementsSupportsRows(models.DB, DBMetricsBase.logger)
 		}
 	}
 	{
@@ -111,8 +109,10 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 	// Query latency from pg_stat_statements if available
 	{
 		ver_current, _ := version.NewVersion(metrics.DB.Info["Version"].(string))
-		pgStatStatements := PgStatStatementsQuery(ver_current)
 		if models.PgStatStatementsEnabled {
+			supportsRows := DetectPgStatStatementsSupportsRows(models.DB, DBMetricsBase.logger)
+			pgStatStatements := PgStatStatementsQuery(ver_current, supportsRows)
+
 			var dealloc uint64
 			var stats_reset string
 
@@ -146,26 +146,24 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 			rows, err := models.DB.Query(pgStatStatements)
 
 			if err != nil {
-				if err != sql.ErrNoRows {
+				DBMetricsBase.logger.Error(err)
+				return err
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var query string
+				err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rows_sent)
+				_ = query // shared pg_stat_statements query; omitted from base metrics payload
+				if err != nil {
 					DBMetricsBase.logger.Error(err)
+					return err
 				}
-			} else {
-				defer rows.Close()
 
-				for rows.Next() {
-					var query string
-					err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rows_sent)
-					_ = query // shared pg_stat_statements query; omitted from base metrics payload
-					if err != nil {
-						DBMetricsBase.logger.Error(err)
-						return err
-					}
-
-					// Convert to microseconds for compatibility with MySQL metrics
-					total_exec_time_us := total_exec_time * 1000
-					mean_exec_time_us := mean_exec_time * 1000
-					output = append(output, pgQueryMetricLatency(datname, queryid, calls, total_exec_time_us, mean_exec_time_us, rows_sent))
-				}
+				// Convert to microseconds for compatibility with MySQL metrics
+				total_exec_time_us := total_exec_time * 1000
+				mean_exec_time_us := mean_exec_time * 1000
+				output = append(output, pgQueryMetricLatency(datname, queryid, calls, total_exec_time_us, mean_exec_time_us, rows_sent))
 			}
 			metrics.DB.Queries = output
 		}

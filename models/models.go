@@ -91,6 +91,5 @@ var (
 	SampleQueries           map[string]string
 	SampleQueriesMutex      sync.RWMutex
 	CountEnabledConsumers   uint64
-	PgStatStatementsEnabled       bool
-	PgStatStatementsSupportsRows bool
+	PgStatStatementsEnabled bool
 )

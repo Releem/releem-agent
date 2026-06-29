@@ -3,7 +3,6 @@ package postgresql
 import (
 	"database/sql"
 
-	"github.com/Releem/mysqlconfigurer/models"
 	logging "github.com/google/logger"
 	"github.com/hashicorp/go-version"
 )
@@ -89,19 +88,18 @@ func DetectPgStatStatementsSupportsRows(db *sql.DB, logger logging.Logger) bool 
 		logger.Error("Error checking pg_stat_statements rows column: ", err)
 		return false
 	}
-	models.PgStatStatementsSupportsRows = exists
 	return exists
 }
 
-func PgStatStatementsQuery(pgVersion *version.Version) string {
+func PgStatStatementsQuery(pgVersion *version.Version, supportsRows bool) string {
 	useOldTiming := pgVersion.LessThan(version.Must(version.NewVersion("13")))
 	if useOldTiming {
-		if models.PgStatStatementsSupportsRows {
+		if supportsRows {
 			return PG_STAT_STATEMENTS_OLD_VERSION
 		}
 		return PG_STAT_STATEMENTS_OLD_VERSION_NO_ROWS
 	}
-	if models.PgStatStatementsSupportsRows {
+	if supportsRows {
 		return PG_STAT_STATEMENTS
 	}
 	return PG_STAT_STATEMENTS_NO_ROWS

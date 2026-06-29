@@ -49,10 +49,8 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 	ver_current, _ := version.NewVersion(metrics.DB.Info["Version"].(string))
 	ver_plan_cache_mode, _ := version.NewVersion("12")
 	supportsParameterizedExplain := !ver_current.LessThan(ver_plan_cache_mode)
-	if models.PgStatStatementsEnabled {
-		DetectPgStatStatementsSupportsRows(models.DB, DBCollectQueriesOptimization.logger)
-	}
-	pgStatStatements := PgStatStatementsQuery(ver_current)
+	supportsRows := DetectPgStatStatementsSupportsRows(models.DB, DBCollectQueriesOptimization.logger)
+	pgStatStatements := PgStatStatementsQuery(ver_current, supportsRows)
 
 	// Collect query statistics from pg_stat_statements
 	rows, err := models.DB.Query(pgStatStatements)
@@ -202,6 +200,10 @@ func pgUserSchemaPredicate(schemaNameExpr string) string {
 	return fmt.Sprintf("%s NOT IN ('information_schema', 'pg_catalog') AND %s NOT LIKE 'pg_toast%%' AND %s NOT LIKE 'pg_temp_%%'", schemaNameExpr, schemaNameExpr, schemaNameExpr)
 }
 
+func pgTableRelkindPredicate(relkindExpr string) string {
+	return fmt.Sprintf("%s IN ('r', 'p', 'v', 'm', 'f')", relkindExpr)
+}
+
 func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics *models.Metrics) error {
 	if db == nil {
 		return fmt.Errorf("database connection is nil for %s", database)
@@ -221,7 +223,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 	}
 	var information_schema_table information_schema_table_type
 
-	rows, err := db.Query(`
+	tableSchemaQuery := fmt.Sprintf(`
 		SELECT
 			t.table_schema,
 			t.table_name,
@@ -241,11 +243,12 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 			'NULL' AS table_collation
 		FROM information_schema.tables t
 		LEFT JOIN pg_namespace n ON n.nspname = t.table_schema
-		LEFT JOIN pg_class c ON c.relname = t.table_name AND c.relnamespace = n.oid AND c.relkind IN ('r', 'v', 'm', 'f')
+		LEFT JOIN pg_class c ON c.relname = t.table_name AND c.relnamespace = n.oid AND %s
 		LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
 		WHERE t.table_catalog = $1
-			AND t.table_schema NOT IN ('information_schema', 'pg_catalog')
-		ORDER BY t.table_schema, t.table_name`, database)
+			AND %s
+		ORDER BY t.table_schema, t.table_name`, pgTableRelkindPredicate("c.relkind"), pgUserSchemaPredicate("t.table_schema"))
+	rows, err := db.Query(tableSchemaQuery, database)
 	if err != nil {
 		logger.Error(err)
 		return err
@@ -279,7 +282,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 	}
 	var information_schema_column information_schema_column_type
 
-	rows, err = db.Query(`
+	columnSchemaQuery := fmt.Sprintf(`
 		SELECT
 			table_schema,
 			table_name,
@@ -294,8 +297,9 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 			'NULL' AS character_set_name
 		FROM information_schema.columns 
 		WHERE table_catalog = $1
-			AND table_schema NOT IN ('information_schema', 'pg_catalog')
-		ORDER BY table_schema, table_name, ordinal_position`, database)
+			AND %s
+		ORDER BY table_schema, table_name, ordinal_position`, pgUserSchemaPredicate("table_schema"))
+	rows, err = db.Query(columnSchemaQuery, database)
 	if err != nil {
 		logger.Error(err)
 		return err

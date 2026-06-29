@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/hashicorp/go-version"
 )
 
@@ -69,6 +68,13 @@ func TestPostgresqlUserSchemaPredicateExcludesInternalSchemas(t *testing.T) {
 	}
 }
 
+func TestPostgresqlTableRelkindPredicateIncludesPartitionedTables(t *testing.T) {
+	predicate := pgTableRelkindPredicate("c.relkind")
+	if !strings.Contains(predicate, "'p'") {
+		t.Fatalf("postgresql table relkind predicate should include partitioned tables: %s", predicate)
+	}
+}
+
 func TestPostgresqlQueryMetricIncludesRowsSentForPlatformCollector(t *testing.T) {
 	query := pgQueryMetric("appdb", "42", "select * from orders", 3, 9000, 3000, 12)
 
@@ -100,19 +106,17 @@ func TestPgStatStatementsQueriesCollectRows(t *testing.T) {
 }
 
 func TestPgStatStatementsQuerySelectsRowsFallback(t *testing.T) {
-	models.PgStatStatementsSupportsRows = false
-	query := PgStatStatementsQuery(version.Must(version.NewVersion("14.0")))
+	query := PgStatStatementsQuery(version.Must(version.NewVersion("14.0")), false)
 	if query != PG_STAT_STATEMENTS_NO_ROWS {
 		t.Fatalf("expected rows fallback query for PG 14, got: %s", query)
 	}
 
-	models.PgStatStatementsSupportsRows = true
-	query = PgStatStatementsQuery(version.Must(version.NewVersion("14.0")))
+	query = PgStatStatementsQuery(version.Must(version.NewVersion("14.0")), true)
 	if query != PG_STAT_STATEMENTS {
 		t.Fatalf("expected rows-enabled query for PG 14, got: %s", query)
 	}
 
-	query = PgStatStatementsQuery(version.Must(version.NewVersion("12.0")))
+	query = PgStatStatementsQuery(version.Must(version.NewVersion("12.0")), true)
 	if query != PG_STAT_STATEMENTS_OLD_VERSION {
 		t.Fatalf("expected old timing query for PG 12, got: %s", query)
 	}
