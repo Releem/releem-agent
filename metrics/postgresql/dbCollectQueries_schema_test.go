@@ -1,0 +1,87 @@
+package postgresql
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
+	table := pgTableSchemaMetric("app", "orders", "BASE TABLE", "HEAP", "42", "128", "4096", "1024", "NULL")
+	if table["TABLE_SCHEMA"] != "app" || table["TABLE_NAME"] != "orders" {
+		t.Fatalf("table identity keys are not collector-compatible: %#v", table)
+	}
+	if table["ENGINE"] != "HEAP" || table["TABLE_ROWS"] != "42" || table["AVG_ROW_LENGTH"] != "128" {
+		t.Fatalf("table statistics keys are not collector-compatible: %#v", table)
+	}
+	if table["DATA_LENGTH"] != "4096" || table["INDEX_LENGTH"] != "1024" || table["TABLE_COLLATION"] != "NULL" {
+		t.Fatalf("table size/collation keys are not collector-compatible: %#v", table)
+	}
+
+	column := pgColumnSchemaMetric("app", "orders", "customer_id", "2", "NULL", "NO", "bigint", "NULL", "64", "0", "NULL")
+	if column["COLUMN_NAME"] != "customer_id" || column["ORDINAL_POSITION"] != "2" {
+		t.Fatalf("column identity keys are not collector-compatible: %#v", column)
+	}
+	if column["CHARACTER_MAXIMUM_LENGTH"] != "NULL" || column["NUMERIC_PRECISION"] != "64" || column["NUMERIC_SCALE"] != "0" {
+		t.Fatalf("column numeric metadata keys are not collector-compatible: %#v", column)
+	}
+	if column["CHARACTER_SET_NAME"] != "NULL" {
+		t.Fatalf("postgresql columns should expose NULL character set: %#v", column)
+	}
+
+	index := pgIndexSchemaMetric("app", "orders", "idx_orders_customer", "1", "1", "customer_id", "NULL", "NULL", "NULL", "NULL", "NO", "btree", "NULL", "NULL")
+	if index["INDEX_NAME"] != "idx_orders_customer" || index["COLUMN_NAME"] != "customer_id" {
+		t.Fatalf("index identity keys are not collector-compatible: %#v", index)
+	}
+	if index["NON_UNIQUE"] != "1" || index["SEQ_IN_INDEX"] != "1" || index["INDEX_TYPE"] != "btree" {
+		t.Fatalf("index metadata keys are not collector-compatible: %#v", index)
+	}
+	if index["CARDINALITY"] != "NULL" {
+		t.Fatalf("postgresql indexes should expose NULL cardinality when estimate is unavailable: %#v", index)
+	}
+	if index["EXPRESSION"] != "NULL" {
+		t.Fatalf("plain index should expose NULL expression: %#v", index)
+	}
+
+	expressionIndex := pgIndexSchemaMetric("app", "users", "idx_users_lower_email", "1", "1", "NULL", "NULL", "NULL", "NULL", "NULL", "YES", "btree", "lower(email)", "NULL")
+	if expressionIndex["COLUMN_NAME"] != "lower(email)" || expressionIndex["EXPRESSION"] != "lower(email)" {
+		t.Fatalf("expression index should preserve expression identity in COLUMN_NAME and EXPRESSION: %#v", expressionIndex)
+	}
+
+	partialIndex := pgIndexSchemaMetric("app", "orders", "idx_orders_customer_open", "1", "1", "customer_id", "NULL", "NULL", "NULL", "NULL", "NO", "btree", "NULL", "status = 'open'")
+	if partialIndex["PREDICATE"] != "status = 'open'" {
+		t.Fatalf("partial index should preserve predicate identity: %#v", partialIndex)
+	}
+}
+
+func TestPostgresqlQueryMetricIncludesRowsSentForPlatformCollector(t *testing.T) {
+	query := pgQueryMetric("appdb", "42", "select * from orders", 3, 9000, 3000, 12)
+
+	if query["SUM_ROWS_SENT"] != int64(12) {
+		t.Fatalf("query metric should expose SUM_ROWS_SENT for rows_sent calculation: %#v", query)
+	}
+}
+
+func TestPgStatStatementsQueriesCollectRows(t *testing.T) {
+	for name, query := range map[string]string{
+		"new": PG_STAT_STATEMENTS,
+		"old": PG_STAT_STATEMENTS_OLD_VERSION,
+	} {
+		if !strings.Contains(query, "sum(s.rows)") {
+			t.Fatalf("%s pg_stat_statements query should collect rows: %s", name, query)
+		}
+		if !strings.Contains(query, "NULLIF(sum(s.calls), 0)") {
+			t.Fatalf("%s pg_stat_statements query should guard mean_exec_time division: %s", name, query)
+		}
+	}
+}
+
+func TestPostgresqlBaseQueryMetricLatencyExcludesQueryText(t *testing.T) {
+	query := pgQueryMetricLatency("appdb", "42", 3, 9000, 3000, 12)
+
+	if _, ok := query["query"]; ok {
+		t.Fatalf("base query metric should not include query text: %#v", query)
+	}
+	if query["SUM_ROWS_SENT"] != int64(12) {
+		t.Fatalf("base query metric should expose SUM_ROWS_SENT: %#v", query)
+	}
+}

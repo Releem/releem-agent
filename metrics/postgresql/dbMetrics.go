@@ -141,9 +141,10 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 			metrics.DB.Metrics.CountQueriesLatency = count_statements
 
 			var output []models.MetricGroupValue
-			var queryid, query, datname string
+			var queryid, datname string
 			var calls int
 			var total_exec_time, mean_exec_time float64
+			var rows_sent int64
 			// Collect query statistics from pg_stat_statements
 			rows, err := models.DB.Query(pgStatStatements)
 
@@ -155,7 +156,9 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 				defer rows.Close()
 
 				for rows.Next() {
-					err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time)
+					var query string
+					err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rows_sent)
+					_ = query // shared pg_stat_statements query; omitted from base metrics payload
 					if err != nil {
 						DBMetricsBase.logger.Error(err)
 						return err
@@ -164,13 +167,7 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 					// Convert to microseconds for compatibility with MySQL metrics
 					total_exec_time_us := total_exec_time * 1000
 					mean_exec_time_us := mean_exec_time * 1000
-					output = append(output, models.MetricGroupValue{
-						"datname":            datname,
-						"queryid":            queryid,
-						"calls":              calls,
-						"total_exec_time_us": total_exec_time_us,
-						"mean_exec_time_us":  mean_exec_time_us,
-					})
+					output = append(output, pgQueryMetricLatency(datname, queryid, calls, total_exec_time_us, mean_exec_time_us, rows_sent))
 				}
 			}
 			metrics.DB.Queries = output

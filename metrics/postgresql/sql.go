@@ -17,7 +17,8 @@ SELECT
 	min(s.query) as query,
 	sum(s.calls) AS calls,
 	sum(s.total_exec_time) AS total_exec_time,
-	sum(s.total_exec_time) / sum(s.calls) AS mean_exec_time
+	COALESCE(sum(s.total_exec_time) / NULLIF(sum(s.calls), 0), 0) AS mean_exec_time,
+	sum(s.rows) AS rows_sent
 FROM pg_stat_statements s
 LEFT JOIN pg_database d ON d.oid = s.dbid
 GROUP BY d.datname, s.queryid
@@ -30,7 +31,8 @@ SELECT
 	min(s.query) as query,
 	sum(s.calls) AS calls,
 	sum(s.total_time) AS total_exec_time,
-	sum(s.total_time) / sum(s.calls) AS mean_exec_time
+	COALESCE(sum(s.total_time) / NULLIF(sum(s.calls), 0), 0) AS mean_exec_time,
+	sum(s.rows) AS rows_sent
 FROM pg_stat_statements s
 LEFT JOIN pg_database d ON d.oid = s.dbid
 GROUP BY d.datname, s.queryid
