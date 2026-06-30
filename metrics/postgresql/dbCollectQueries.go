@@ -175,7 +175,9 @@ func pgColumnSchemaMetric(tableSchema, tableName, columnName, ordinalPosition, c
 }
 
 func pgIndexSchemaMetric(tableSchema, tableName, indexName, nonUnique, seqInIndex, columnName, collation, cardinality, subPart, packed, nullable, indexType, expression, predicate string) models.MetricGroupValue {
-	if columnName == "NULL" && expression != "NULL" {
+	expression = normalizePgAbsentValue(expression)
+	predicate = normalizePgAbsentValue(predicate)
+	if columnName == "NULL" && expression != "" {
 		columnName = expression
 	}
 	return models.MetricGroupValue{
@@ -367,9 +369,9 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 					WHEN key_info.attnum <= 0 THEN pg_get_indexdef(idx.indexrelid, key_info.seq_in_index::integer, true)
 					ELSE NULL
 				END,
-				'NULL'
+				''
 			) AS expression,
-			COALESCE(pg_get_expr(idx.indpred, idx.indrelid, true), 'NULL') AS predicate
+			COALESCE(pg_get_expr(idx.indpred, idx.indrelid, true), '') AS predicate
 		FROM pg_index idx
 		JOIN pg_class ic ON ic.oid = idx.indexrelid
 		JOIN pg_class tc ON tc.oid = idx.indrelid
@@ -412,6 +414,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 // PostgreSQL version of CollectionExplain - uses EXPLAIN (FORMAT JSON)
 func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting string, supportsParameterizedExplain bool, logger logging.Logger, configuration *config.Config) {
 	var schema_name_conn string
+	var searchPathSchemas []string
 	var i int
 	var db *sql.DB
 
@@ -459,8 +462,9 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 			db = u.ConnectionDatabase(configuration, logger, digests[k]["datname"].(string))
 			defer db.Close()
 			schema_name_conn = digests[k]["datname"].(string)
+			searchPathSchemas = fetchPgUserSchemas(db, logger)
 		}
-		query_explain, err := ExecuteExplain(db, digests[k]["queryid"].(string), digests[k]["query_text"].(string), supportsParameterizedExplain, logger)
+		query_explain, err := ExecuteExplainWithSearchPath(db, digests[k]["queryid"].(string), digests[k]["query_text"].(string), supportsParameterizedExplain, searchPathSchemas, logger)
 		if err != nil {
 			digests[k]["explain_error"] = err.Error()
 		}
@@ -474,6 +478,10 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 }
 
 func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParameterizedExplain bool, logger logging.Logger) (string, error) {
+	return ExecuteExplainWithSearchPath(db, queryId, queryText, supportsParameterizedExplain, nil, logger)
+}
+
+func ExecuteExplainWithSearchPath(db *sql.DB, queryId string, queryText string, supportsParameterizedExplain bool, searchPathSchemas []string, logger logging.Logger) (string, error) {
 	var explain, query_text string
 	var explain_error error
 	explain_error = nil
@@ -485,7 +493,20 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 			if isExplainPermissionError(errPrepared) {
 				return explainPrepared, errors.New("need_grant_permission")
 			}
-			explain_error = errPrepared
+			if shouldRetryPreparedExplainWithSearchPath(errPrepared, searchPathSchemas) {
+				searchPathPrepared, searchPathErr := executePreparedExplainWithSearchPath(db, queryId, queryText, searchPathSchemas)
+				if searchPathErr != nil {
+					logger.Error("Explain prepared search_path retry error: ", searchPathErr, "; queryText: ", queryText)
+					if isExplainPermissionError(searchPathErr) {
+						return searchPathPrepared, errors.New("need_grant_permission")
+					}
+					explain_error = searchPathErr
+				} else {
+					return searchPathPrepared, nil
+				}
+			} else {
+				explain_error = errPrepared
+			}
 		} else {
 			return explainPrepared, nil
 		}
@@ -535,7 +556,134 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 		return explain, explain_error
 	}
 
+	if isUndefinedRelationError(explain_error) {
+		searchPathExplain, searchPathErr := executeExplainWithSearchPath(db, queryText, searchPathSchemas)
+		if searchPathErr != nil {
+			logger.Error("Explain search_path retry error: ", searchPathErr)
+			if isExplainPermissionError(searchPathErr) {
+				explain_error = errors.New("need_grant_permission")
+				return searchPathExplain, explain_error
+			}
+			explain_error = searchPathErr
+		} else if searchPathExplain != "" {
+			return searchPathExplain, nil
+		}
+	}
+
 	return explain, explain_error
+}
+
+func normalizePgAbsentValue(value string) string {
+	if strings.TrimSpace(strings.ToLower(value)) == "null" {
+		return ""
+	}
+	return value
+}
+
+func fetchPgUserSchemas(db *sql.DB, logger logging.Logger) []string {
+	if db == nil {
+		return nil
+	}
+
+	query := fmt.Sprintf(
+		"SELECT nspname FROM pg_namespace WHERE %s ORDER BY CASE WHEN nspname = 'public' THEN 1 ELSE 0 END, nspname",
+		pgUserSchemaPredicate("nspname"),
+	)
+	rows, err := db.Query(query)
+	if err != nil {
+		logger.Error("Error collecting PostgreSQL schemas for EXPLAIN search_path retry: ", err)
+		return nil
+	}
+	defer rows.Close()
+
+	schemas := []string{}
+	for rows.Next() {
+		var schema string
+		if err = rows.Scan(&schema); err != nil {
+			logger.Error("Error scanning PostgreSQL schema for EXPLAIN search_path retry: ", err)
+			return schemas
+		}
+		schemas = append(schemas, schema)
+	}
+	return schemas
+}
+
+func executeExplainWithSearchPath(db *sql.DB, queryText string, schemas []string) (string, error) {
+	searchPath, ok := pgSearchPathList(schemas)
+	if !ok {
+		return "", fmt.Errorf("no non-public schemas available for search_path retry")
+	}
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	var lastErr error
+	for _, query := range pgExplainQueryVariants(queryText) {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return "", err
+		}
+
+		if _, err = tx.ExecContext(ctx, "SET LOCAL search_path = "+searchPath); err == nil {
+			var explain string
+			err = tx.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+query).Scan(&explain)
+			_ = tx.Rollback()
+			if err == nil {
+				return explain, nil
+			}
+		} else {
+			_ = tx.Rollback()
+		}
+
+		lastErr = err
+		if isExplainPermissionError(err) {
+			return "", err
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("search_path retry did not run")
+	}
+	return "", lastErr
+}
+
+func pgExplainQueryVariants(queryText string) []string {
+	return []string{
+		queryText,
+		strings.Replace(queryText, "\"", "'", -1),
+		strings.Replace(queryText, "\"", "`", -1),
+	}
+}
+
+func isUndefinedRelationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "relation") && strings.Contains(errText, "does not exist")
+}
+
+func pgSearchPathList(schemas []string) (string, bool) {
+	quoted := []string{}
+	hasNonPublicSchema := false
+	for _, schema := range schemas {
+		schema = strings.TrimSpace(schema)
+		if schema == "" {
+			continue
+		}
+		if strings.ToLower(schema) != "public" {
+			hasNonPublicSchema = true
+		}
+		quoted = append(quoted, `"`+strings.Replace(schema, `"`, `""`, -1)+`"`)
+	}
+	if !hasNonPublicSchema || len(quoted) == 0 {
+		return "", false
+	}
+	return strings.Join(quoted, ","), true
 }
 
 func isExplainPermissionError(err error) bool {
@@ -572,6 +720,18 @@ func containsUnquotedPgParameter(query string) bool {
 }
 
 func executePreparedExplain(db *sql.DB, queryId string, queryText string) (string, error) {
+	return executePreparedExplainWithSessionSettings(db, queryId, queryText, "")
+}
+
+func executePreparedExplainWithSearchPath(db *sql.DB, queryId string, queryText string, schemas []string) (string, error) {
+	searchPath, ok := pgSearchPathList(schemas)
+	if !ok {
+		return "", fmt.Errorf("no non-public schemas available for prepared search_path retry")
+	}
+	return executePreparedExplainWithSessionSettings(db, queryId, queryText, searchPath)
+}
+
+func executePreparedExplainWithSessionSettings(db *sql.DB, queryId string, queryText string, searchPath string) (string, error) {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -583,6 +743,13 @@ func executePreparedExplain(db *sql.DB, queryId string, queryText string) (strin
 
 	if _, err = conn.ExecContext(ctx, "SET plan_cache_mode = force_generic_plan"); err != nil {
 		return "", err
+	}
+	defer conn.ExecContext(ctx, "RESET plan_cache_mode")
+	if searchPath != "" {
+		if _, err = conn.ExecContext(ctx, "SET search_path = "+searchPath); err != nil {
+			return "", err
+		}
+		defer conn.ExecContext(ctx, "RESET search_path")
 	}
 	query := fmt.Sprintf("PREPARE %s AS %s", stmtName, queryText)
 	if _, err = conn.ExecContext(ctx, query); err != nil {
@@ -606,6 +773,14 @@ func executePreparedExplain(db *sql.DB, queryId string, queryText string) (strin
 		return "", err
 	}
 	return explain, nil
+}
+
+func shouldRetryPreparedExplainWithSearchPath(err error, schemas []string) bool {
+	if !isUndefinedRelationError(err) {
+		return false
+	}
+	_, ok := pgSearchPathList(schemas)
+	return ok
 }
 
 func normalizePgQueryID(queryID string) string {

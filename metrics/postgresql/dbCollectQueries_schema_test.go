@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -40,8 +41,8 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 	if index["CARDINALITY"] != "NULL" {
 		t.Fatalf("postgresql indexes should expose NULL cardinality when estimate is unavailable: %#v", index)
 	}
-	if index["EXPRESSION"] != "NULL" {
-		t.Fatalf("plain index should expose NULL expression: %#v", index)
+	if index["EXPRESSION"] != "" || index["PREDICATE"] != "" {
+		t.Fatalf("plain index should expose empty absent expression/predicate: %#v", index)
 	}
 
 	expressionIndex := pgIndexSchemaMetric("app", "users", "idx_users_lower_email", "1", "1", "NULL", "NULL", "NULL", "NULL", "NULL", "YES", "btree", "lower(email)", "NULL")
@@ -52,6 +53,37 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 	partialIndex := pgIndexSchemaMetric("app", "orders", "idx_orders_customer_open", "1", "1", "customer_id", "NULL", "NULL", "NULL", "NULL", "NO", "btree", "NULL", "status = 'open'")
 	if partialIndex["PREDICATE"] != "status = 'open'" {
 		t.Fatalf("partial index should preserve predicate identity: %#v", partialIndex)
+	}
+}
+
+func TestPostgresqlExplainSearchPathRetryHelpers(t *testing.T) {
+	if !isUndefinedRelationError(fmt.Errorf("pq: relation \"orders\" does not exist")) {
+		t.Fatalf("undefined relation errors should trigger search_path retry")
+	}
+	if isUndefinedRelationError(fmt.Errorf("pq: permission denied for table orders")) {
+		t.Fatalf("permission errors should not trigger search_path retry")
+	}
+
+	searchPath, ok := pgSearchPathList([]string{"app", `tenant"one`})
+	if !ok {
+		t.Fatalf("user schemas should produce a search_path")
+	}
+	if searchPath != `"app","tenant""one"` {
+		t.Fatalf("search_path should quote PostgreSQL identifiers safely, got %s", searchPath)
+	}
+
+	if _, ok := pgSearchPathList([]string{"public"}); ok {
+		t.Fatalf("public-only schema list should not add a retry search_path")
+	}
+
+	if !shouldRetryPreparedExplainWithSearchPath(fmt.Errorf("pq: relation \"orders\" does not exist"), []string{"app"}) {
+		t.Fatalf("prepared explain should retry with search_path on undefined relation")
+	}
+	if shouldRetryPreparedExplainWithSearchPath(fmt.Errorf("pq: there is no parameter $1"), []string{"app"}) {
+		t.Fatalf("prepared explain should not retry search_path for parameter binding errors")
+	}
+	if shouldRetryPreparedExplainWithSearchPath(fmt.Errorf("pq: relation \"orders\" does not exist"), []string{"public"}) {
+		t.Fatalf("prepared explain should not retry search_path without non-public schemas")
 	}
 }
 
