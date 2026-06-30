@@ -186,3 +186,8 @@
 ## 1.23.6.1
 - Updated Go toolchain and module dependencies, including `golang.org/x/crypto` to v0.52.0
 - Bumped agent, installer, configurer, and Windows script versions to 1.23.6.1
+
+## 1.23.7
+- Updated Go toolchain to 1.26.4
+- Updated Go module dependencies, including Azure, AWS, Google API, OpenTelemetry, and `golang.org/x/*` packages
+- Bumped agent, installer, configurer, and Windows script versions to 1.23.7
