@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh - Version 1.23.6.1
+# install.sh - Version 1.23.7
 # (C) Releem, Inc 2022
 # All rights reserved
 
@@ -10,7 +10,7 @@ set -e -E
 # using the package manager.
 
 # Set defaults.
-install_script_version=1.23.6.1
+install_script_version=1.23.7
 logfile="/var/log/releem-install.log"
 npipe=""
 
