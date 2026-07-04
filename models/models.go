@@ -42,6 +42,7 @@ type Metrics struct {
 			Variables MetricGroupValue
 		}
 		Info           MetricGroupValue
+		Topology       MetricGroupValue
 		Queries        []MetricGroupValue
 		DatabaseSchema map[string][]MetricGroupValue
 	}

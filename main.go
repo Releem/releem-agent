@@ -268,6 +268,7 @@ func (programm *Programm) Run() {
 			mysql.NewDBConfGatherer(logger, configuration),
 			mysql.NewDBInfoGatherer(logger, configuration),
 			mysql.NewDBMetricsBaseGatherer(logger, configuration),
+			mysql.NewDBTopologyGatherer(logger, configuration),
 			metrics.NewAgentMetricsGatherer(logger, configuration))
 
 		gatherers["metrics"] = append(gatherers["metrics"], mysql.NewDBMetricsGatherer(logger, configuration))
