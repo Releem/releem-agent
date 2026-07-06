@@ -146,24 +146,25 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 			rows, err := models.DB.Query(pgStatStatements)
 
 			if err != nil {
-				DBMetricsBase.logger.Error(err)
-				return err
-			}
-			defer rows.Close()
-
-			for rows.Next() {
-				var query string
-				err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rows_sent)
-				_ = query // shared pg_stat_statements query; omitted from base metrics payload
-				if err != nil {
+				if err != sql.ErrNoRows {
 					DBMetricsBase.logger.Error(err)
-					return err
 				}
+			} else {
+				defer rows.Close()
+				for rows.Next() {
+					var query string
+					err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rows_sent)
+					_ = query // shared pg_stat_statements query; omitted from base metrics payload
+					if err != nil {
+						DBMetricsBase.logger.Error(err)
+						return err
+					}
 
-				// Convert to microseconds for compatibility with MySQL metrics
-				total_exec_time_us := total_exec_time * 1000
-				mean_exec_time_us := mean_exec_time * 1000
-				output = append(output, pgQueryMetricLatency(datname, queryid, calls, total_exec_time_us, mean_exec_time_us, rows_sent))
+					// Convert to microseconds for compatibility with MySQL metrics
+					total_exec_time_us := total_exec_time * 1000
+					mean_exec_time_us := mean_exec_time * 1000
+					output = append(output, pgQueryMetricLatency(datname, queryid, calls, total_exec_time_us, mean_exec_time_us, rows_sent))
+				}
 			}
 			metrics.DB.Queries = output
 		}

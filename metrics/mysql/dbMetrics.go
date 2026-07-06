@@ -147,6 +147,7 @@ func (DBMetrics *DBMetricsGatherer) GetMetrics(metrics *models.Metrics) error {
 				DBMetrics.logger.Error(err)
 			}
 		} else {
+			defer rows.Close()
 			for rows.Next() {
 				err := rows.Scan(&schema_name, &query_id, &calls, &avg_time_us, &sum_time_us)
 				if err != nil {
