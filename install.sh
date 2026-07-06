@@ -200,9 +200,11 @@ function setup_mysql_connection_string() {
                 mysql_user_host="%"
             fi
             connection_string="${connection_string} --host=${RELEEM_MYSQL_HOST}"
+            root_connection_string="${root_connection_string} --host=${RELEEM_MYSQL_HOST}"
             
             if [ -n "$RELEEM_MYSQL_PORT" ]; then
                 connection_string="${connection_string} --port=${RELEEM_MYSQL_PORT}"
+                root_connection_string="${root_connection_string} --port=${RELEEM_MYSQL_PORT}"
             else
                 connection_string="${connection_string} --port=3306"
             fi
@@ -214,6 +216,7 @@ function setup_mysql_connection_string() {
         
         if [ -n "$RELEEM_MYSQL_PORT" ]; then
             connection_string="${connection_string} --port=${RELEEM_MYSQL_PORT}"
+            root_connection_string="${root_connection_string} --port=${RELEEM_MYSQL_PORT}"
         else
             connection_string="${connection_string} --port=3306"
         fi
@@ -229,7 +232,7 @@ function setup_postgresql_connection_string() {
     pg_root_peer_connection=""
 
     # Set PostgreSQL host
-    if [ -z "$RELEEM_PG_ROOT_PASSWORD" ]; then
+    if [[ -z "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
         pg_root_connection_string="${pg_root_connection_string}"
         pg_root_peer_connection="sudo -u postgres "
     else
@@ -248,6 +251,42 @@ function setup_postgresql_connection_string() {
     pg_database="${RELEEM_PG_DATABASE:-postgres}"
     pg_connection_string="${pg_connection_string} -d ${pg_database}"
     pg_root_connection_string="${pg_root_connection_string} -d ${pg_database}"
+}
+
+function postgresql_root_exec() {
+    local pg_superuser="$1"
+    shift
+
+    if [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+        PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} "$@"
+    else
+        ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} "$@" < /dev/null
+    fi
+}
+
+function postgresql_root_connection_successful() {
+    local pg_superuser="$1"
+    postgresql_root_exec "${pg_superuser}" -c "SELECT VERSION()" >/dev/null 2>&1
+}
+
+function prompt_postgresql_root_password_until_success() {
+    local pg_superuser="$1"
+
+    while true; do
+        if ! read -s -p "Please enter PostgreSQL superuser password: " RELEEM_PG_ROOT_PASSWORD; then
+            echo
+            printf "\033[31m\n Unable to read PostgreSQL superuser password.\033[0m\n"
+            return 1
+        fi
+        echo
+        setup_postgresql_connection_string
+
+        if postgresql_root_connection_successful "${pg_superuser}"; then
+            return 0
+        fi
+
+        printf "\033[31m\n PostgreSQL connection failed with the entered superuser password.\033[0m\n"
+    done
 }
 
 function detect_mysql_service() {
@@ -532,7 +571,11 @@ function create_postgresql_user() {
         printf "\033[37m - Using PostgreSQL superuser for user creation.\033[0m\n"        
         # Test connection with superuser (usually postgres)
         pg_superuser="${RELEEM_PG_ROOT_LOGIN:-postgres}"            
-        if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "SELECT VERSION()" >/dev/null 2>&1; then
+        if ! postgresql_root_connection_successful "${pg_superuser}" && [[ -z "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+            prompt_postgresql_root_password_until_success "${pg_superuser}" || true
+        fi
+
+        if postgresql_root_connection_successful "${pg_superuser}"; then
 
             printf "\033[37m - PostgreSQL connection successful.\033[0m\n"
             
@@ -541,18 +584,18 @@ function create_postgresql_user() {
             RELEEM_PG_PASSWORD=$(cat /dev/urandom | tr -cd '%*)?@#~' | head -c2 ; cat /dev/urandom | tr -cd '%*)?@#~A-Za-z0-9%*)?@#~' | head -c16 ; cat /dev/urandom | tr -cd '%*)?@#~' | head -c2 )
             
             # Update the password for an existing role, otherwise create it.
-            if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${RELEEM_PG_LOGIN}';" 2>/dev/null | grep -q "1"; then
-                PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "ALTER USER ${RELEEM_PG_LOGIN} WITH PASSWORD '${RELEEM_PG_PASSWORD}';" 2>/dev/null
+            if postgresql_root_exec "${pg_superuser}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${RELEEM_PG_LOGIN}';" 2>/dev/null | grep -q "1"; then
+                postgresql_root_exec "${pg_superuser}" -c "ALTER USER ${RELEEM_PG_LOGIN} WITH PASSWORD '${RELEEM_PG_PASSWORD}';" 2>/dev/null
                 printf "\033[32m   Updated password for existing PostgreSQL user \`${RELEEM_PG_LOGIN}\`\033[0m\n"
             else
-                PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "CREATE USER ${RELEEM_PG_LOGIN} WITH PASSWORD '${RELEEM_PG_PASSWORD}';" 2>/dev/null
+                postgresql_root_exec "${pg_superuser}" -c "CREATE USER ${RELEEM_PG_LOGIN} WITH PASSWORD '${RELEEM_PG_PASSWORD}';" 2>/dev/null
                 printf "\033[32m   Created new PostgreSQL user \`${RELEEM_PG_LOGIN}\`\033[0m\n"
             fi
             
             # Grant necessary permissions
-            PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "GRANT pg_monitor TO ${RELEEM_PG_LOGIN};" 2>/dev/null 
-            PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "GRANT SELECT ON pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null 
-            PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null 
+            postgresql_root_exec "${pg_superuser}" -c "GRANT pg_monitor TO ${RELEEM_PG_LOGIN};" 2>/dev/null
+            postgresql_root_exec "${pg_superuser}" -c "GRANT SELECT ON pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null
+            postgresql_root_exec "${pg_superuser}" -c "GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null
 
 
             # # Try to grant access to pg_stat_statements if available
@@ -562,12 +605,12 @@ function create_postgresql_user() {
             # fi
             # Check if pg_stat_statements extension is available
             FLAG_PG_STAT_STATEMENTS=1
-            if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null  | grep -q "1" 2>/dev/null; then
+            if postgresql_root_exec "${pg_superuser}" -c "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null  | grep -q "1" 2>/dev/null; then
                 printf "\033[32m - pg_stat_statements extension is available for query performance monitoring.\033[0m\n"
             else
                 printf "\033[37m - Installing pg_stat_statements extension.\033[0m\n"
                 
-                if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>/dev/null; then
+                if postgresql_root_exec "${pg_superuser}" -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>/dev/null; then
                     printf "\033[32m   Successfully installed pg_stat_statements extension.\033[0m\n"
                 else
                     FLAG_PG_STAT_STATEMENTS=0
@@ -1134,12 +1177,16 @@ then
     detect_database_type
     configure_connection_parameters
 
-    grant_privileges_sql=$($mysqlcmd  ${root_connection_string} --user=root --password=${RELEEM_MYSQL_ROOT_PASSWORD} -NBe 'select Concat("GRANT SELECT on *.* to `",User,"`@`", Host,"`;") from mysql.user where User="releem"')
-    for query in  "${grant_privileges_sql[@]}";
-    do
+    if ! mysql_root_connection_successful && [[ -z "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
+        prompt_mysql_root_password_until_success || true
+    fi
+
+    grant_privileges_sql=$($mysqlcmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" -NBe 'select Concat("GRANT SELECT on *.* to `",User,"`@`", Host,"`;") from mysql.user where User="releem"')
+    while IFS= read -r query; do
+        [ -z "$query" ] && continue
         echo "${query}"
-        $mysqlcmd  ${root_connection_string} --user=root --password=${RELEEM_MYSQL_ROOT_PASSWORD} -Be "${query}"
-    done
+        mysql_root_exec "${query}"
+    done <<< "${grant_privileges_sql}"
     if [ -z "$query_optimization" ]; then
         echo "query_optimization=true" | $sudo_cmd tee -a $RELEEM_CONF_FILE
     else

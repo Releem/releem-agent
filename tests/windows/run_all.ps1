@@ -2,7 +2,7 @@
 # Run all Releem agent Windows tests in sequence.
 #
 # Usage:
-#   .\run_all.ps1 [-Test 1|2|3|4|5|6|7|8|9|all]
+#   .\run_all.ps1 [-Test 1|2|3|4|5|6|7|8|9|10|all]
 #
 # Required env vars:
 #   RELEEM_API_KEY, MYSQL_ROOT_PASSWORD, OS_VERSION
@@ -80,6 +80,7 @@ Invoke-Test "5" "test_05_update_delegation.ps1" "Test 5: Update delegation"
 Invoke-Test "6" "test_06_reinstall_existing_install.ps1" "Test 6: Reinstall existing installation"
 Invoke-Test "8" "test_08_queue_apply.ps1" "Test 8: Queue apply"
 Invoke-Test "9" "test_09_reinstall_rewrites_config_without_prompt.ps1" "Test 9: Reinstall rewrites config without prompt"
+Invoke-Test "10" "test_10_install_prompt_root_password.ps1" "Test 10: Install with prompted root password"
 
 Write-Host ""
 Write-Host "========================================="
