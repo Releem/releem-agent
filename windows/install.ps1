@@ -91,6 +91,55 @@ function Invoke-MySQL {
     return $output
 }
 
+function Get-MySQLRootArgs {
+    $rootArgs = @('-u', 'root')
+    if ([System.Environment]::GetEnvironmentVariable('RELEEM_MYSQL_ROOT_PASSWORD') -ne $null) {
+        $rootArgs += "-p$env:RELEEM_MYSQL_ROOT_PASSWORD"
+    }
+    return $rootArgs
+}
+
+function Invoke-MySQLRoot {
+    $mysqlArgs = @('-h', $MysqlHost, '-P', $MysqlPort) + (Get-MySQLRootArgs) + $args
+    return Invoke-MySQL @mysqlArgs
+}
+
+function Test-MySQLRootConnection {
+    $null = Invoke-MySQLRoot -e 'SELECT 1;'
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Convert-SecureStringToPlainText {
+    param([System.Security.SecureString]$SecureString)
+
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+}
+
+function Prompt-MySQLRootPasswordUntilSuccess {
+    while ($true) {
+        if ([Console]::IsInputRedirected) {
+            Write-Host 'Please enter MySQL root password'
+            $env:RELEEM_MYSQL_ROOT_PASSWORD = [Console]::In.ReadLine()
+        } else {
+            $securePassword = Read-Host -Prompt 'Please enter MySQL root password' -AsSecureString
+            $env:RELEEM_MYSQL_ROOT_PASSWORD = Convert-SecureStringToPlainText $securePassword
+        }
+
+        if (Test-MySQLRootConnection) {
+            return $true
+        }
+
+        Write-Log 'ERROR: MySQL connection failed with the entered root password.'
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Helper: Stop-ReleemAgentForReplacement
 # Stops the running service and waits for the binary to be released so the
@@ -465,48 +514,39 @@ if ($env:RELEEM_MYSQL_PASSWORD -and $env:RELEEM_MYSQL_LOGIN) {
 
 } else {
     Write-Log 'Using MySQL root user.'
-    $RootPassword = if ($env:RELEEM_MYSQL_ROOT_PASSWORD) { $env:RELEEM_MYSQL_ROOT_PASSWORD } else { '' }
 
-    $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" -e 'SELECT 1;'
-    if ($LASTEXITCODE -eq 0) {
+    $rootConnectionSuccessful = Test-MySQLRootConnection
+    if (-not $rootConnectionSuccessful -and [System.Environment]::GetEnvironmentVariable('RELEEM_MYSQL_ROOT_PASSWORD') -eq $null) {
+        $rootConnectionSuccessful = Prompt-MySQLRootPasswordUntilSuccess
+    }
+
+    if ($rootConnectionSuccessful) {
         Write-Log 'MySQL connection successful.'
 
         $ReleemMysqlLogin    = 'releem'
         $charSet             = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#%'.ToCharArray()
         $ReleemMysqlPassword = -join (1..16 | ForEach-Object { $charSet | Get-Random })
 
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "DROP USER '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "CREATE USER '$ReleemMysqlLogin'$at'$MysqlUserHost' IDENTIFIED BY '$ReleemMysqlPassword';"
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT PROCESS ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT REPLICATION CLIENT ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT SHOW VIEW ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT SELECT ON mysql.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "DROP USER '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "CREATE USER '$ReleemMysqlLogin'$at'$MysqlUserHost' IDENTIFIED BY '$ReleemMysqlPassword';"
+        $null = Invoke-MySQLRoot -e "GRANT PROCESS ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT REPLICATION CLIENT ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT SHOW VIEW ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT SELECT ON mysql.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
 
         # Non-fatal performance_schema grants
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT SELECT ON performance_schema.events_statements_summary_by_digest TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT SELECT ON performance_schema.table_io_waits_summary_by_index_usage TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT SELECT ON performance_schema.file_summary_by_instance TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT SELECT ON performance_schema.events_statements_summary_by_digest TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT SELECT ON performance_schema.table_io_waits_summary_by_index_usage TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT SELECT ON performance_schema.file_summary_by_instance TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
 
         # SYSTEM_VARIABLES_ADMIN or SUPER (non-fatal)
-        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-            -e "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         if ($LASTEXITCODE -ne 0) {
-            $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-                -e "GRANT SUPER ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+            $null = Invoke-MySQLRoot -e "GRANT SUPER ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         }
 
         if ($env:RELEEM_QUERY_OPTIMIZATION) {
-            $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
-                -e "GRANT SELECT ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+            $null = Invoke-MySQLRoot -e "GRANT SELECT ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         }
 
         Write-Log "Created new user '$ReleemMysqlLogin'."
