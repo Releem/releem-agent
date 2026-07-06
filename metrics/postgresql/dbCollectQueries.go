@@ -56,7 +56,6 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 	rows, err := models.DB.Query(pgStatStatements)
 
 	if err != nil {
-		DBCollectQueriesOptimization.logger.Error(err)
 		if err != sql.ErrNoRows {
 			DBCollectQueriesOptimization.logger.Error(err)
 		}
