@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/hashicorp/go-version"
 )
 
@@ -151,6 +152,31 @@ func TestPgStatStatementsQuerySelectsRowsFallback(t *testing.T) {
 	query = PgStatStatementsQuery(version.Must(version.NewVersion("12.0")), true)
 	if query != PG_STAT_STATEMENTS_OLD_VERSION {
 		t.Fatalf("expected old timing query for PG 12, got: %s", query)
+	}
+}
+
+func TestPgStatStatementsRowsSupportIsCached(t *testing.T) {
+	models.PgStatStatementsSupportsRows = false
+	models.PgStatStatementsSupportsRowsDetected = false
+	t.Cleanup(func() {
+		models.PgStatStatementsSupportsRows = false
+		models.PgStatStatementsSupportsRowsDetected = false
+	})
+
+	calls := 0
+	probe := func() (bool, error) {
+		calls++
+		return calls == 1, nil
+	}
+
+	if !detectPgStatStatementsSupportsRows(probe, nil) {
+		t.Fatalf("first rows-support probe should return the database result")
+	}
+	if !detectPgStatStatementsSupportsRows(probe, nil) {
+		t.Fatalf("second rows-support probe should return cached result")
+	}
+	if calls != 1 {
+		t.Fatalf("rows-support detection should query once, got %d probes", calls)
 	}
 }
 

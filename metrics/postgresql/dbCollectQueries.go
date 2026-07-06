@@ -458,9 +458,13 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 		if schema_name_conn != digests[k]["datname"].(string) {
 			if db != nil {
 				db.Close()
+				db = nil
 			}
 			db = u.ConnectionDatabase(configuration, logger, digests[k]["datname"].(string))
-			defer db.Close()
+			if db == nil {
+				logger.Error("Connection to database failed: ", digests[k]["datname"].(string))
+				continue
+			}
 			schema_name_conn = digests[k]["datname"].(string)
 			searchPathSchemas = fetchPgUserSchemas(db, logger)
 		}
@@ -474,6 +478,9 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 			digests[k]["explain"] = query_explain
 			i = i + 1
 		}
+	}
+	if db != nil {
+		db.Close()
 	}
 }
 

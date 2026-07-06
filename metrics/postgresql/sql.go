@@ -3,6 +3,7 @@ package postgresql
 import (
 	"database/sql"
 
+	"github.com/Releem/mysqlconfigurer/models"
 	logging "github.com/google/logger"
 	"github.com/hashicorp/go-version"
 )
@@ -74,20 +75,41 @@ GROUP BY d.datname, s.queryid
 `
 
 func DetectPgStatStatementsSupportsRows(db *sql.DB, logger logging.Logger) bool {
-	var exists bool
-	err := db.QueryRow(`
-		SELECT EXISTS (
-			SELECT 1
-			FROM pg_attribute a
-			JOIN pg_class c ON c.oid = a.attrelid
-			WHERE c.relname = 'pg_stat_statements'
-				AND a.attname = 'rows'
-				AND NOT a.attisdropped
-		)`).Scan(&exists)
-	if err != nil {
+	return detectPgStatStatementsSupportsRows(func() (bool, error) {
+		var exists bool
+		err := db.QueryRow(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_attribute a
+				JOIN pg_class c ON c.oid = a.attrelid
+				WHERE c.relname = 'pg_stat_statements'
+					AND a.attname = 'rows'
+					AND NOT a.attisdropped
+			)`).Scan(&exists)
+		return exists, err
+	}, func(err error) {
 		logger.Error("Error checking pg_stat_statements rows column: ", err)
-		return false
+	})
+}
+
+func detectPgStatStatementsSupportsRows(probe func() (bool, error), logError func(error)) bool {
+	models.PgStatStatementsSupportsRowsMutex.Lock()
+	defer models.PgStatStatementsSupportsRowsMutex.Unlock()
+
+	if models.PgStatStatementsSupportsRowsDetected {
+		return models.PgStatStatementsSupportsRows
 	}
+
+	exists, err := probe()
+	if err != nil {
+		if logError != nil {
+			logError(err)
+		}
+		exists = false
+	}
+
+	models.PgStatStatementsSupportsRows = exists
+	models.PgStatStatementsSupportsRowsDetected = true
 	return exists
 }
 

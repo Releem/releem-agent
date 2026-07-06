@@ -87,9 +87,12 @@ type MetricsRepeater interface {
 }
 
 var (
-	DB                      *sql.DB
-	SampleQueries           map[string]string
-	SampleQueriesMutex      sync.RWMutex
-	CountEnabledConsumers   uint64
-	PgStatStatementsEnabled bool
+	DB                                   *sql.DB
+	SampleQueries                        map[string]string
+	SampleQueriesMutex                   sync.RWMutex
+	CountEnabledConsumers                uint64
+	PgStatStatementsEnabled              bool
+	PgStatStatementsSupportsRows         bool
+	PgStatStatementsSupportsRowsDetected bool
+	PgStatStatementsSupportsRowsMutex    sync.Mutex
 )
