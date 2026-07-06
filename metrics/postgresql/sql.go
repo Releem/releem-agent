@@ -105,7 +105,7 @@ func detectPgStatStatementsSupportsRows(probe func() (bool, error), logError fun
 		if logError != nil {
 			logError(err)
 		}
-		exists = false
+		return false
 	}
 
 	models.PgStatStatementsSupportsRows = exists

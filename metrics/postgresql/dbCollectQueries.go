@@ -57,21 +57,24 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 
 	if err != nil {
 		DBCollectQueriesOptimization.logger.Error(err)
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rowsSent)
-		if err != nil {
+		if err != sql.ErrNoRows {
 			DBCollectQueriesOptimization.logger.Error(err)
-			return err
 		}
-		queryid = normalizePgQueryID(queryid)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rowsSent)
+			if err != nil {
+				DBCollectQueriesOptimization.logger.Error(err)
+				return err
+			}
+			queryid = normalizePgQueryID(queryid)
 
-		// Convert to microseconds for compatibility with MySQL metrics
-		total_exec_time_us := total_exec_time * 1000
-		mean_exec_time_us := mean_exec_time * 1000
-		output_digest[datname+queryid] = pgQueryMetric(datname, queryid, query, calls, total_exec_time_us, mean_exec_time_us, rowsSent)
+			// Convert to microseconds for compatibility with MySQL metrics
+			total_exec_time_us := total_exec_time * 1000
+			mean_exec_time_us := mean_exec_time * 1000
+			output_digest[datname+queryid] = pgQueryMetric(datname, queryid, query, calls, total_exec_time_us, mean_exec_time_us, rowsSent)
+		}
 	}
 
 	if DBCollectQueriesOptimization.configuration.QueryOptimization {

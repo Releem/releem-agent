@@ -180,6 +180,37 @@ func TestPgStatStatementsRowsSupportIsCached(t *testing.T) {
 	}
 }
 
+func TestPgStatStatementsRowsSupportProbeErrorIsNotCached(t *testing.T) {
+	models.PgStatStatementsSupportsRows = false
+	models.PgStatStatementsSupportsRowsDetected = false
+	t.Cleanup(func() {
+		models.PgStatStatementsSupportsRows = false
+		models.PgStatStatementsSupportsRowsDetected = false
+	})
+
+	calls := 0
+	probe := func() (bool, error) {
+		calls++
+		if calls == 1 {
+			return false, fmt.Errorf("temporary connection error")
+		}
+		return true, nil
+	}
+
+	if detectPgStatStatementsSupportsRows(probe, nil) {
+		t.Fatalf("failed rows-support probe should return false")
+	}
+	if models.PgStatStatementsSupportsRowsDetected {
+		t.Fatalf("failed rows-support probe should not mark detection complete")
+	}
+	if !detectPgStatStatementsSupportsRows(probe, nil) {
+		t.Fatalf("successful retry should return the database result")
+	}
+	if calls != 2 {
+		t.Fatalf("rows-support detection should retry after a probe error, got %d probes", calls)
+	}
+}
+
 func TestPostgresqlBaseQueryMetricLatencyExcludesQueryText(t *testing.T) {
 	query := pgQueryMetricLatency("appdb", "42", 3, 9000, 3000, 12)
 
