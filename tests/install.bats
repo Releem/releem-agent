@@ -312,6 +312,36 @@ exit 0
     [ "$status" -eq 0 ]
 }
 
+@test "create_postgresql_user grants pg_read_all_data when query optimization is enabled" {
+    create_mock_cmd "psql" '
+query="$*"
+printf "PGPASSWORD=%s args=%s\n" "${PGPASSWORD-__unset__}" "$query" >> "${PG_ARGS_LOG}"
+if [[ "$query" == *"pg_extension WHERE extname = '"'"'pg_stat_statements'"'"'"* ]]; then
+  echo "1"
+fi
+exit 0
+'
+
+    run env \
+        RELEEM_PG_ROOT_PASSWORD="rootpwd" \
+        RELEEM_QUERY_OPTIMIZATION="true" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            pg_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            unset RELEEM_PG_LOGIN RELEEM_PG_PASSWORD
+            create_postgresql_user
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
+
+    [ "$status" -eq 0 ]
+    run grep -F -- "PGPASSWORD=rootpwd args=-h 127.0.0.1 -p 5432 -d postgres -U postgres -c GRANT pg_read_all_data TO releem;" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+}
+
 @test "postgresql_root_exec omits PGPASSWORD for root when root password env is unset" {
     create_mock_cmd "psql" '
 printf "PGPASSWORD=%s args=%s\n" "${PGPASSWORD-__unset__}" "$*" >> "${PG_ARGS_LOG}"
@@ -850,6 +880,49 @@ exit 0
     run grep -F -- "--user=root --password=promptedpwd -NBe select Concat(" "${mysql_args}"
     [ "$status" -eq 0 ]
     run grep -F -- "--user=root --password=promptedpwd -Be GRANT SELECT on *.* to" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -E "^query_optimization=true$" "${conf}"
+    [ "$status" -eq 0 ]
+    run grep -E "^-p$" "${workdir}/calls.log"
+    [ "$status" -eq 0 ]
+}
+
+@test "enable_query_optimization mode supports postgresql without mysql root commands" {
+    prepare_common_install_mocks
+    create_mock_cmd "psql" '
+printf "%s\n" "$*" >> "${PG_ARGS_LOG}"
+exit 0
+'
+    create_mock_cmd "pg_isready" 'exit 0'
+    create_mock_cmd "mysqladmin" 'echo "mysqladmin should not be called" >&2; exit 99'
+    create_mock_cmd "mysql" 'echo "mysql should not be called" >&2; exit 99'
+    create_mock_cmd "mariadb-admin" 'echo "mariadb-admin should not be called" >&2; exit 99'
+    create_mock_cmd "mariadb" 'echo "mariadb should not be called" >&2; exit 99'
+
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    mkdir -p "${workdir}"
+    printf 'apikey="k1"\n' > "${conf}"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${workdir}/releem-agent"
+    printf '#!/usr/bin/env bash\necho "$@" >> "%s/calls.log"\nexit 0\n' "${workdir}" > "${workdir}/mysqlconfigurer.sh"
+    chmod +x "${workdir}/releem-agent" "${workdir}/mysqlconfigurer.sh"
+    cp "${INSTALL_SH}" "${MOCK_BIN}/enable_query_optimization"
+    chmod +x "${MOCK_BIN}/enable_query_optimization"
+
+    PATH="${MOCK_BIN}:${PATH}" run env \
+        RELEEM_TEST_MODE=1 \
+        RELEEM_WORKDIR="${workdir}" \
+        RELEEM_CONF_FILE="${conf}" \
+        RELEEM_API_KEY="k1" \
+        RELEEM_PG_HOST="127.0.0.1" \
+        RELEEM_PG_PORT="5432" \
+        RELEEM_PG_ROOT_PASSWORD="rootpwd" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        RELEEM_CRON_ENABLE="1" \
+        enable_query_optimization
+
+    [ "$status" -eq 0 ]
+    run grep -F -- "-U postgres -c GRANT pg_read_all_data TO releem;" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
     run grep -E "^query_optimization=true$" "${conf}"
     [ "$status" -eq 0 ]

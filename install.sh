@@ -596,6 +596,9 @@ function create_postgresql_user() {
             postgresql_root_exec "${pg_superuser}" -c "GRANT pg_monitor TO ${RELEEM_PG_LOGIN};" 2>/dev/null
             postgresql_root_exec "${pg_superuser}" -c "GRANT SELECT ON pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null
             postgresql_root_exec "${pg_superuser}" -c "GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null
+            if [ -n "$RELEEM_QUERY_OPTIMIZATION" ]; then
+                postgresql_root_exec "${pg_superuser}" -c "GRANT pg_read_all_data TO ${RELEEM_PG_LOGIN};" 2>/dev/null
+            fi
 
 
             # # Try to grant access to pg_stat_statements if available
@@ -1177,16 +1180,26 @@ then
     detect_database_type
     configure_connection_parameters
 
-    if ! mysql_root_connection_successful && [[ -z "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
-        prompt_mysql_root_password_until_success || true
+    if [ "$database_type" == "mysql" ]; then
+        if ! mysql_root_connection_successful && [[ -z "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
+            prompt_mysql_root_password_until_success || true
+        fi
+
+        grant_privileges_sql=$($mysqlcmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" -NBe 'select Concat("GRANT SELECT on *.* to `",User,"`@`", Host,"`;") from mysql.user where User="releem"')
+        while IFS= read -r query; do
+            [ -z "$query" ] && continue
+            echo "${query}"
+            mysql_root_exec "${query}"
+        done <<< "${grant_privileges_sql}"
+    elif [ "$database_type" == "postgresql" ]; then
+        pg_superuser="${RELEEM_PG_ROOT_LOGIN:-postgres}"
+        if ! postgresql_root_connection_successful "${pg_superuser}" && [[ -z "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+            prompt_postgresql_root_password_until_success "${pg_superuser}" || true
+        fi
+
+        postgresql_root_exec "${pg_superuser}" -c "GRANT pg_read_all_data TO releem;" 2>/dev/null
     fi
 
-    grant_privileges_sql=$($mysqlcmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" -NBe 'select Concat("GRANT SELECT on *.* to `",User,"`@`", Host,"`;") from mysql.user where User="releem"')
-    while IFS= read -r query; do
-        [ -z "$query" ] && continue
-        echo "${query}"
-        mysql_root_exec "${query}"
-    done <<< "${grant_privileges_sql}"
     if [ -z "$query_optimization" ]; then
         echo "query_optimization=true" | $sudo_cmd tee -a $RELEEM_CONF_FILE
     else
