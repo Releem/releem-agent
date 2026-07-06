@@ -4,7 +4,7 @@ End-to-end tests for `install.sh`, `mysqlconfigurer.sh` (Linux) and `windows/ins
 
 Tests run on GCP spot (preemptible) VMs provisioned by Terraform, torn down after each run.
 
-## Test Workflows
+## Linux Test Workflows
 
 | # | Name | Description |
 |---|------|-------------|
@@ -14,6 +14,21 @@ Tests run on GCP spot (preemptible) VMs provisioned by Terraform, torn down afte
 | 4 | Rollback configuration | Rolls back the applied config via `mysqlconfigurer.sh -r` |
 
 Tests 3 and 4 depend on test 1 having run first. The run_all scripts handle this automatically.
+
+## Windows Test Workflows
+
+| # | Name | Description |
+|---|------|-------------|
+| 1 | Fresh install (auto user) | Installs agent; script creates the `releem` MySQL user automatically |
+| 2 | Install with existing user | `releem` MySQL user is pre-created; install.ps1 uses provided credentials |
+| 3 | Apply configuration | Applies the API-recommended MySQL configuration |
+| 4 | Rollback configuration | Rolls back the applied config |
+| 5 | Update delegation | Verifies update flow delegation |
+| 6 | Reinstall existing installation | Reinstalls over an existing agent installation |
+| 7 | Apply without restart | Applies configuration without restarting MySQL |
+| 8 | Queue apply | Verifies queued apply behavior |
+| 9 | Reinstall rewrites config without prompt | Reinstalls without interactive credential prompts |
+| 10 | Install with prompted root password | Installs without `RELEEM_MYSQL_ROOT_PASSWORD` and supplies the root password interactively |
 
 ## Supported Matrices
 
@@ -62,11 +77,21 @@ export MYSQL_ROOT_PASSWORD="SomeSecurePassword123!"
 
 ### Running Windows tests locally
 
-```powershell
-# Windows test runner script (TODO: implement run_tests_windows.sh)
-# For now, manually provision a GCP Windows Server 2022 VM,
-# copy tests/windows/ and windows/*.ps1 scripts, and run:
-.\run_all.ps1 -Test all
+```bash
+cd tests
+
+export RELEEM_API_KEY="4170dfb9-d55f-4de5-bcc9-555f9187ce98"
+export GCP_PROJECT="your-gcp-project-id"
+export MYSQL_ROOT_PASSWORD="SomeSecurePassword123!"
+
+# Run all Windows tests on Windows Server 2022 + MySQL 8.0
+./run_tests_windows.sh --db mysql-8.0
+
+# Run only test 10, which validates the prompted root password install flow
+./run_tests_windows.sh --db mysql-8.0 --test 10
+
+# Keep the VM alive after tests (for debugging)
+./run_tests_windows.sh --db mysql-8.0 --test 10 --keep-vm
 ```
 
 ## Running in GitHub Actions
@@ -102,6 +127,7 @@ Or simply: `roles/compute.instanceAdmin.v1`
 tests/
 ├── README.md                            # This file
 ├── run_tests_local.sh                   # Local Linux test orchestrator
+├── run_tests_windows.sh                 # Local Windows test orchestrator
 ├── gcp/terraform/
 │   ├── main.tf                          # GCP VM Terraform definition
 │   ├── variables.tf                     # Input variables
@@ -122,5 +148,11 @@ tests/
     ├── test_02_install_existing_user.ps1
     ├── test_03_apply_config.ps1
     ├── test_04_rollback_config.ps1
+    ├── test_05_update_delegation.ps1
+    ├── test_06_reinstall_existing_install.ps1
+    ├── test_07_apply_without_restart.ps1
+    ├── test_08_queue_apply.ps1
+    ├── test_09_reinstall_rewrites_config_without_prompt.ps1
+    ├── test_10_install_prompt_root_password.ps1
     └── run_all.ps1                      # Run all Windows tests
 ```

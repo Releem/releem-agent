@@ -87,15 +87,18 @@ echo "200"
 }
 
 @test "setup_mysql_connection_string builds host and default port" {
-    load_install_functions
-    unset RELEEM_MYSQL_PORT
-    RELEEM_MYSQL_HOST="10.1.2.3"
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        unset RELEEM_MYSQL_PORT
+        RELEEM_MYSQL_HOST="10.1.2.3"
+        setup_mysql_connection_string >/dev/null
+        printf "conn=%s\nroot=%s\nhost=%s\n" "$connection_string" "$root_connection_string" "$mysql_user_host"
+    ' _ "${INSTALL_SH}"
 
-    run setup_mysql_connection_string
     [ "$status" -eq 0 ]
-    [[ "$connection_string" == *"--host=10.1.2.3"* ]]
-    [[ "$connection_string" == *"--port=3306"* ]]
-    [ "$mysql_user_host" = "%" ]
+    [[ "$output" == *"conn= --host=10.1.2.3 --port=3306"* ]]
+    [[ "$output" == *"root= --host=10.1.2.3"* ]]
+    [[ "$output" == *"host=%"* ]]
 }
 
 @test "setup_mysql_connection_string uses socket and localhost host marker" {
@@ -121,6 +124,22 @@ echo "200"
     [[ "$pg_connection_string" == *"-h 10.2.0.3"* ]]
     [[ "$pg_connection_string" == *"-p 5433"* ]]
     [ "$pg_root_peer_connection" = "sudo -u postgres " ]
+}
+
+@test "setup_postgresql_connection_string uses explicit empty root password when env is set" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        RELEEM_PG_ROOT_PASSWORD=""
+        RELEEM_PG_HOST="10.2.0.3"
+        RELEEM_PG_PORT="5433"
+        setup_postgresql_connection_string >/dev/null
+        printf "root=%s\npeer=%s\n" "$pg_root_connection_string" "$pg_root_peer_connection"
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"root= -h 10.2.0.3 -p 5433 -d postgres"* ]]
+    [[ "$output" == *"peer="* ]]
+    [[ "$output" != *"peer=sudo -u postgres "* ]]
 }
 
 @test "detect_instance_type defaults to local and accepts override" {
@@ -290,6 +309,147 @@ exit 0
 
     [ "$status" -eq 0 ]
     run grep -E "^FLAG_PG_STAT_STATEMENTS=1$" "${TEST_TMPDIR}/pg-stat-flag.log"
+    [ "$status" -eq 0 ]
+}
+
+@test "postgresql_root_exec omits PGPASSWORD for root when root password env is unset" {
+    create_mock_cmd "psql" '
+printf "PGPASSWORD=%s args=%s\n" "${PGPASSWORD-__unset__}" "$*" >> "${PG_ARGS_LOG}"
+exit 0
+'
+
+    run env -u RELEEM_PG_ROOT_PASSWORD \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-p 5432 -d postgres"
+            postgresql_root_exec postgres -c "SELECT 1;"
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
+
+    [ "$status" -eq 0 ]
+    run grep -F "PGPASSWORD=__unset__" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+}
+
+@test "postgresql_root_exec keeps empty PGPASSWORD when root password env is set to empty string" {
+    create_mock_cmd "psql" '
+printf "PGPASSWORD=%s args=%s\n" "${PGPASSWORD-__unset__}" "$*" >> "${PG_ARGS_LOG}"
+exit 0
+'
+
+    run env \
+        RELEEM_PG_ROOT_PASSWORD="" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            postgresql_root_exec postgres -c "SELECT 1;"
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
+
+    [ "$status" -eq 0 ]
+    run grep -F "PGPASSWORD= args=-h 127.0.0.1 -p 5432 -d postgres -U postgres -c SELECT 1;" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+}
+
+@test "create_postgresql_user prompts for root password when env is unset and passwordless root fails" {
+    create_mock_cmd "psql" '
+query="$*"
+user=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -U) user="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf "user=%s PGPASSWORD=%s query=%s\n" "$user" "${PGPASSWORD-__unset__}" "$query" >> "${PG_ARGS_LOG}"
+if [ "$user" = "postgres" ] && [ "${PGPASSWORD-__unset__}" != "pgprompt" ]; then
+  read -r _stolen_password || true
+  exit 1
+fi
+if [[ "$query" == *"pg_extension WHERE extname = '"'"'pg_stat_statements'"'"'"* ]]; then
+  echo "1"
+fi
+exit 0
+'
+
+    run env -u RELEEM_PG_ROOT_PASSWORD \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-p 5432 -d postgres"
+            pg_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            unset RELEEM_PG_LOGIN RELEEM_PG_PASSWORD
+            create_postgresql_user
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" <<< "pgprompt"
+
+    [ "$status" -eq 0 ]
+    run head -n 1 "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"user=postgres PGPASSWORD=__unset__"* ]]
+    run grep -F "user=postgres PGPASSWORD=pgprompt" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+}
+
+@test "create_postgresql_user keeps prompting until entered root password works" {
+    create_mock_cmd "psql" '
+query="$*"
+user=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -U) user="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf "user=%s PGPASSWORD=%s query=%s\n" "$user" "${PGPASSWORD-__unset__}" "$query" >> "${PG_ARGS_LOG}"
+if [ "$user" = "postgres" ] && [ "${PGPASSWORD-__unset__}" != "pgprompt" ]; then
+  exit 1
+fi
+if [[ "$query" == *"pg_extension WHERE extname = '"'"'pg_stat_statements'"'"'"* ]]; then
+  echo "1"
+fi
+exit 0
+'
+
+    run env -u RELEEM_PG_ROOT_PASSWORD \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-p 5432 -d postgres"
+            pg_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            unset RELEEM_PG_LOGIN RELEEM_PG_PASSWORD
+            create_postgresql_user
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" <<< "wrongpg
+pgprompt"
+
+    [ "$status" -eq 0 ]
+    run grep -F "user=postgres PGPASSWORD=wrongpg" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F "user=postgres PGPASSWORD=pgprompt" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F "user=postgres PGPASSWORD=wrongpg" "${TEST_TMPDIR}/pg.args"
+    [ "${#lines[@]}" -eq 1 ]
+}
+
+@test "windows installer uses conditional MySQL root password args" {
+    run grep -F '"-p$RootPassword"' "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -ne 0 ]
+
+    run grep -F "Get-MySQLRootArgs" "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+
+    run grep -F "Prompt-MySQLRootPasswordUntilSuccess" "${REPO_ROOT}/windows/install.ps1"
     [ "$status" -eq 0 ]
 }
 
@@ -569,20 +729,31 @@ promptedpwd"
     create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
     create_mock_cmd "mariadb-admin" 'echo "mysqld is alive"'
     create_mock_cmd "mysql" '
-if [[ "$*" == *"-NBe"* ]]; then
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
   echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
+elif [[ "$*" == *"-Be GRANT SELECT on *.* to"* ]]; then
+  exit 0
+elif [[ "$*" == *"--user=root"* ]]; then
+  exit 64
 fi
 exit 0
 '
     create_mock_cmd "mariadb" '
-if [[ "$*" == *"-NBe"* ]]; then
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
   echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
+elif [[ "$*" == *"-Be GRANT SELECT on *.* to"* ]]; then
+  exit 0
+elif [[ "$*" == *"--user=root"* ]]; then
+  exit 64
 fi
 exit 0
 '
 
     local workdir="${TEST_TMPDIR}/workdir"
     local conf="${workdir}/releem.conf"
+    local mysql_args="${TEST_TMPDIR}/mysql.args"
     mkdir -p "${workdir}"
     printf 'apikey="k1"\n' > "${conf}"
     printf '#!/usr/bin/env bash\nexit 0\n' > "${workdir}/releem-agent"
@@ -597,9 +768,88 @@ exit 0
         RELEEM_CONF_FILE="${conf}" \
         RELEEM_API_KEY="k1" \
         RELEEM_MYSQL_ROOT_PASSWORD="rootpwd" \
+        MYSQL_ARGS_LOG="${mysql_args}" \
         RELEEM_CRON_ENABLE="1" \
         enable_query_optimization
 
+    [ "$status" -eq 0 ]
+    run grep -F -- "-NBe select Concat(" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "-Be GRANT SELECT on *.* to" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -E "^query_optimization=true$" "${conf}"
+    [ "$status" -eq 0 ]
+    run grep -E "^-p$" "${workdir}/calls.log"
+    [ "$status" -eq 0 ]
+}
+
+@test "enable_query_optimization mode prompts for root password when env is unset" {
+    prepare_common_install_mocks
+    create_mock_cmd "mysqladmin" '
+printf "%s\n" "$*" >> "${MYSQLADMIN_ARGS_LOG}"
+if [[ "$*" == *"--user=root"* && "$*" != *"--password=promptedpwd"* ]]; then
+  exit 1
+fi
+echo "mysqld is alive"
+'
+    create_mock_cmd "mariadb-admin" '
+printf "%s\n" "$*" >> "${MYSQLADMIN_ARGS_LOG}"
+if [[ "$*" == *"--user=root"* && "$*" != *"--password=promptedpwd"* ]]; then
+  exit 1
+fi
+echo "mysqld is alive"
+'
+    create_mock_cmd "mysql" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"--user=root"* && "$*" != *"--password=promptedpwd"* ]]; then
+  exit 1
+fi
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
+  echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
+fi
+exit 0
+'
+    create_mock_cmd "mariadb" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"--user=root"* && "$*" != *"--password=promptedpwd"* ]]; then
+  exit 1
+fi
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
+  echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
+fi
+exit 0
+'
+
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    local mysqladmin_args="${TEST_TMPDIR}/mysqladmin.args"
+    local mysql_args="${TEST_TMPDIR}/mysql.args"
+    mkdir -p "${workdir}"
+    printf 'apikey="k1"\n' > "${conf}"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${workdir}/releem-agent"
+    printf '#!/usr/bin/env bash\necho "$@" >> "%s/calls.log"\nexit 0\n' "${workdir}" > "${workdir}/mysqlconfigurer.sh"
+    chmod +x "${workdir}/releem-agent" "${workdir}/mysqlconfigurer.sh"
+    cp "${INSTALL_SH}" "${MOCK_BIN}/enable_query_optimization"
+    chmod +x "${MOCK_BIN}/enable_query_optimization"
+
+    PATH="${MOCK_BIN}:${PATH}" run env -u RELEEM_MYSQL_ROOT_PASSWORD \
+        RELEEM_TEST_MODE=1 \
+        RELEEM_WORKDIR="${workdir}" \
+        RELEEM_CONF_FILE="${conf}" \
+        RELEEM_API_KEY="k1" \
+        MYSQLADMIN_ARGS_LOG="${mysqladmin_args}" \
+        MYSQL_ARGS_LOG="${mysql_args}" \
+        RELEEM_CRON_ENABLE="1" \
+        enable_query_optimization <<< "promptedpwd"
+
+    [ "$status" -eq 0 ]
+    run grep -F -- "--user=root ping" "${mysqladmin_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "--user=root --password=promptedpwd ping" "${mysqladmin_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "--user=root --password=promptedpwd -NBe select Concat(" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "--user=root --password=promptedpwd -Be GRANT SELECT on *.* to" "${mysql_args}"
     [ "$status" -eq 0 ]
     run grep -E "^query_optimization=true$" "${conf}"
     [ "$status" -eq 0 ]
