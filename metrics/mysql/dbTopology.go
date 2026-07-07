@@ -3,6 +3,7 @@ package mysql
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -38,6 +39,7 @@ type asyncReplicaChannel struct {
 	lagOK            bool
 	state            string
 	severity         int
+	sortKey          string
 	facts            models.MetricGroupValue
 }
 
@@ -137,14 +139,14 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 	for idx, replicaStatus := range replicaStatuses {
 		channel := analyzeAsyncReplicaChannel(replicaStatus)
 		channels = append(channels, channel.facts)
-		if idx == 0 || channel.severity > selected.severity {
+		if idx == 0 || preferAsyncReplicaChannel(channel, selected) {
 			selected = channel
 		}
 	}
 
 	topology["Type"] = "async_replication"
 	topology["Role"] = "replica"
-	topology["GroupKey"] = firstNonEmpty(selected.primaryMemberKey, selected.primaryHost, firstString(variables, "server_uuid"))
+	topology["GroupKey"] = asyncReplicaGroupKey(replicaStatuses, firstString(variables, "server_uuid"), selected)
 	topology["PrimaryMemberKey"] = nullableString(selected.primaryMemberKey)
 	topology["PrimaryHost"] = nullableString(selected.primaryHost)
 	topology["IsWriter"] = false
@@ -184,6 +186,7 @@ func analyzeAsyncReplicaChannel(replicaStatus map[string]interface{}) asyncRepli
 		lagOK:            lagOK,
 		state:            state,
 		severity:         asyncReplicationStateSeverity(state),
+		sortKey:          firstNonEmpty(primaryMemberKey, primaryHost),
 		facts:            selectReplicaStatusFacts(replicaStatus),
 	}
 }
@@ -354,6 +357,48 @@ func asyncReplicationStateSeverity(state string) int {
 	default:
 		return 0
 	}
+}
+
+func preferAsyncReplicaChannel(candidate asyncReplicaChannel, selected asyncReplicaChannel) bool {
+	if candidate.severity != selected.severity {
+		return candidate.severity > selected.severity
+	}
+	if candidate.state == "lagging" && selected.state == "lagging" && candidate.lagOK && selected.lagOK && candidate.lagValue != selected.lagValue {
+		return candidate.lagValue > selected.lagValue
+	}
+	if candidate.sortKey == "" {
+		return false
+	}
+	if selected.sortKey == "" {
+		return true
+	}
+	return candidate.sortKey < selected.sortKey
+}
+
+func asyncReplicaGroupKey(replicaStatuses []map[string]interface{}, serverUUID string, selected asyncReplicaChannel) string {
+	if len(replicaStatuses) <= 1 {
+		return firstNonEmpty(selected.primaryMemberKey, selected.primaryHost, serverUUID)
+	}
+
+	keys := make([]string, 0, len(replicaStatuses))
+	seen := map[string]struct{}{}
+	for _, replicaStatus := range replicaStatuses {
+		channel := analyzeAsyncReplicaChannel(replicaStatus)
+		key := firstNonEmpty(channel.primaryMemberKey, channel.primaryHost)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return firstNonEmpty(serverUUID, selected.primaryMemberKey, selected.primaryHost)
+	}
+	sort.Strings(keys)
+	return "multi-source:" + strings.Join(keys, ",")
 }
 
 func truthy(value string) bool {

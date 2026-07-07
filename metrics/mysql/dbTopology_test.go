@@ -118,6 +118,9 @@ func TestBuildTopologyFromFactsUsesWorstAsyncReplicationChannel(t *testing.T) {
 	if topology["ReplicationState"] != "stopped" {
 		t.Fatalf("expected stopped state from worst channel, got %#v", topology["ReplicationState"])
 	}
+	if topology["GroupKey"] != "multi-source:healthy-primary-uuid,stopped-primary-uuid" {
+		t.Fatalf("expected stable multi-source group key, got %#v", topology["GroupKey"])
+	}
 
 	facts := topology["Facts"].(models.MetricGroupValue)
 	replicaStatus := facts["ReplicaStatus"].(models.MetricGroupValue)
@@ -133,6 +136,44 @@ func TestBuildTopologyFromFactsUsesWorstAsyncReplicationChannel(t *testing.T) {
 	}
 	if _, ok := channels[0]["Another_Unused_Field"]; ok {
 		t.Fatalf("expected unused replica channel fields to be trimmed")
+	}
+}
+
+func TestBuildTopologyFromFactsBreaksAsyncReplicationTiesByLag(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":     "replica-uuid",
+			"read_only":       "ON",
+			"super_read_only": "ON",
+		},
+		ReplicaStatus: []map[string]interface{}{
+			{
+				"Channel_Name":          "low-lag-channel",
+				"Source_Host":           "low-lag-primary.example.com",
+				"Source_UUID":           "low-lag-primary-uuid",
+				"Replica_IO_Running":    "Yes",
+				"Replica_SQL_Running":   "Yes",
+				"Seconds_Behind_Source": "5",
+			},
+			{
+				"Channel_Name":          "high-lag-channel",
+				"Source_Host":           "high-lag-primary.example.com",
+				"Source_UUID":           "high-lag-primary-uuid",
+				"Replica_IO_Running":    "Yes",
+				"Replica_SQL_Running":   "Yes",
+				"Seconds_Behind_Source": "30",
+			},
+		},
+	})
+
+	if topology["PrimaryMemberKey"] != "high-lag-primary-uuid" {
+		t.Fatalf("expected higher-lag channel primary uuid, got %#v", topology["PrimaryMemberKey"])
+	}
+	if topology["ReplicationLagSeconds"] != int64(30) {
+		t.Fatalf("expected higher lag at top level, got %#v", topology["ReplicationLagSeconds"])
+	}
+	if topology["GroupKey"] != "multi-source:high-lag-primary-uuid,low-lag-primary-uuid" {
+		t.Fatalf("expected stable sorted multi-source group key, got %#v", topology["GroupKey"])
 	}
 }
 
