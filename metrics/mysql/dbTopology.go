@@ -112,7 +112,7 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		"PrimaryMemberKey":      nil,
 		"PrimaryHost":           nil,
 		"IsWriter":              !readOnly && !superReadOnly,
-		"IsReader":              readOnly || superReadOnly,
+		"IsReader":              topologyIsReader("healthy"),
 		"ReadOnly":              readOnly,
 		"SuperReadOnly":         superReadOnly,
 		"ReplicationLagSeconds": nil,
@@ -152,6 +152,7 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 	topology["PrimaryMemberKey"] = nullableString(selected.primaryMemberKey)
 	topology["PrimaryHost"] = nullableString(selected.primaryHost)
 	topology["IsWriter"] = false
+	topology["IsReader"] = topologyIsReader(selected.state)
 	if selected.lagOK {
 		topology["ReplicationLagSeconds"] = selected.lagValue
 	}
@@ -236,6 +237,7 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 	topology["PrimaryMemberKey"] = nullableString(primaryMemberKey)
 	topology["PrimaryHost"] = nullableString(primaryHost)
 	topology["IsWriter"] = (role == "primary" || role == "multi_primary") && !readOnly && !superReadOnly
+	topology["IsReader"] = topologyIsReader(state)
 	topology["ReplicationState"] = state
 	topology["Facts"] = models.MetricGroupValue{"GroupMembers": members}
 	return topology
@@ -271,6 +273,7 @@ func buildGaleraTopology(topology models.MetricGroupValue, variables map[string]
 	topology["PrimaryMemberKey"] = nil
 	topology["PrimaryHost"] = nil
 	topology["IsWriter"] = !readOnly && !superReadOnly && state == "healthy"
+	topology["IsReader"] = topologyIsReader(state)
 	topology["ReplicationState"] = state
 	topology["Facts"] = models.MetricGroupValue{"Variables": selectPrefixed(variables, "wsrep_"), "Status": selectPrefixed(status, "wsrep_")}
 	return topology
@@ -346,6 +349,15 @@ func groupMemberState(state string) string {
 		return "unknown"
 	}
 	return "error"
+}
+
+func topologyIsReader(replicationState string) bool {
+	switch replicationState {
+	case "stopped", "error":
+		return false
+	default:
+		return true
+	}
 }
 
 func asyncReplicationStateSeverity(state string) int {

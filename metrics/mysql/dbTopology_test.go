@@ -74,8 +74,8 @@ func TestBuildTopologyFromFactsKeepsAsyncPrimaryAsStandalone(t *testing.T) {
 	if topology["IsWriter"] != true {
 		t.Fatalf("expected async primary to be writer, got %#v", topology["IsWriter"])
 	}
-	if topology["IsReader"] != false {
-		t.Fatalf("expected writable async primary not to be reader, got %#v", topology["IsReader"])
+	if topology["IsReader"] != true {
+		t.Fatalf("expected writable async primary to serve reads, got %#v", topology["IsReader"])
 	}
 }
 
@@ -145,6 +145,9 @@ func TestBuildTopologyFromFactsUsesWorstAsyncReplicationChannel(t *testing.T) {
 	}
 	if topology["ReplicationState"] != "stopped" {
 		t.Fatalf("expected stopped state from worst channel, got %#v", topology["ReplicationState"])
+	}
+	if topology["IsReader"] != false {
+		t.Fatalf("expected stopped async replica not to serve reads, got %#v", topology["IsReader"])
 	}
 	if topology["GroupKey"] != "multi-source:healthy-primary-uuid,stopped-primary-uuid" {
 		t.Fatalf("expected stable multi-source group key, got %#v", topology["GroupKey"])
@@ -260,6 +263,9 @@ func TestBuildTopologyFromFactsDetectsGroupReplicationPrimary(t *testing.T) {
 	if topology["IsWriter"] != true {
 		t.Fatalf("expected primary writer, got %#v", topology["IsWriter"])
 	}
+	if topology["IsReader"] != true {
+		t.Fatalf("expected healthy group replication member to serve reads, got %#v", topology["IsReader"])
+	}
 	if topology["ReplicationState"] != "healthy" {
 		t.Fatalf("expected healthy state, got %#v", topology["ReplicationState"])
 	}
@@ -287,6 +293,45 @@ func TestBuildTopologyFromFactsInfersGroupReplicationPrimaryWhenMembersUnavailab
 	}
 	if topology["IsWriter"] != true {
 		t.Fatalf("expected writable primary, got %#v", topology["IsWriter"])
+	}
+	if topology["IsReader"] != true {
+		t.Fatalf("expected inferred group replication primary to serve reads, got %#v", topology["IsReader"])
+	}
+}
+
+func TestBuildTopologyFromFactsDetectsGroupReplicationSecondary(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":                           "member-2",
+			"group_replication_group_name":          "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+			"group_replication_single_primary_mode": "ON",
+			"read_only":                             "ON",
+			"super_read_only":                       "ON",
+		},
+		GroupMembers: []map[string]interface{}{
+			{
+				"MEMBER_ID":    "member-1",
+				"MEMBER_HOST":  "db1",
+				"MEMBER_STATE": "ONLINE",
+				"MEMBER_ROLE":  "PRIMARY",
+			},
+			{
+				"MEMBER_ID":    "member-2",
+				"MEMBER_HOST":  "db2",
+				"MEMBER_STATE": "ONLINE",
+				"MEMBER_ROLE":  "SECONDARY",
+			},
+		},
+	})
+
+	if topology["Role"] != "replica" {
+		t.Fatalf("expected secondary role, got %#v", topology["Role"])
+	}
+	if topology["IsWriter"] != false {
+		t.Fatalf("expected secondary not to be writer, got %#v", topology["IsWriter"])
+	}
+	if topology["IsReader"] != true {
+		t.Fatalf("expected healthy group replication secondary to serve reads, got %#v", topology["IsReader"])
 	}
 }
 
@@ -321,6 +366,33 @@ func TestBuildTopologyFromFactsDetectsGaleraCluster(t *testing.T) {
 	}
 	if topology["ReplicationState"] != "healthy" {
 		t.Fatalf("expected healthy galera state, got %#v", topology["ReplicationState"])
+	}
+	if topology["IsReader"] != true {
+		t.Fatalf("expected healthy galera node to serve reads, got %#v", topology["IsReader"])
+	}
+}
+
+func TestBuildTopologyFromFactsMarksUnhealthyGaleraAsNonReader(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":              "server-uuid",
+			"wsrep_on":                 "ON",
+			"wsrep_cluster_state_uuid": "cluster-state",
+			"wsrep_node_uuid":          "node-uuid",
+			"read_only":                "OFF",
+		},
+		Status: map[string]interface{}{
+			"wsrep_ready":          "ON",
+			"wsrep_connected":      "OFF",
+			"wsrep_cluster_status": "Primary",
+		},
+	})
+
+	if topology["ReplicationState"] != "error" {
+		t.Fatalf("expected unhealthy galera state, got %#v", topology["ReplicationState"])
+	}
+	if topology["IsReader"] != false {
+		t.Fatalf("expected unhealthy galera node not to serve reads, got %#v", topology["IsReader"])
 	}
 }
 
