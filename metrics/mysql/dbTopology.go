@@ -112,7 +112,7 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		"PrimaryMemberKey":      nil,
 		"PrimaryHost":           nil,
 		"IsWriter":              !readOnly && !superReadOnly,
-		"IsReader":              true,
+		"IsReader":              readOnly || superReadOnly,
 		"ReadOnly":              readOnly,
 		"SuperReadOnly":         superReadOnly,
 		"ReplicationLagSeconds": nil,
@@ -134,11 +134,13 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 }
 
 func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[string]string, replicaStatuses []map[string]interface{}) models.MetricGroupValue {
-	channels := make([]models.MetricGroupValue, 0, len(replicaStatuses))
+	channels := make([]asyncReplicaChannel, 0, len(replicaStatuses))
+	channelFacts := make([]models.MetricGroupValue, 0, len(replicaStatuses))
 	selected := asyncReplicaChannel{state: "unknown", severity: asyncReplicationStateSeverity("unknown")}
 	for idx, replicaStatus := range replicaStatuses {
 		channel := analyzeAsyncReplicaChannel(replicaStatus)
-		channels = append(channels, channel.facts)
+		channels = append(channels, channel)
+		channelFacts = append(channelFacts, channel.facts)
 		if idx == 0 || preferAsyncReplicaChannel(channel, selected) {
 			selected = channel
 		}
@@ -146,7 +148,7 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 
 	topology["Type"] = "async_replication"
 	topology["Role"] = "replica"
-	topology["GroupKey"] = asyncReplicaGroupKey(replicaStatuses, firstString(variables, "server_uuid"), selected)
+	topology["GroupKey"] = asyncReplicaGroupKey(channels, firstString(variables, "server_uuid"), selected)
 	topology["PrimaryMemberKey"] = nullableString(selected.primaryMemberKey)
 	topology["PrimaryHost"] = nullableString(selected.primaryHost)
 	topology["IsWriter"] = false
@@ -156,7 +158,7 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 	topology["ReplicationState"] = selected.state
 	topology["Facts"] = models.MetricGroupValue{
 		"ReplicaStatus":   selected.facts,
-		"ReplicaChannels": channels,
+		"ReplicaChannels": channelFacts,
 	}
 	return topology
 }
@@ -375,15 +377,14 @@ func preferAsyncReplicaChannel(candidate asyncReplicaChannel, selected asyncRepl
 	return candidate.sortKey < selected.sortKey
 }
 
-func asyncReplicaGroupKey(replicaStatuses []map[string]interface{}, serverUUID string, selected asyncReplicaChannel) string {
-	if len(replicaStatuses) <= 1 {
+func asyncReplicaGroupKey(channels []asyncReplicaChannel, serverUUID string, selected asyncReplicaChannel) string {
+	if len(channels) <= 1 {
 		return firstNonEmpty(selected.primaryMemberKey, selected.primaryHost, serverUUID)
 	}
 
-	keys := make([]string, 0, len(replicaStatuses))
+	keys := make([]string, 0, len(channels))
 	seen := map[string]struct{}{}
-	for _, replicaStatus := range replicaStatuses {
-		channel := analyzeAsyncReplicaChannel(replicaStatus)
+	for _, channel := range channels {
 		key := firstNonEmpty(channel.primaryMemberKey, channel.primaryHost)
 		if key == "" {
 			continue

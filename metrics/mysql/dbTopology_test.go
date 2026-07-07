@@ -74,6 +74,34 @@ func TestBuildTopologyFromFactsKeepsAsyncPrimaryAsStandalone(t *testing.T) {
 	if topology["IsWriter"] != true {
 		t.Fatalf("expected async primary to be writer, got %#v", topology["IsWriter"])
 	}
+	if topology["IsReader"] != false {
+		t.Fatalf("expected writable async primary not to be reader, got %#v", topology["IsReader"])
+	}
+}
+
+func TestBuildTopologyFromFactsMarksReadOnlyReplicaAsReader(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":     "replica-uuid",
+			"read_only":       "ON",
+			"super_read_only": "ON",
+		},
+		ReplicaStatus: []map[string]interface{}{
+			{
+				"Source_UUID":           "primary-uuid",
+				"Replica_IO_Running":    "Yes",
+				"Replica_SQL_Running":   "Yes",
+				"Seconds_Behind_Source": "0",
+			},
+		},
+	})
+
+	if topology["IsReader"] != true {
+		t.Fatalf("expected read-only async replica to be reader, got %#v", topology["IsReader"])
+	}
+	if topology["IsWriter"] != false {
+		t.Fatalf("expected read-only async replica not to be writer, got %#v", topology["IsWriter"])
+	}
 }
 
 func TestBuildTopologyFromFactsUsesWorstAsyncReplicationChannel(t *testing.T) {
@@ -174,6 +202,22 @@ func TestBuildTopologyFromFactsBreaksAsyncReplicationTiesByLag(t *testing.T) {
 	}
 	if topology["GroupKey"] != "multi-source:high-lag-primary-uuid,low-lag-primary-uuid" {
 		t.Fatalf("expected stable sorted multi-source group key, got %#v", topology["GroupKey"])
+	}
+}
+
+func TestAsyncReplicaGroupKeyUsesAnalyzedChannels(t *testing.T) {
+	groupKey := asyncReplicaGroupKey(
+		[]asyncReplicaChannel{
+			{primaryMemberKey: "primary-b", primaryHost: "db-b.example.com"},
+			{primaryMemberKey: "primary-a", primaryHost: "db-a.example.com"},
+			{primaryMemberKey: "primary-a", primaryHost: "db-a-duplicate.example.com"},
+		},
+		"replica-uuid",
+		asyncReplicaChannel{primaryMemberKey: "primary-b", primaryHost: "db-b.example.com"},
+	)
+
+	if groupKey != "multi-source:primary-a,primary-b" {
+		t.Fatalf("expected sorted group key from analyzed channels, got %#v", groupKey)
 	}
 }
 
