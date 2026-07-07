@@ -1,6 +1,13 @@
 package mysql
 
-import "testing"
+import (
+	"errors"
+	"io"
+	"testing"
+
+	"github.com/Releem/mysqlconfigurer/models"
+	logging "github.com/google/logger"
+)
 
 func TestBuildTopologyFromFactsDetectsAsyncReplica(t *testing.T) {
 	topology := BuildTopologyFromFacts(TopologyFacts{
@@ -43,6 +50,89 @@ func TestBuildTopologyFromFactsDetectsAsyncReplica(t *testing.T) {
 	}
 	if topology["IsWriter"] != false {
 		t.Fatalf("expected replica not to be writer, got %#v", topology["IsWriter"])
+	}
+}
+
+func TestBuildTopologyFromFactsKeepsAsyncPrimaryAsStandalone(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":     "primary-uuid",
+			"read_only":       "OFF",
+			"super_read_only": "OFF",
+		},
+	})
+
+	if topology["Type"] != "standalone" {
+		t.Fatalf("expected async primary without replica rows to stay standalone, got %#v", topology["Type"])
+	}
+	if topology["Role"] != "primary" {
+		t.Fatalf("expected primary role, got %#v", topology["Role"])
+	}
+	if topology["GroupKey"] != "primary-uuid" {
+		t.Fatalf("expected primary member key as group key, got %#v", topology["GroupKey"])
+	}
+	if topology["IsWriter"] != true {
+		t.Fatalf("expected async primary to be writer, got %#v", topology["IsWriter"])
+	}
+}
+
+func TestBuildTopologyFromFactsUsesWorstAsyncReplicationChannel(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":     "replica-uuid",
+			"read_only":       "ON",
+			"super_read_only": "ON",
+		},
+		ReplicaStatus: []map[string]interface{}{
+			{
+				"Channel_Name":           "healthy-channel",
+				"Source_Host":            "healthy-primary.example.com",
+				"Source_UUID":            "healthy-primary-uuid",
+				"Replica_IO_Running":     "Yes",
+				"Replica_SQL_Running":    "Yes",
+				"Seconds_Behind_Source":  "0",
+				"Large_Unused_Field":     "this should not be persisted",
+				"Another_Unused_Field":   "this should not be persisted either",
+				"Yet_Another_Unused_Key": "ignored",
+			},
+			{
+				"Channel_Name":           "stopped-channel",
+				"Source_Host":            "stopped-primary.example.com",
+				"Source_UUID":            "stopped-primary-uuid",
+				"Replica_IO_Running":     "No",
+				"Replica_SQL_Running":    "Yes",
+				"Seconds_Behind_Source":  "0",
+				"Large_Unused_Field":     "this should not be persisted",
+				"Another_Unused_Field":   "this should not be persisted either",
+				"Yet_Another_Unused_Key": "ignored",
+			},
+		},
+	})
+
+	if topology["PrimaryMemberKey"] != "stopped-primary-uuid" {
+		t.Fatalf("expected worst channel primary uuid, got %#v", topology["PrimaryMemberKey"])
+	}
+	if topology["PrimaryHost"] != "stopped-primary.example.com" {
+		t.Fatalf("expected worst channel primary host, got %#v", topology["PrimaryHost"])
+	}
+	if topology["ReplicationState"] != "stopped" {
+		t.Fatalf("expected stopped state from worst channel, got %#v", topology["ReplicationState"])
+	}
+
+	facts := topology["Facts"].(models.MetricGroupValue)
+	replicaStatus := facts["ReplicaStatus"].(models.MetricGroupValue)
+	if replicaStatus["Channel_Name"] != "stopped-channel" {
+		t.Fatalf("expected selected trimmed replica status, got %#v", replicaStatus["Channel_Name"])
+	}
+	if _, ok := replicaStatus["Large_Unused_Field"]; ok {
+		t.Fatalf("expected unused replica status fields to be trimmed")
+	}
+	channels := facts["ReplicaChannels"].([]models.MetricGroupValue)
+	if len(channels) != 2 {
+		t.Fatalf("expected all replica channels in facts, got %d", len(channels))
+	}
+	if _, ok := channels[0]["Another_Unused_Field"]; ok {
+		t.Fatalf("expected unused replica channel fields to be trimmed")
 	}
 }
 
@@ -165,5 +255,49 @@ func TestBuildTopologyFromFactsReturnsStandaloneForNoReplicationFacts(t *testing
 	}
 	if topology["IsWriter"] != true {
 		t.Fatalf("expected standalone writer, got %#v", topology["IsWriter"])
+	}
+}
+
+type fakeTopologyRows struct {
+	columns []string
+	rows    [][]interface{}
+	err     error
+	index   int
+}
+
+func (r *fakeTopologyRows) Columns() ([]string, error) {
+	return r.columns, nil
+}
+
+func (r *fakeTopologyRows) Next() bool {
+	return r.index < len(r.rows)
+}
+
+func (r *fakeTopologyRows) Scan(dest ...interface{}) error {
+	row := r.rows[r.index]
+	r.index++
+	for i := range dest {
+		ptr := dest[i].(*interface{})
+		*ptr = row[i]
+	}
+	return nil
+}
+
+func (r *fakeTopologyRows) Err() error {
+	return r.err
+}
+
+func TestScanTopologyRowsReturnsNilOnRowsErr(t *testing.T) {
+	logger := *logging.Init("db-topology-test", false, false, io.Discard)
+	defer logger.Close()
+
+	rows := &fakeTopologyRows{
+		columns: []string{"Source_Host"},
+		rows:    [][]interface{}{{"primary.example.com"}},
+		err:     errors.New("cursor failed"),
+	}
+
+	if result := scanTopologyRows(rows, logger); result != nil {
+		t.Fatalf("expected nil result when rows has iteration error, got %#v", result)
 	}
 }

@@ -24,6 +24,23 @@ type DBTopologyGatherer struct {
 	configuration *config.Config
 }
 
+type topologyRows interface {
+	Columns() ([]string, error)
+	Next() bool
+	Scan(dest ...interface{}) error
+	Err() error
+}
+
+type asyncReplicaChannel struct {
+	primaryHost      string
+	primaryMemberKey string
+	lagValue         int64
+	lagOK            bool
+	state            string
+	severity         int
+	facts            models.MetricGroupValue
+}
+
 func NewDBTopologyGatherer(logger logging.Logger, configuration *config.Config) *DBTopologyGatherer {
 	return &DBTopologyGatherer{logger: logger, configuration: configuration}
 }
@@ -108,13 +125,41 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		return buildGroupReplicationTopology(topology, variables, facts.GroupMembers, readOnly, superReadOnly)
 	}
 	if len(facts.ReplicaStatus) > 0 {
-		return buildAsyncReplicaTopology(topology, variables, facts.ReplicaStatus[0])
+		return buildAsyncReplicaTopology(topology, variables, facts.ReplicaStatus)
 	}
 
 	return topology
 }
 
-func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[string]string, replicaStatus map[string]interface{}) models.MetricGroupValue {
+func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[string]string, replicaStatuses []map[string]interface{}) models.MetricGroupValue {
+	channels := make([]models.MetricGroupValue, 0, len(replicaStatuses))
+	selected := asyncReplicaChannel{state: "unknown", severity: asyncReplicationStateSeverity("unknown")}
+	for idx, replicaStatus := range replicaStatuses {
+		channel := analyzeAsyncReplicaChannel(replicaStatus)
+		channels = append(channels, channel.facts)
+		if idx == 0 || channel.severity > selected.severity {
+			selected = channel
+		}
+	}
+
+	topology["Type"] = "async_replication"
+	topology["Role"] = "replica"
+	topology["GroupKey"] = firstNonEmpty(selected.primaryMemberKey, selected.primaryHost, firstString(variables, "server_uuid"))
+	topology["PrimaryMemberKey"] = nullableString(selected.primaryMemberKey)
+	topology["PrimaryHost"] = nullableString(selected.primaryHost)
+	topology["IsWriter"] = false
+	if selected.lagOK {
+		topology["ReplicationLagSeconds"] = selected.lagValue
+	}
+	topology["ReplicationState"] = selected.state
+	topology["Facts"] = models.MetricGroupValue{
+		"ReplicaStatus":   selected.facts,
+		"ReplicaChannels": channels,
+	}
+	return topology
+}
+
+func analyzeAsyncReplicaChannel(replicaStatus map[string]interface{}) asyncReplicaChannel {
 	row := normalizeKeys(replicaStatus)
 	primaryHost := firstNonEmpty(firstString(row, "source_host"), firstString(row, "master_host"))
 	primaryMemberKey := firstNonEmpty(firstString(row, "source_uuid"), firstString(row, "master_uuid"))
@@ -132,18 +177,15 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 		state = "stopped"
 	}
 
-	topology["Type"] = "async_replication"
-	topology["Role"] = "replica"
-	topology["GroupKey"] = firstNonEmpty(primaryMemberKey, primaryHost, firstString(variables, "server_uuid"))
-	topology["PrimaryMemberKey"] = nullableString(primaryMemberKey)
-	topology["PrimaryHost"] = nullableString(primaryHost)
-	topology["IsWriter"] = false
-	if lagOK {
-		topology["ReplicationLagSeconds"] = lagValue
+	return asyncReplicaChannel{
+		primaryHost:      primaryHost,
+		primaryMemberKey: primaryMemberKey,
+		lagValue:         lagValue,
+		lagOK:            lagOK,
+		state:            state,
+		severity:         asyncReplicationStateSeverity(state),
+		facts:            selectReplicaStatusFacts(replicaStatus),
 	}
-	topology["ReplicationState"] = state
-	topology["Facts"] = models.MetricGroupValue{"ReplicaStatus": replicaStatus}
-	return topology
 }
 
 func buildGroupReplicationTopology(topology models.MetricGroupValue, variables map[string]string, members []map[string]interface{}, readOnly bool, superReadOnly bool) models.MetricGroupValue {
@@ -229,7 +271,7 @@ func buildGaleraTopology(topology models.MetricGroupValue, variables map[string]
 	return topology
 }
 
-func scanTopologyRows(rows *sql.Rows, logger logging.Logger) []map[string]interface{} {
+func scanTopologyRows(rows topologyRows, logger logging.Logger) []map[string]interface{} {
 	cols, err := rows.Columns()
 	if err != nil {
 		logger.Error(err)
@@ -257,6 +299,10 @@ func scanTopologyRows(rows *sql.Rows, logger logging.Logger) []map[string]interf
 			}
 		}
 		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Error(err)
+		return nil
 	}
 	return result
 }
@@ -295,6 +341,19 @@ func groupMemberState(state string) string {
 		return "unknown"
 	}
 	return "error"
+}
+
+func asyncReplicationStateSeverity(state string) int {
+	switch state {
+	case "stopped":
+		return 3
+	case "lagging":
+		return 2
+	case "unknown":
+		return 1
+	default:
+		return 0
+	}
 }
 
 func truthy(value string) bool {
@@ -352,6 +411,29 @@ func stringValue(value interface{}) string {
 	default:
 		return strings.TrimSpace(fmt.Sprint(typed))
 	}
+}
+
+func selectReplicaStatusFacts(values map[string]interface{}) models.MetricGroupValue {
+	selected := models.MetricGroupValue{}
+	for _, key := range []string{
+		"Channel_Name",
+		"Connection_name",
+		"Source_Host",
+		"Master_Host",
+		"Source_UUID",
+		"Master_UUID",
+		"Replica_IO_Running",
+		"Slave_IO_Running",
+		"Replica_SQL_Running",
+		"Slave_SQL_Running",
+		"Seconds_Behind_Source",
+		"Seconds_Behind_Master",
+	} {
+		if value, ok := values[key]; ok {
+			selected[key] = value
+		}
+	}
+	return selected
 }
 
 func selectPrefixed(values map[string]string, prefix string) models.MetricGroupValue {
