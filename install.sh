@@ -106,11 +106,11 @@ function detect_database_type() {
     database_type="mysql"  # Default to MySQL for backward compatibility
     
     # Check for PostgreSQL environment variables
-    if [[ -n "${RELEEM_PG_HOST+x}" ]] || [[ -n "${RELEEM_PG_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_PASSWORD+x}" ]] || [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+    if [[ -n "${RELEEM_PG_TYPE+x}" ]] || [[ -n "${RELEEM_PG_HOST+x}" ]] || [[ -n "${RELEEM_PG_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_PASSWORD+x}" ]] || [[ -n "${RELEEM_PG_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
         database_type="postgresql"
         printf "\033[37m   Detected PostgreSQL configuration.\033[0m\n"
     # Check for MySQL environment variables (fallback)
-    elif [[ -n "${RELEEM_MYSQL_HOST+x}" ]] || [[ -n "${RELEEM_MYSQL_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_PASSWORD+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
+    elif [[ -n "${RELEEM_MYSQL_TYPE+x}" ]] || [[ -n "${RELEEM_MYSQL_HOST+x}" ]] || [[ -n "${RELEEM_MYSQL_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_PASSWORD+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
         database_type="mysql"
         printf "\033[37m   Detected MySQL configuration.\033[0m\n"
     else
@@ -395,6 +395,7 @@ function setup_mysql_config_directory() {
 }
 
 function setup_mysql_root_password_option() {
+    mysql_root_login="${RELEEM_MYSQL_ROOT_LOGIN:-root}"
     mysql_root_password_option=()
     if [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
         mysql_root_password_option=("--password=${RELEEM_MYSQL_ROOT_PASSWORD}")
@@ -402,11 +403,11 @@ function setup_mysql_root_password_option() {
 }
 
 function mysql_root_ping() {
-    $mysqladmincmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" ping
+    $mysqladmincmd ${root_connection_string} --user="${mysql_root_login:-root}" "${mysql_root_password_option[@]}" ping
 }
 
 function mysql_root_exec() {
-    $mysqlcmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" -Be "$1"
+    $mysqlcmd ${root_connection_string} --user="${mysql_root_login:-root}" "${mysql_root_password_option[@]}" -Be "$1"
 }
 
 function mysql_root_connection_successful() {
@@ -539,7 +540,7 @@ function create_mysql_user() {
             printf "\033[32m\n Created new user \`${RELEEM_MYSQL_LOGIN}\`\033[0m\n"
             FLAG_SUCCESS=1
         else
-            printf "\033[31m\n%s\n%s\033[0m\n" "MySQL connection failed with user root." "Check that the password is correct, the execution of the command \`${mysqladmincmd} ${root_connection_string} --user=root --password=<MYSQL_ROOT_PASSWORD> ping\` and reinstall the agent."
+            printf "\033[31m\n%s\n%s\033[0m\n" "MySQL connection failed with user ${mysql_root_login:-root}." "Check that the password is correct, the execution of the command \`${mysqladmincmd} ${root_connection_string} --user=${mysql_root_login:-root} --password=<MYSQL_ROOT_PASSWORD> ping\` and reinstall the agent."
             mysql_root_ping || true
             on_error
             exit 1
@@ -1180,26 +1181,31 @@ then
     detect_database_type
     configure_connection_parameters
 
-    if [ "$database_type" == "mysql" ]; then
-        if ! mysql_root_connection_successful && [[ -z "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
-            prompt_mysql_root_password_until_success || true
-        fi
-
-        grant_privileges_sql=$($mysqlcmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" -NBe 'select Concat("GRANT SELECT on *.* to `",User,"`@`", Host,"`;") from mysql.user where User="releem"')
-        while IFS= read -r query; do
-            [ -z "$query" ] && continue
-            echo "${query}"
-            mysql_root_exec "${query}"
-        done <<< "${grant_privileges_sql}"
-    elif [ "$database_type" == "postgresql" ]; then
+    if [ "$database_type" == "postgresql" ]; then
         pg_superuser="${RELEEM_PG_ROOT_LOGIN:-postgres}"
         if ! postgresql_root_connection_successful "${pg_superuser}" && [[ -z "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
             prompt_postgresql_root_password_until_success "${pg_superuser}" || true
         fi
 
-        postgresql_root_exec "${pg_superuser}" -c "GRANT pg_read_all_data TO releem;" 2>/dev/null
-    fi
+        if postgresql_root_connection_successful "${pg_superuser}"; then
+            postgresql_root_exec "${pg_superuser}" -c "GRANT pg_read_all_data TO releem;"
+        else
+            printf "\033[31m\n%s\n%s\033[0m\n" "PostgreSQL connection failed with superuser ${pg_superuser}." "Check that PostgreSQL is running and accessible, or set RELEEM_PG_ROOT_PASSWORD if authentication is required."
+            exit 1
+        fi
+    else
+        setup_mysql_root_password_option
+        if ! mysql_root_connection_successful && [[ -z "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
+            prompt_mysql_root_password_until_success || true
+        fi
 
+        grant_privileges_sql=$($mysqlcmd ${root_connection_string} --user="${mysql_root_login:-root}" "${mysql_root_password_option[@]}" -NBe 'select Concat("GRANT SELECT on *.* to `",User,"`@`", Host,"`;") from mysql.user where User="releem"')
+        while IFS= read -r query; do
+            [ -z "$query" ] && continue
+            echo "${query}"
+            mysql_root_exec "${query}"
+        done <<< "${grant_privileges_sql}"
+    fi
     if [ -z "$query_optimization" ]; then
         echo "query_optimization=true" | $sudo_cmd tee -a $RELEEM_CONF_FILE
     else
