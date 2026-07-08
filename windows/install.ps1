@@ -764,6 +764,5 @@ $script:MainExitCode = 0
     $script:MainExitCode = 1
 } finally {
     Send-InstallLog
+    exit $script:MainExitCode
 }
-
-exit $script:MainExitCode
