@@ -106,11 +106,11 @@ function detect_database_type() {
     database_type="mysql"  # Default to MySQL for backward compatibility
     
     # Check for PostgreSQL environment variables
-    if [[ -n "${RELEEM_PG_HOST+x}" ]] || [[ -n "${RELEEM_PG_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_PASSWORD+x}" ]] || [[ -n "${RELEEM_PG_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+    if [[ -n "${RELEEM_PG_TYPE+x}" ]] || [[ -n "${RELEEM_PG_HOST+x}" ]] || [[ -n "${RELEEM_PG_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_PASSWORD+x}" ]] || [[ -n "${RELEEM_PG_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
         database_type="postgresql"
         printf "\033[37m   Detected PostgreSQL configuration.\033[0m\n"
     # Check for MySQL environment variables (fallback)
-    elif [[ -n "${RELEEM_MYSQL_HOST+x}" ]] || [[ -n "${RELEEM_MYSQL_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_PASSWORD+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
+    elif [[ -n "${RELEEM_MYSQL_TYPE+x}" ]] || [[ -n "${RELEEM_MYSQL_HOST+x}" ]] || [[ -n "${RELEEM_MYSQL_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_PASSWORD+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
         database_type="mysql"
         printf "\033[37m   Detected MySQL configuration.\033[0m\n"
     else

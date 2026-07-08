@@ -68,8 +68,8 @@ echo "200"
 
 @test "detect_database_type defaults to mysql" {
     load_install_functions
-    unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD RELEEM_PG_ROOT_LOGIN
-    unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_ROOT_LOGIN
+    unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD RELEEM_PG_ROOT_LOGIN RELEEM_PG_TYPE
+    unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_ROOT_LOGIN RELEEM_MYSQL_TYPE
 
     run detect_database_type
     [ "$status" -eq 0 ]
@@ -88,8 +88,8 @@ echo "200"
 
 @test "detect_database_type uses postgresql root login as postgresql signal" {
     load_install_functions
-    unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD
-    unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_ROOT_LOGIN
+    unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD RELEEM_PG_TYPE
+    unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_ROOT_LOGIN RELEEM_MYSQL_TYPE
     RELEEM_PG_ROOT_LOGIN="pgadmin"
 
     run detect_database_type
@@ -97,15 +97,42 @@ echo "200"
     [ "$database_type" = "postgresql" ]
 }
 
+@test "detect_database_type uses postgresql type flag as postgresql signal" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD RELEEM_PG_ROOT_LOGIN
+        unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_ROOT_LOGIN RELEEM_MYSQL_TYPE
+        RELEEM_PG_TYPE="1"
+        detect_database_type >/dev/null
+        printf "%s" "$database_type"
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "postgresql" ]
+}
+
 @test "detect_database_type uses mysql root login as mysql signal" {
     load_install_functions
-    unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD RELEEM_PG_ROOT_LOGIN
-    unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD
+    unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD RELEEM_PG_ROOT_LOGIN RELEEM_PG_TYPE
+    unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_TYPE
     RELEEM_MYSQL_ROOT_LOGIN="admin"
 
     run detect_database_type
     [ "$status" -eq 0 ]
     [ "$database_type" = "mysql" ]
+}
+
+@test "detect_database_type uses mysql type flag as mysql signal" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        unset RELEEM_PG_HOST RELEEM_PG_LOGIN RELEEM_PG_PASSWORD RELEEM_PG_ROOT_PASSWORD RELEEM_PG_ROOT_LOGIN RELEEM_PG_TYPE
+        unset RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_ROOT_LOGIN
+        RELEEM_MYSQL_TYPE="1"
+        detect_database_type
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Detected MySQL configuration."* ]]
 }
 
 @test "setup_mysql_connection_string builds host and default port" {
