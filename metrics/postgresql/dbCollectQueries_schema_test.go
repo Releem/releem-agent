@@ -10,7 +10,21 @@ import (
 )
 
 func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
-	table := pgTableSchemaMetric("app", "orders", "BASE TABLE", "HEAP", "42", "128", "4096", "1024", "NULL")
+	table := pgTableSchemaMetric(pgTableSchemaMetricInput{
+		TABLE_SCHEMA:        "app",
+		TABLE_NAME:          "orders",
+		TABLE_TYPE:          "BASE TABLE",
+		ENGINE:              "HEAP",
+		TABLE_ROWS:          "42",
+		AVG_ROW_LENGTH:      "128",
+		DATA_LENGTH:         "4096",
+		INDEX_LENGTH:        "1024",
+		TABLE_COLLATION:     "NULL",
+		TABLE_SIZE_BYTES:    "5120",
+		N_MOD_SINCE_ANALYZE: "7",
+		LAST_ANALYZE:        "2026-07-01 00:00:00+00",
+		LAST_AUTOANALYZE:    "NULL",
+	})
 	if table["TABLE_SCHEMA"] != "app" || table["TABLE_NAME"] != "orders" {
 		t.Fatalf("table identity keys are not collector-compatible: %#v", table)
 	}
@@ -19,6 +33,9 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 	}
 	if table["DATA_LENGTH"] != "4096" || table["INDEX_LENGTH"] != "1024" || table["TABLE_COLLATION"] != "NULL" {
 		t.Fatalf("table size/collation keys are not collector-compatible: %#v", table)
+	}
+	if table["N_MOD_SINCE_ANALYZE"] != "7" || table["LAST_ANALYZE"] != "2026-07-01 00:00:00+00" || table["LAST_AUTOANALYZE"] != "NULL" || table["TABLE_SIZE_BYTES"] != "5120" {
+		t.Fatalf("postgresql table metrics should expose planner statistics keys: %#v", table)
 	}
 
 	column := pgColumnSchemaMetric("app", "orders", "customer_id", "2", "NULL", "NO", "bigint", "NULL", "64", "0", "NULL")
@@ -32,7 +49,7 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 		t.Fatalf("postgresql columns should expose NULL character set: %#v", column)
 	}
 
-	index := pgIndexSchemaMetric("app", "orders", "idx_orders_customer", "1", "1", "customer_id", "NULL", "NULL", "NULL", "NULL", "NO", "btree", "NULL", "NULL")
+	index := pgIndexSchemaMetric(pgIndexInput("app", "orders", "idx_orders_customer", "customer_id", "NULL", "NULL"))
 	if index["INDEX_NAME"] != "idx_orders_customer" || index["COLUMN_NAME"] != "customer_id" {
 		t.Fatalf("index identity keys are not collector-compatible: %#v", index)
 	}
@@ -42,18 +59,152 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 	if index["CARDINALITY"] != "NULL" {
 		t.Fatalf("postgresql indexes should expose NULL cardinality when estimate is unavailable: %#v", index)
 	}
+	if index["LAST_IDX_SCAN"] != "NULL" {
+		t.Fatalf("postgresql indexes should expose last_idx_scan key: %#v", index)
+	}
 	if index["EXPRESSION"] != "" || index["PREDICATE"] != "" {
 		t.Fatalf("plain index should expose empty absent expression/predicate: %#v", index)
 	}
 
-	expressionIndex := pgIndexSchemaMetric("app", "users", "idx_users_lower_email", "1", "1", "NULL", "NULL", "NULL", "NULL", "NULL", "YES", "btree", "lower(email)", "NULL")
+	expressionIndex := pgIndexSchemaMetric(pgIndexInput("app", "users", "idx_users_lower_email", "NULL", "lower(email)", "NULL"))
 	if expressionIndex["COLUMN_NAME"] != "lower(email)" || expressionIndex["EXPRESSION"] != "lower(email)" {
 		t.Fatalf("expression index should preserve expression identity in COLUMN_NAME and EXPRESSION: %#v", expressionIndex)
 	}
 
-	partialIndex := pgIndexSchemaMetric("app", "orders", "idx_orders_customer_open", "1", "1", "customer_id", "NULL", "NULL", "NULL", "NULL", "NO", "btree", "NULL", "status = 'open'")
+	partialIndex := pgIndexSchemaMetric(pgIndexInput("app", "orders", "idx_orders_customer_open", "customer_id", "NULL", "status = 'open'"))
 	if partialIndex["PREDICATE"] != "status = 'open'" {
 		t.Fatalf("partial index should preserve predicate identity: %#v", partialIndex)
+	}
+}
+
+func TestPostgresqlSequenceMetricUsesCollectorCompatibleKeys(t *testing.T) {
+	sequence := pgSequenceSchemaMetric("app", "orders_id_seq", "1700000000", "2147483647", "1")
+
+	if sequence["SEQUENCE_SCHEMA"] != "app" || sequence["SEQUENCE_NAME"] != "orders_id_seq" {
+		t.Fatalf("sequence identity keys are not collector-compatible: %#v", sequence)
+	}
+	if sequence["LAST_VALUE"] != "1700000000" || sequence["MAX_VALUE"] != "2147483647" || sequence["INCREMENT_BY"] != "1" {
+		t.Fatalf("sequence range keys are not collector-compatible: %#v", sequence)
+	}
+}
+
+func TestPostgresqlIndexMetricExposesExactPgIndexIdentity(t *testing.T) {
+	index := pgIndexSchemaMetric(pgIndexInput("app", "orders", "idx_orders_customer", "customer_id", "", ""))
+
+	for _, key := range []string{
+		"PG_RELAM",
+		"PG_INDKEY",
+		"PG_INDCLASS",
+		"PG_INDCOLLATION",
+		"PG_INDOPTION",
+		"PG_INDNKEYATTS",
+		"PG_INDNATTS",
+		"PG_INDEXPRS",
+		"PG_INDPRED",
+		"PG_INDISVALID",
+		"PG_INDISREADY",
+		"PG_INDISEXCLUSION",
+		"LAST_IDX_SCAN",
+	} {
+		if _, ok := index[key]; !ok {
+			t.Fatalf("postgresql index metric should expose exact pg_index key %s: %#v", key, index)
+		}
+	}
+}
+
+func TestPostgresqlIndexSchemaQueryCollectsUsageStatistics(t *testing.T) {
+	if !strings.Contains(pgIndexSchemaQuery("app"), "pg_stat_user_indexes") {
+		t.Fatalf("postgresql index schema query should collect pg_stat_user_indexes usage statistics")
+	}
+	if !strings.Contains(pgIndexSchemaQuery("app"), "idx_scan") {
+		t.Fatalf("postgresql index schema query should collect idx_scan")
+	}
+	if !strings.Contains(pgIndexSchemaQuery("app"), "last_idx_scan") {
+		t.Fatalf("postgresql index schema query should collect last_idx_scan")
+	}
+}
+
+func TestPostgresqlIndexVectorExpressionUsesTextCast(t *testing.T) {
+	for input, expected := range map[string]string{
+		"idx.indkey":       "idx.indkey::text",
+		"idx.indclass":     "idx.indclass::text",
+		"idx.indcollation": "idx.indcollation::text",
+		"idx.indoption":    "idx.indoption::text",
+	} {
+		if got := pgIndexVectorExpression(input); got != expected {
+			t.Fatalf("postgresql vector expression for %s should use text cast, got %s", input, got)
+		}
+	}
+}
+
+func TestPostgresqlIndexAttributeCountExpressionsUseVersionSafeFallback(t *testing.T) {
+	nkeyatts, natts := pgIndexAttributeCountExpressions(110000)
+	if nkeyatts != "idx.indnkeyatts::text" || natts != "idx.indnatts::text" {
+		t.Fatalf("postgresql 11+ should use native pg_index attribute counts, got %s and %s", nkeyatts, natts)
+	}
+
+	nkeyatts, natts = pgIndexAttributeCountExpressions(100000)
+	expected := "array_length(idx.indkey::int2[], 1)::text"
+	if nkeyatts != expected || natts != expected {
+		t.Fatalf("postgresql before 11 should derive index attribute counts from indkey, got %s and %s", nkeyatts, natts)
+	}
+}
+
+func TestPostgresqlIndexSchemaQueryAvoidsVersionSpecificColumnsOnOlderServers(t *testing.T) {
+	pg10Query := pgIndexSchemaQueryForVersion(100000)
+	if strings.Contains(pg10Query, "idx.indnkeyatts") || strings.Contains(pg10Query, "idx.indnatts") {
+		t.Fatalf("postgresql before 11 query should not reference pg_index attribute count columns: %s", pg10Query)
+	}
+
+	pg12Query := pgIndexSchemaQueryForVersion(120000)
+	if strings.Contains(pg12Query, "sui.last_idx_scan") {
+		t.Fatalf("postgresql before 16 query should not reference pg_stat_user_indexes.last_idx_scan: %s", pg12Query)
+	}
+
+	pg16Query := pgIndexSchemaQueryForVersion(160000)
+	if !strings.Contains(pg16Query, "sui.last_idx_scan") {
+		t.Fatalf("postgresql 16+ query should collect last_idx_scan: %s", pg16Query)
+	}
+}
+
+func TestPostgresqlSequencesAreCollectedOnlyWhenViewExists(t *testing.T) {
+	if !pgSupportsSequencesView(100000) {
+		t.Fatalf("postgresql 10+ should support pg_sequences")
+	}
+	if pgSupportsSequencesView(90600) {
+		t.Fatalf("postgresql before 10 should not query pg_sequences")
+	}
+}
+
+func pgIndexInput(schema, tableName, indexName, columnName, expression, predicate string) pgIndexSchemaMetricInput {
+	return pgIndexSchemaMetricInput{
+		TABLE_SCHEMA:      schema,
+		TABLE_NAME:        tableName,
+		INDEX_NAME:        indexName,
+		NON_UNIQUE:        "1",
+		SEQ_IN_INDEX:      "1",
+		COLUMN_NAME:       columnName,
+		COLLATION:         "NULL",
+		CARDINALITY:       "NULL",
+		SUB_PART:          "NULL",
+		PACKED:            "NULL",
+		NULLABLE:          "NO",
+		INDEX_TYPE:        "btree",
+		EXPRESSION:        expression,
+		PREDICATE:         predicate,
+		PG_RELAM:          "btree",
+		PG_INDKEY:         "1",
+		PG_INDCLASS:       "1978",
+		PG_INDCOLLATION:   "0",
+		PG_INDOPTION:      "0",
+		PG_INDNKEYATTS:    "1",
+		PG_INDNATTS:       "1",
+		PG_INDEXPRS:       expression,
+		PG_INDPRED:        predicate,
+		PG_INDISVALID:     "true",
+		PG_INDISREADY:     "true",
+		PG_INDISEXCLUSION: "false",
+		LAST_IDX_SCAN:     "NULL",
 	}
 }
 
