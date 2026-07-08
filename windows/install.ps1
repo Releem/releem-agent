@@ -92,8 +92,8 @@ function Invoke-MySQL {
 }
 
 function Get-MySQLRootArgs {
-    $rootLogin = if ($env:RELEEM_MYSQL_ROOT_LOGIN) { $env:RELEEM_MYSQL_ROOT_LOGIN } else { 'root' }
-    $rootArgs = @('-u', $rootLogin)
+    $rootUser = if ($env:RELEEM_MYSQL_ROOT_LOGIN) { $env:RELEEM_MYSQL_ROOT_LOGIN } else { 'root' }
+    $rootArgs = @('-u', $rootUser)
     if ([System.Environment]::GetEnvironmentVariable('RELEEM_MYSQL_ROOT_PASSWORD') -ne $null) {
         $rootArgs += "-p$env:RELEEM_MYSQL_ROOT_PASSWORD"
     }
@@ -514,7 +514,8 @@ if ($env:RELEEM_MYSQL_PASSWORD -and $env:RELEEM_MYSQL_LOGIN) {
     $FLAG_SUCCESS = 1
 
 } else {
-    Write-Log 'Using MySQL root user.'
+    $MysqlRootLogin = if ($env:RELEEM_MYSQL_ROOT_LOGIN) { $env:RELEEM_MYSQL_ROOT_LOGIN } else { 'root' }
+    Write-Log "Using MySQL root user '$MysqlRootLogin'."
 
     $rootConnectionSuccessful = Test-MySQLRootConnection
     if (-not $rootConnectionSuccessful -and [System.Environment]::GetEnvironmentVariable('RELEEM_MYSQL_ROOT_PASSWORD') -eq $null) {
@@ -554,8 +555,7 @@ if ($env:RELEEM_MYSQL_PASSWORD -and $env:RELEEM_MYSQL_LOGIN) {
         $FLAG_SUCCESS = 1
 
     } else {
-        $rootLogin = if ($env:RELEEM_MYSQL_ROOT_LOGIN) { $env:RELEEM_MYSQL_ROOT_LOGIN } else { 'root' }
-        Write-Log "ERROR: MySQL connection failed with user $rootLogin. Check that RELEEM_MYSQL_ROOT_PASSWORD is correct and run reinstall the agent."
+        Write-Log "ERROR: MySQL connection failed with user '$MysqlRootLogin'. Check that RELEEM_MYSQL_ROOT_LOGIN and RELEEM_MYSQL_ROOT_PASSWORD are correct and reinstall the agent."
         $script:MainExitCode = 1; return
     }
 }
@@ -765,3 +765,5 @@ $script:MainExitCode = 0
 } finally {
     Send-InstallLog
 }
+
+exit $script:MainExitCode
