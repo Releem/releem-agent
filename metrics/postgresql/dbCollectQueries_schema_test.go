@@ -11,6 +11,7 @@ import (
 
 func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 	table := pgTableSchemaMetric(pgTableSchemaMetricInput{
+		TABLE_CATALOG:       "shop",
 		TABLE_SCHEMA:        "app",
 		TABLE_NAME:          "orders",
 		TABLE_TYPE:          "BASE TABLE",
@@ -25,6 +26,9 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 		LAST_ANALYZE:        "2026-07-01 00:00:00+00",
 		LAST_AUTOANALYZE:    "NULL",
 	})
+	if table["TABLE_CATALOG"] != "shop" {
+		t.Fatalf("table metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", table)
+	}
 	if table["TABLE_SCHEMA"] != "app" || table["TABLE_NAME"] != "orders" {
 		t.Fatalf("table identity keys are not collector-compatible: %#v", table)
 	}
@@ -38,7 +42,10 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 		t.Fatalf("postgresql table metrics should expose planner statistics keys: %#v", table)
 	}
 
-	column := pgColumnSchemaMetric("app", "orders", "customer_id", "2", "NULL", "NO", "bigint", "NULL", "64", "0", "NULL")
+	column := pgColumnSchemaMetric("shop", "app", "orders", "customer_id", "2", "NULL", "NO", "bigint", "NULL", "64", "0", "NULL")
+	if column["TABLE_CATALOG"] != "shop" {
+		t.Fatalf("column metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", column)
+	}
 	if column["COLUMN_NAME"] != "customer_id" || column["ORDINAL_POSITION"] != "2" {
 		t.Fatalf("column identity keys are not collector-compatible: %#v", column)
 	}
@@ -49,7 +56,10 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 		t.Fatalf("postgresql columns should expose NULL character set: %#v", column)
 	}
 
-	index := pgIndexSchemaMetric(pgIndexInput("app", "orders", "idx_orders_customer", "customer_id", "NULL", "NULL"))
+	index := pgIndexSchemaMetric(pgIndexInput("shop", "app", "orders", "idx_orders_customer", "customer_id", "NULL", "NULL"))
+	if index["TABLE_CATALOG"] != "shop" {
+		t.Fatalf("index metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", index)
+	}
 	if index["INDEX_NAME"] != "idx_orders_customer" || index["COLUMN_NAME"] != "customer_id" {
 		t.Fatalf("index identity keys are not collector-compatible: %#v", index)
 	}
@@ -66,20 +76,23 @@ func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
 		t.Fatalf("plain index should expose empty absent expression/predicate: %#v", index)
 	}
 
-	expressionIndex := pgIndexSchemaMetric(pgIndexInput("app", "users", "idx_users_lower_email", "NULL", "lower(email)", "NULL"))
+	expressionIndex := pgIndexSchemaMetric(pgIndexInput("shop", "app", "users", "idx_users_lower_email", "NULL", "lower(email)", "NULL"))
 	if expressionIndex["COLUMN_NAME"] != "lower(email)" || expressionIndex["EXPRESSION"] != "lower(email)" {
 		t.Fatalf("expression index should preserve expression identity in COLUMN_NAME and EXPRESSION: %#v", expressionIndex)
 	}
 
-	partialIndex := pgIndexSchemaMetric(pgIndexInput("app", "orders", "idx_orders_customer_open", "customer_id", "NULL", "status = 'open'"))
+	partialIndex := pgIndexSchemaMetric(pgIndexInput("shop", "app", "orders", "idx_orders_customer_open", "customer_id", "NULL", "status = 'open'"))
 	if partialIndex["PREDICATE"] != "status = 'open'" {
 		t.Fatalf("partial index should preserve predicate identity: %#v", partialIndex)
 	}
 }
 
 func TestPostgresqlSequenceMetricUsesCollectorCompatibleKeys(t *testing.T) {
-	sequence := pgSequenceSchemaMetric("app", "orders_id_seq", "1700000000", "2147483647", "1")
+	sequence := pgSequenceSchemaMetric("shop", "app", "orders_id_seq", "1700000000", "2147483647", "1")
 
+	if sequence["TABLE_CATALOG"] != "shop" {
+		t.Fatalf("sequence metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", sequence)
+	}
 	if sequence["SEQUENCE_SCHEMA"] != "app" || sequence["SEQUENCE_NAME"] != "orders_id_seq" {
 		t.Fatalf("sequence identity keys are not collector-compatible: %#v", sequence)
 	}
@@ -89,7 +102,7 @@ func TestPostgresqlSequenceMetricUsesCollectorCompatibleKeys(t *testing.T) {
 }
 
 func TestPostgresqlIndexMetricExposesExactPgIndexIdentity(t *testing.T) {
-	index := pgIndexSchemaMetric(pgIndexInput("app", "orders", "idx_orders_customer", "customer_id", "", ""))
+	index := pgIndexSchemaMetric(pgIndexInput("shop", "app", "orders", "idx_orders_customer", "customer_id", "", ""))
 
 	for _, key := range []string{
 		"PG_RELAM",
@@ -167,6 +180,57 @@ func TestPostgresqlIndexSchemaQueryAvoidsVersionSpecificColumnsOnOlderServers(t 
 	}
 }
 
+func TestPostgresqlIndexSchemaQueryExcludesIncludeColumns(t *testing.T) {
+	pg11Query := pgIndexSchemaQueryForVersion(110000)
+	if !strings.Contains(pg11Query, "key_info.seq_in_index <= idx.indnkeyatts") {
+		t.Fatalf("postgresql 11+ index query should exclude INCLUDE columns using indnkeyatts: %s", pg11Query)
+	}
+
+	pg10Query := pgIndexSchemaQueryForVersion(100000)
+	if strings.Contains(pg10Query, "idx.indnkeyatts") {
+		t.Fatalf("postgresql before 11 should not filter INCLUDE columns with indnkeyatts: %s", pg10Query)
+	}
+	if !strings.Contains(pg10Query, "key_info.seq_in_index <=") {
+		t.Fatalf("postgresql before 11 should still bound unnest ordinality to key attributes: %s", pg10Query)
+	}
+}
+
+func TestPostgresqlSchemaCollectionCommitsOnlyOnSuccess(t *testing.T) {
+	existing := models.MetricGroupValue{"TABLE_CATALOG": "other", "TABLE_SCHEMA": "public", "TABLE_NAME": "keep_me"}
+	metrics := &models.Metrics{}
+	metrics.DB.DatabaseSchema = map[string][]models.MetricGroupValue{
+		"information_schema_tables": {existing},
+	}
+
+	partial := map[string][]models.MetricGroupValue{
+		"information_schema_tables": {
+			{"TABLE_CATALOG": "shop", "TABLE_SCHEMA": "public", "TABLE_NAME": "orders"},
+		},
+		"information_schema_columns": {
+			{"TABLE_CATALOG": "shop", "TABLE_SCHEMA": "public", "TABLE_NAME": "orders", "COLUMN_NAME": "id"},
+		},
+	}
+
+	commitPgDatabaseSchema(metrics, partial)
+	if len(metrics.DB.DatabaseSchema["information_schema_tables"]) != 2 {
+		t.Fatalf("successful schema should append to existing metrics, got %#v", metrics.DB.DatabaseSchema["information_schema_tables"])
+	}
+	if len(metrics.DB.DatabaseSchema["information_schema_columns"]) != 1 {
+		t.Fatalf("successful schema should commit columns, got %#v", metrics.DB.DatabaseSchema["information_schema_columns"])
+	}
+
+	// Simulate failure path: partial buffer is discarded and never committed.
+	failedPartial := map[string][]models.MetricGroupValue{
+		"information_schema_indexes": {
+			{"TABLE_CATALOG": "shop", "TABLE_SCHEMA": "public", "INDEX_NAME": "idx_orders_id"},
+		},
+	}
+	_ = failedPartial
+	if _, ok := metrics.DB.DatabaseSchema["information_schema_indexes"]; ok {
+		t.Fatalf("failed schema collection must not leave partial indexes in shared metrics")
+	}
+}
+
 func TestPostgresqlSequencesAreCollectedOnlyWhenViewExists(t *testing.T) {
 	if !pgSupportsSequencesView(100000) {
 		t.Fatalf("postgresql 10+ should support pg_sequences")
@@ -176,8 +240,9 @@ func TestPostgresqlSequencesAreCollectedOnlyWhenViewExists(t *testing.T) {
 	}
 }
 
-func pgIndexInput(schema, tableName, indexName, columnName, expression, predicate string) pgIndexSchemaMetricInput {
+func pgIndexInput(catalog, schema, tableName, indexName, columnName, expression, predicate string) pgIndexSchemaMetricInput {
 	return pgIndexSchemaMetricInput{
+		TABLE_CATALOG:     catalog,
 		TABLE_SCHEMA:      schema,
 		TABLE_NAME:        tableName,
 		INDEX_NAME:        indexName,

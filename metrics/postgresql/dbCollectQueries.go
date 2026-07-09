@@ -139,6 +139,7 @@ func collectDatabaseSchema(configuration *config.Config, logger logging.Logger, 
 }
 
 type pgTableSchemaMetricInput struct {
+	TABLE_CATALOG       string
 	TABLE_SCHEMA        string
 	TABLE_NAME          string
 	TABLE_TYPE          string
@@ -156,6 +157,7 @@ type pgTableSchemaMetricInput struct {
 
 func pgTableSchemaMetric(input pgTableSchemaMetricInput) models.MetricGroupValue {
 	return models.MetricGroupValue{
+		"TABLE_CATALOG":       input.TABLE_CATALOG,
 		"TABLE_SCHEMA":        input.TABLE_SCHEMA,
 		"TABLE_NAME":          input.TABLE_NAME,
 		"TABLE_TYPE":          input.TABLE_TYPE,
@@ -175,8 +177,9 @@ func pgTableSchemaMetric(input pgTableSchemaMetricInput) models.MetricGroupValue
 	}
 }
 
-func pgColumnSchemaMetric(tableSchema, tableName, columnName, ordinalPosition, columnDefault, isNullable, dataType, characterMaximumLength, numericPrecision, numericScale, characterSetName string) models.MetricGroupValue {
+func pgColumnSchemaMetric(tableCatalog, tableSchema, tableName, columnName, ordinalPosition, columnDefault, isNullable, dataType, characterMaximumLength, numericPrecision, numericScale, characterSetName string) models.MetricGroupValue {
 	return models.MetricGroupValue{
+		"TABLE_CATALOG":            tableCatalog,
 		"TABLE_SCHEMA":             tableSchema,
 		"TABLE_NAME":               tableName,
 		"COLUMN_NAME":              columnName,
@@ -197,6 +200,7 @@ func pgColumnSchemaMetric(tableSchema, tableName, columnName, ordinalPosition, c
 }
 
 type pgIndexSchemaMetricInput struct {
+	TABLE_CATALOG     string
 	TABLE_SCHEMA      string
 	TABLE_NAME        string
 	INDEX_NAME        string
@@ -234,6 +238,7 @@ func pgIndexSchemaMetric(input pgIndexSchemaMetricInput) models.MetricGroupValue
 		columnName = expression
 	}
 	return models.MetricGroupValue{
+		"TABLE_CATALOG":     input.TABLE_CATALOG,
 		"TABLE_SCHEMA":      input.TABLE_SCHEMA,
 		"TABLE_NAME":        input.TABLE_NAME,
 		"INDEX_NAME":        input.INDEX_NAME,
@@ -264,13 +269,23 @@ func pgIndexSchemaMetric(input pgIndexSchemaMetricInput) models.MetricGroupValue
 	}
 }
 
-func pgSequenceSchemaMetric(sequenceSchema, sequenceName, lastValue, maxValue, incrementBy string) models.MetricGroupValue {
+func pgSequenceSchemaMetric(tableCatalog, sequenceSchema, sequenceName, lastValue, maxValue, incrementBy string) models.MetricGroupValue {
 	return models.MetricGroupValue{
+		"TABLE_CATALOG":   tableCatalog,
 		"SEQUENCE_SCHEMA": sequenceSchema,
 		"SEQUENCE_NAME":   sequenceName,
 		"LAST_VALUE":      lastValue,
 		"MAX_VALUE":       maxValue,
 		"INCREMENT_BY":    incrementBy,
+	}
+}
+
+func commitPgDatabaseSchema(metrics *models.Metrics, partial map[string][]models.MetricGroupValue) {
+	if metrics.DB.DatabaseSchema == nil {
+		metrics.DB.DatabaseSchema = make(map[string][]models.MetricGroupValue)
+	}
+	for key, values := range partial {
+		metrics.DB.DatabaseSchema[key] = append(metrics.DB.DatabaseSchema[key], values...)
 	}
 }
 
@@ -340,6 +355,7 @@ func pgIndexSchemaQueryForVersion(serverVersionNum int) string {
 		LEFT JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = key_info.attnum AND key_info.attnum > 0
 		WHERE %s
 			AND current_database() = $1
+			AND key_info.seq_in_index <= %s
 		ORDER BY n.nspname, tc.relname, ic.relname, key_info.seq_in_index`,
 		pgIndexVectorExpression("idx.indkey"),
 		pgIndexVectorExpression("idx.indclass"),
@@ -349,6 +365,7 @@ func pgIndexSchemaQueryForVersion(serverVersionNum int) string {
 		indnatts,
 		pgIndexLastScanExpression(serverVersionNum),
 		pgUserSchemaPredicate("n.nspname"),
+		pgIndexKeyAttributeLimitExpression(serverVersionNum),
 	)
 }
 
@@ -358,6 +375,13 @@ func pgIndexAttributeCountExpressions(serverVersionNum int) (string, string) {
 	}
 	countExpression := "array_length(idx.indkey::int2[], 1)::text"
 	return countExpression, countExpression
+}
+
+func pgIndexKeyAttributeLimitExpression(serverVersionNum int) string {
+	if serverVersionNum >= 110000 {
+		return "idx.indnkeyatts"
+	}
+	return "array_length(idx.indkey::int2[], 1)"
 }
 
 func pgSupportsSequencesView(serverVersionNum int) bool {
@@ -398,6 +422,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 		return fmt.Errorf("database connection is nil for %s", database)
 	}
 	serverVersionNum := pgServerVersionNum(db, logger)
+	partial := make(map[string][]models.MetricGroupValue)
 
 	// Collect table information from information_schema
 	var information_schema_table pgTableSchemaMetricInput
@@ -443,8 +468,9 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 			logger.Error(err)
 			return err
 		}
-		metrics.DB.DatabaseSchema["information_schema_tables"] = append(
-			metrics.DB.DatabaseSchema["information_schema_tables"],
+		information_schema_table.TABLE_CATALOG = database
+		partial["information_schema_tables"] = append(
+			partial["information_schema_tables"],
 			pgTableSchemaMetric(information_schema_table))
 	}
 	if err := rows.Err(); err != nil {
@@ -506,9 +532,9 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 			logger.Error(err)
 			return err
 		}
-		metrics.DB.DatabaseSchema["information_schema_columns"] = append(
-			metrics.DB.DatabaseSchema["information_schema_columns"],
-			pgColumnSchemaMetric(information_schema_column.TABLE_SCHEMA, information_schema_column.TABLE_NAME, information_schema_column.COLUMN_NAME, information_schema_column.ORDINAL_POSITION, information_schema_column.COLUMN_DEFAULT, information_schema_column.IS_NULLABLE, information_schema_column.DATA_TYPE, information_schema_column.CHARACTER_MAXIMUM_LENGTH, information_schema_column.NUMERIC_PRECISION, information_schema_column.NUMERIC_SCALE, information_schema_column.CHARACTER_SET_NAME))
+		partial["information_schema_columns"] = append(
+			partial["information_schema_columns"],
+			pgColumnSchemaMetric(database, information_schema_column.TABLE_SCHEMA, information_schema_column.TABLE_NAME, information_schema_column.COLUMN_NAME, information_schema_column.ORDINAL_POSITION, information_schema_column.COLUMN_DEFAULT, information_schema_column.IS_NULLABLE, information_schema_column.DATA_TYPE, information_schema_column.CHARACTER_MAXIMUM_LENGTH, information_schema_column.NUMERIC_PRECISION, information_schema_column.NUMERIC_SCALE, information_schema_column.CHARACTER_SET_NAME))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -546,8 +572,9 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 			logger.Error(err)
 			return err
 		}
-		metrics.DB.DatabaseSchema["information_schema_indexes"] = append(
-			metrics.DB.DatabaseSchema["information_schema_indexes"],
+		information_schema_index.TABLE_CATALOG = database
+		partial["information_schema_indexes"] = append(
+			partial["information_schema_indexes"],
 			pgIndexSchemaMetric(information_schema_index))
 	}
 	if err := rows.Err(); err != nil {
@@ -569,6 +596,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 	}
 	var pg_sequence pg_sequence_type
 	if !pgSupportsSequencesView(serverVersionNum) {
+		commitPgDatabaseSchema(metrics, partial)
 		logger.V(5).Info("skip pg_sequences collection because PostgreSQL server_version_num=", serverVersionNum)
 		logger.V(5).Info("collectMetrics ", metrics.DB.DatabaseSchema)
 		return nil
@@ -595,9 +623,9 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 			logger.Error(err)
 			return err
 		}
-		metrics.DB.DatabaseSchema["pg_sequences"] = append(
-			metrics.DB.DatabaseSchema["pg_sequences"],
-			pgSequenceSchemaMetric(pg_sequence.SEQUENCE_SCHEMA, pg_sequence.SEQUENCE_NAME, pg_sequence.LAST_VALUE, pg_sequence.MAX_VALUE, pg_sequence.INCREMENT_BY))
+		partial["pg_sequences"] = append(
+			partial["pg_sequences"],
+			pgSequenceSchemaMetric(database, pg_sequence.SEQUENCE_SCHEMA, pg_sequence.SEQUENCE_NAME, pg_sequence.LAST_VALUE, pg_sequence.MAX_VALUE, pg_sequence.INCREMENT_BY))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -609,6 +637,7 @@ func CollectDbSchema(db *sql.DB, database string, logger logging.Logger, metrics
 		return err
 	}
 
+	commitPgDatabaseSchema(metrics, partial)
 	logger.V(5).Info("collectMetrics ", metrics.DB.DatabaseSchema)
 
 	return nil
