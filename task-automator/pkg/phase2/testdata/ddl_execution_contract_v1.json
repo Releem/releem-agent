@@ -1,0 +1,259 @@
+{
+  "contract_version": 1,
+  "cases": [
+    {
+      "id": "alter_implicit_online",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE users ADD COLUMN last_seen_at DATETIME",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {
+          "database": "app",
+          "table": "users"
+        },
+        "flags": {
+          "ok_online_ddl": true,
+          "ok_pt_osc": true
+        },
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "alter_copy_falls_back_to_ptosc",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD COLUMN archived_at DATETIME, ALGORITHM=COPY, LOCK=EXCLUSIVE",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {
+          "database": "app",
+          "table": "users"
+        },
+        "flags": {
+          "ok_online_ddl": false,
+          "ok_pt_osc": true
+        },
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "create_index_online",
+      "schema_name": "app",
+      "ddl_statement": "CREATE INDEX idx_email ON users(email)",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {
+          "database": "app",
+          "table": "users"
+        },
+        "flags": {
+          "ok_online_ddl": true,
+          "ok_pt_osc": true
+        },
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "table_rename_rejected_by_agent",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users RENAME TO app.users_v2",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {
+          "database": "app",
+          "table": "users"
+        },
+        "flags": {
+          "ok_online_ddl": true,
+          "ok_pt_osc": true
+        },
+        "rejection_reason": "preflight cannot isolate the destination table"
+      }
+    },
+    {
+      "id": "executable_comment_rejected_by_agent",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD COLUMN c INT /*!80000 , ALGORITHM=COPY */",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {
+          "database": "app",
+          "table": "users"
+        },
+        "flags": {
+          "ok_online_ddl": false,
+          "ok_pt_osc": true
+        },
+        "rejection_reason": "executable SQL comments are not allowed"
+      }
+    },
+    {
+      "id": "alter_quoted_qualified_target",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE `app`.`users` ADD COLUMN `status` VARCHAR(16)",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "alter_explicit_inplace_lock_none",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD COLUMN active BOOLEAN, ALGORITHM=INPLACE, LOCK=NONE",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "alter_lock_shared_ptosc_only",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD COLUMN active BOOLEAN, ALGORITHM=INPLACE, LOCK=SHARED",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": false, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "create_unique_index",
+      "schema_name": "app",
+      "ddl_statement": "CREATE UNIQUE INDEX idx_email_unique ON app.users(email)",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "create_index_comment_before_target",
+      "schema_name": "app",
+      "ddl_statement": "CREATE INDEX idx_status /* users */ ON app.users(status)",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "create_index_explicit_online_clauses",
+      "schema_name": "app",
+      "ddl_statement": "CREATE INDEX idx_status ON app.users(status) ALGORITHM=INPLACE LOCK=NONE",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "multiple_statements_rejected_by_agent",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD COLUMN a INT; ALTER TABLE app.users ADD COLUMN b INT",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": "multiple SQL statements are not allowed"
+      }
+    },
+    {
+      "id": "rename_as_syntax_error",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users RENAME AS app.users_v2",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": false,
+        "target": null,
+        "flags": {"ok_online_ddl": false, "ok_pt_osc": false},
+        "rejection_reason": "syntax validation failed"
+      }
+    },
+    {
+      "id": "backslash_escaped_quote_rejected_by_agent",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD COLUMN note VARCHAR(20) DEFAULT 'it\\'s'",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": "backslash-escaped quotes are not allowed"
+      }
+    },
+    {
+      "id": "alter_add_foreign_key",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD CONSTRAINT fk_manager FOREIGN KEY (manager_id) REFERENCES users(id)",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "alter_trailing_semicolon_comment",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE app.users ADD COLUMN reviewed_at DATETIME; /* audit */",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": true,
+        "target": {"database": "app", "table": "users"},
+        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
+        "rejection_reason": null
+      }
+    },
+    {
+      "id": "syntax_error",
+      "schema_name": "app",
+      "ddl_statement": "ALTER TABLE",
+      "server_flavor": "mysql",
+      "server_version": "8.0.35",
+      "expected": {
+        "syntax_valid": false,
+        "target": null,
+        "flags": {
+          "ok_online_ddl": false,
+          "ok_pt_osc": false
+        },
+        "rejection_reason": "syntax validation failed"
+      }
+    }
+  ]
+}

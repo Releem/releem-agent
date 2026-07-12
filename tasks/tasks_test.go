@@ -8,6 +8,7 @@ import (
 
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
+	"github.com/Releem/mysqlconfigurer/task-automator/pkg/phase2"
 	logging "github.com/google/logger"
 )
 
@@ -117,7 +118,7 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 			details:       "not-json",
 			cfg:           &config.Config{},
 			wantExitCode:  2,
-			wantErrorText: "taskdetails JSON",
+			wantErrorText: "taskdetails JSON must be an object with a statements array",
 		},
 		{
 			name:          "empty schema change list",
@@ -125,6 +126,13 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 			cfg:           &config.Config{},
 			wantExitCode:  3,
 			wantErrorText: "empty schema change list",
+		},
+		{
+			name:          "syntax invalid without extracted target",
+			details:       `{"statements":[{"schema_name":"app","ddl_statement":"ALTER TABLE","analysis_results":{"schema_name":null,"table_name":null,"syntax_valid":false,"syntax_error":"expected table name","ok_online_ddl":false,"ok_pt_osc":false}}]}`,
+			cfg:           &config.Config{},
+			wantExitCode:  4,
+			wantErrorText: "syntax validation failed: expected table name",
 		},
 		{
 			name: "syntax validation failed",
@@ -204,6 +212,82 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFormatSchemaChangeExecutionResult(t *testing.T) {
+	result := &phase2.ExecuteResult{
+		MethodUsed: "pt-online-schema-change",
+		Warnings:   []string{"Online DDL unavailable", "session cleanup failed"},
+	}
+
+	got := formatSchemaChangeExecutionResult(2, result)
+	for _, want := range []string{
+		"Statement 2 method: pt-online-schema-change\n",
+		"Statement 2 warning: Online DDL unavailable\n",
+		"Statement 2 warning: session cleanup failed\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatSchemaChangeExecutionResult() = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestApplySchemaChangesIncludesExecutorMethodAndWarnings(t *testing.T) {
+	logger := *logging.Init("tasks-test", true, false, io.Discard)
+	originalFactory := newSchemaChangeExecutor
+	var capturedOptions phase2.ExecuteOptions
+	newSchemaChangeExecutor = func(logging.Logger) schemaChangeExecutor {
+		return schemaChangeExecutorStub{
+			result: &phase2.ExecuteResult{
+				ChangeExecuted: true,
+				MethodUsed:     "pt-online-schema-change",
+				Warnings:       []string{"Online DDL unavailable; used pt-online-schema-change"},
+			},
+			onExecute: func(options phase2.ExecuteOptions) {
+				capturedOptions = options
+			},
+		}
+	}
+	defer func() { newSchemaChangeExecutor = originalFactory }()
+
+	exitCode, status, output, taskError := ApplySchemaChanges(
+		logger,
+		&config.Config{DisableSpaceChecks: true},
+		taskType6Details(`{
+			"syntax_valid": true,
+			"ok_online_ddl": true,
+			"ok_pt_osc": true,
+			"ok_pitr": true,
+			"ok_online_physical_backup": true
+		}`),
+	)
+	if exitCode != 0 || status != 1 || taskError != "" {
+		t.Fatalf("ApplySchemaChanges() = exit %d status %d error %q", exitCode, status, taskError)
+	}
+	for _, want := range []string{
+		"Statement 0 method: pt-online-schema-change",
+		"Statement 0 warning: Online DDL unavailable; used pt-online-schema-change",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("ApplySchemaChanges() output = %q, want %q", output, want)
+		}
+	}
+	if capturedOptions.Target == nil || *capturedOptions.Target != (phase2.TableInfo{Database: "app", Table: "users"}) {
+		t.Fatalf("executor target = %#v, want structured Platform target", capturedOptions.Target)
+	}
+}
+
+type schemaChangeExecutorStub struct {
+	result    *phase2.ExecuteResult
+	err       error
+	onExecute func(phase2.ExecuteOptions)
+}
+
+func (s schemaChangeExecutorStub) Execute(options phase2.ExecuteOptions) (*phase2.ExecuteResult, error) {
+	if s.onExecute != nil {
+		s.onExecute(options)
+	}
+	return s.result, s.err
 }
 
 func taskType6Details(analysisJSON string) string {

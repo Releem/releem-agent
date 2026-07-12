@@ -15,6 +15,14 @@ import (
 	logging "github.com/google/logger"
 )
 
+type schemaChangeExecutor interface {
+	Execute(phase2.ExecuteOptions) (*phase2.ExecuteResult, error)
+}
+
+var newSchemaChangeExecutor = func(logger logging.Logger) schemaChangeExecutor {
+	return phase2.NewExecutor(models.DB, &logger)
+}
+
 func ProcessTaskFunc(repeaters models.MetricsRepeater, gatherers []models.MetricsGatherer, logger logging.Logger, configuration *config.Config) func() {
 	return func() {
 		ProcessTask(repeaters, gatherers, logger, configuration)
@@ -208,7 +216,7 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 		var details TaskDetails
 		if err := json.Unmarshal([]byte(taskdetails), &details); err != nil {
 			logger.Error("Failed to parse task_details JSON: ", err)
-			return TaskDetails{}, fmt.Errorf("taskdetails JSON must be an array of objects with `schema_name`, `ddl_statement`, and `analysis_results`")
+			return TaskDetails{}, fmt.Errorf("taskdetails JSON must be an object with a statements array")
 		}
 
 		for i, item := range details.Statements {
@@ -221,11 +229,14 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 				return TaskDetails{}, fmt.Errorf("taskdetails[%d].ddl_statement is required", i)
 			}
 
-			if strings.TrimSpace(item.AnalysisResults.SchemaName) == "" {
-				return TaskDetails{}, fmt.Errorf("taskdetails[%d].analysis_results.schema_name is required", i)
-			}
-			if strings.TrimSpace(item.AnalysisResults.TableName) == "" {
-				return TaskDetails{}, fmt.Errorf("taskdetails[%d].analysis_results.table_name is required", i)
+			if item.AnalysisResults.SyntaxValid {
+				analysisSchema := strings.TrimSpace(item.AnalysisResults.SchemaName)
+				if analysisSchema == "" {
+					return TaskDetails{}, fmt.Errorf("taskdetails[%d].analysis_results.schema_name is required", i)
+				}
+				if strings.TrimSpace(item.AnalysisResults.TableName) == "" {
+					return TaskDetails{}, fmt.Errorf("taskdetails[%d].analysis_results.table_name is required", i)
+				}
 			}
 		}
 
@@ -243,13 +254,16 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 	}
 
 	logger.Info("* Executing schema changes...")
-	executor := phase2.NewExecutor(models.DB, &logger)
+	executor := newSchemaChangeExecutor(logger)
 	executed := 0
 	for i, item := range details.Statements {
 		backupMethod = phase2.BackupNone
 		analysis := item.AnalysisResults
 		statement := strings.TrimSpace(item.DDLStatement)
-		tableName := analysis.SchemaName + "." + analysis.TableName
+		target := phase2.TableInfo{
+			Database: strings.TrimSpace(analysis.SchemaName),
+			Table:    strings.TrimSpace(analysis.TableName),
+		}
 
 		if !analysis.SyntaxValid {
 			errMsg := "syntax validation failed"
@@ -287,9 +301,9 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 			}
 		}
 
-		_, err = executor.Execute(phase2.ExecuteOptions{
+		executionResult, err := executor.Execute(phase2.ExecuteOptions{
 			SQL:          statement,
-			TableName:    tableName,
+			Target:       &target,
 			BackupMethod: backupMethod,
 			OkPTOSC:      analysis.OKPTOSC,
 			OkOnlineDDL:  analysis.OKOnlineDDL,
@@ -303,6 +317,7 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 		}
 
 		executed++
+		task_output += formatSchemaChangeExecutionResult(i, executionResult)
 		logger.Info("* Schema changes execution successful for statement ", i)
 		task_output += fmt.Sprintf("Statement %d successful: %s\n", i, statement)
 	}
@@ -313,4 +328,19 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 	}
 
 	return task_exit_code, task_status, task_output, task_error
+}
+
+func formatSchemaChangeExecutionResult(statementIndex int, result *phase2.ExecuteResult) string {
+	if result == nil {
+		return ""
+	}
+
+	var output strings.Builder
+	if result.MethodUsed != "" {
+		fmt.Fprintf(&output, "Statement %d method: %s\n", statementIndex, result.MethodUsed)
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(&output, "Statement %d warning: %s\n", statementIndex, warning)
+	}
+	return output.String()
 }

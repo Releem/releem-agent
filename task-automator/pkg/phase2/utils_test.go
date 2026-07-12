@@ -24,6 +24,14 @@ func TestParseTableName(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name:    "quoted qualified table name",
+			input:   " `my``db` . \"my\"\"table\" ",
+			getDB:   func() (string, error) { return "testdb", nil },
+			wantDB:  "my`db",
+			wantTbl: `my"table`,
+			wantErr: false,
+		},
+		{
 			name:    "table name only",
 			input:   "mytable",
 			getDB:   func() (string, error) { return "testdb", nil },
@@ -37,6 +45,12 @@ func TestParseTableName(t *testing.T) {
 			getDB:   func() (string, error) { return "", fmt.Errorf("database error") },
 			wantDB:  "",
 			wantTbl: "",
+			wantErr: true,
+		},
+		{
+			name:    "invalid table reference",
+			input:   "app.users.extra",
+			getDB:   func() (string, error) { return "testdb", nil },
 			wantErr: true,
 		},
 	}
@@ -108,6 +122,67 @@ func TestExtractAlterStatement(t *testing.T) {
 	}
 }
 
+func TestExtractAlterStatementPreservesQuotedWhitespace(t *testing.T) {
+	sql := "ALTER TABLE users ADD COLUMN note VARCHAR(32) DEFAULT 'two  spaces'"
+	want := "ADD COLUMN note VARCHAR(32) DEFAULT 'two  spaces'"
+
+	if got := ExtractAlterStatement(sql); got != want {
+		t.Fatalf("ExtractAlterStatement() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractAlterStatementHandlesMariaDBModifiersAndIdentifiers(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "if exists",
+			sql:  "ALTER TABLE IF EXISTS users ADD COLUMN c INT",
+			want: "ADD COLUMN c INT",
+		},
+		{
+			name: "online ignore",
+			sql:  "ALTER ONLINE IGNORE TABLE users ADD COLUMN c INT",
+			want: "ADD COLUMN c INT",
+		},
+		{
+			name: "dollar identifier",
+			sql:  "ALTER TABLE orders$2026 ADD COLUMN c INT",
+			want: "ADD COLUMN c INT",
+		},
+		{
+			name: "Unicode identifier",
+			sql:  "ALTER TABLE заказы ADD COLUMN c INT",
+			want: "ADD COLUMN c INT",
+		},
+		{
+			name: "BMP symbol identifier",
+			sql:  "ALTER TABLE orders£ ADD COLUMN c INT",
+			want: "ADD COLUMN c INT",
+		},
+		{
+			name: "spaces around qualifier dot",
+			sql:  "ALTER TABLE app . users ADD COLUMN c INT",
+			want: "ADD COLUMN c INT",
+		},
+		{
+			name: "ANSI quotes identifier",
+			sql:  `ALTER TABLE "app"."users" ADD COLUMN c INT`,
+			want: "ADD COLUMN c INT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExtractAlterStatement(tt.sql); got != tt.want {
+				t.Fatalf("ExtractAlterStatement() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCanUseOnlineDDL(t *testing.T) {
 	tests := []struct {
 		name string
@@ -160,4 +235,3 @@ func TestCanUseOnlineDDL(t *testing.T) {
 		})
 	}
 }
-

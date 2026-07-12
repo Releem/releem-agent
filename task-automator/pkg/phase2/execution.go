@@ -1,16 +1,22 @@
 package phase2
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/Releem/mysqlconfigurer/config"
+	"github.com/go-sql-driver/mysql"
+	"github.com/shirou/gopsutil/v4/disk"
 )
 
 // BackupMethod represents the type of backup to perform
@@ -22,6 +28,19 @@ const (
 	BackupXtrabackup BackupMethod = "xtrabackup"
 )
 
+var errOnlineDDLUnsupported = errors.New("online DDL is unsupported")
+
+const onlineDDLCleanupTimeout = 5 * time.Second
+
+var (
+	alterOnlineDDLClausePattern = regexp.MustCompile(`(?i)^(?:ALGORITHM|LOCK)\b`)
+	createIndexWaitPattern      = regexp.MustCompile(`(?i)\b(?:WAIT\s+\d+|NOWAIT)\b`)
+	referenceKeywordPattern     = regexp.MustCompile(`(?i)\bREFERENCES\b`)
+	renameOperationPattern      = regexp.MustCompile(`(?i)\bRENAME\b`)
+	renameMemberPattern         = regexp.MustCompile(`(?i)^RENAME\s+(?:COLUMN|INDEX|KEY)\b`)
+	exchangePartitionPattern    = regexp.MustCompile(`(?i)\bEXCHANGE\s+PARTITION\b`)
+)
+
 // Executor handles Phase 2 schema change execution
 type Logger interface {
 	Infof(format string, v ...interface{})
@@ -29,19 +48,32 @@ type Logger interface {
 }
 
 type Executor struct {
-	conn   *sql.DB
-	logger Logger
+	conn       *sql.DB
+	logger     Logger
+	runCommand func(name string, args ...string) ([]byte, error)
 }
 
 // NewExecutor creates a new executor instance
 func NewExecutor(conn *sql.DB, logger Logger) *Executor {
-	return &Executor{conn: conn, logger: logger}
+	return &Executor{conn: conn, logger: logger, runCommand: runCombinedOutput}
+}
+
+func runCombinedOutput(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
+
+func (e *Executor) combinedOutput(name string, args ...string) ([]byte, error) {
+	if e.runCommand != nil {
+		return e.runCommand(name, args...)
+	}
+	return runCombinedOutput(name, args...)
 }
 
 // ExecuteOptions contains options for schema change execution
 type ExecuteOptions struct {
 	SQL          string
 	TableName    string
+	Target       *TableInfo
 	BackupMethod BackupMethod
 	OkPTOSC      bool
 	OkOnlineDDL  bool
@@ -66,9 +98,17 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 		Errors:   []string{},
 	}
 
-	if strings.TrimSpace(options.TableName) == "" {
+	if options.Target == nil && strings.TrimSpace(options.TableName) == "" {
 		return nil, fmt.Errorf("table name is required for schema change execution")
 	}
+	qualifiedSQL, resolvedTarget, err := e.validateDDLTarget(options.SQL, options.TableName, options.Target)
+	if err != nil {
+		return nil, err
+	}
+	canonicalTable := fmt.Sprintf("`%s`.`%s`", escapeIdent(resolvedTarget.Database), escapeIdent(resolvedTarget.Table))
+	options.SQL = qualifiedSQL
+	options.TableName = canonicalTable
+	options.Target = &resolvedTarget
 
 	// Validate datadir filesystem headroom before attempting any schema change.
 	if options.Config == nil || !options.Config.DisableSpaceChecks {
@@ -90,10 +130,9 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 	// 2.3. Execute using Online DDL if allowed
 	if options.OkOnlineDDL {
 		if err := e.executeWithOnlineDDL(options, result); err != nil {
-			// Fall back to pt-online-schema-change when Online DDL preflight
-			// signals that an in-place algorithm is unsupported (the MySQL
-			// error suggests "Try ALGORITHM=COPY") and pt-osc is allowed.
-			if options.OkPTOSC && strings.Contains(err.Error(), "Try ALGORITHM=COPY") {
+			if options.OkPTOSC && isOnlineDDLUnsupported(err) {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("Online DDL unavailable; used pt-online-schema-change: %v", err))
 				if e.logger != nil {
 					e.logger.Infof("Online DDL not possible for table %s (%v); falling back to pt-online-schema-change", options.TableName, err)
 				}
@@ -124,10 +163,173 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 	}
 }
 
+func (e *Executor) validateDDLTarget(sql, configuredTable string, suppliedTarget *TableInfo) (string, TableInfo, error) {
+	masked := maskSQLStringsAndComments(sql, false)
+	match := alterTableTargetPattern.FindStringSubmatchIndex(masked)
+	if len(match) < 4 {
+		match = createIndexTargetPattern.FindStringSubmatchIndex(masked)
+	}
+	if len(match) < 4 {
+		return "", TableInfo{}, fmt.Errorf("cannot validate DDL target; expected ALTER TABLE or CREATE INDEX")
+	}
+
+	ddlReference := strings.TrimSpace(sql[match[2]:match[3]])
+	var currentDatabase string
+	getCurrentDB := func() (string, error) {
+		if currentDatabase != "" {
+			return currentDatabase, nil
+		}
+		if e.conn == nil {
+			return "", fmt.Errorf("database connection is required to resolve an unqualified configured table name")
+		}
+		if err := e.conn.QueryRow("SELECT DATABASE()").Scan(&currentDatabase); err != nil {
+			return "", fmt.Errorf("failed to get current database: %w", err)
+		}
+		if currentDatabase == "" {
+			return "", fmt.Errorf("no current database selected")
+		}
+		return currentDatabase, nil
+	}
+
+	var configuredTarget TableInfo
+	if suppliedTarget != nil {
+		configuredTarget = *suppliedTarget
+		if strings.TrimSpace(configuredTarget.Database) == "" || strings.TrimSpace(configuredTarget.Table) == "" {
+			return "", TableInfo{}, fmt.Errorf("structured schema change target requires database and table")
+		}
+	} else {
+		var err error
+		configuredTarget, err = ParseTableName(configuredTable, getCurrentDB)
+		if err != nil {
+			return "", TableInfo{}, fmt.Errorf("invalid configured table %q: %w", configuredTable, err)
+		}
+	}
+	ddlDatabase, ddlTable, ddlQualified, err := parseTableReference(ddlReference)
+	if err != nil {
+		return "", TableInfo{}, fmt.Errorf("invalid DDL target %q: %w", ddlReference, err)
+	}
+	ddlTarget := TableInfo{Database: ddlDatabase, Table: ddlTable}
+	if !ddlQualified {
+		ddlTarget.Database = configuredTarget.Database
+	}
+
+	targetsEqual, err := e.tableTargetsEqual(ddlTarget, configuredTarget)
+	if err != nil {
+		return "", TableInfo{}, err
+	}
+	if !targetsEqual {
+		return "", TableInfo{}, fmt.Errorf(
+			"DDL target %s.%s does not match configured table %s.%s",
+			ddlTarget.Database, ddlTarget.Table, configuredTarget.Database, configuredTarget.Table,
+		)
+	}
+
+	canonicalTarget := fmt.Sprintf("`%s`.`%s`", escapeIdent(configuredTarget.Database), escapeIdent(configuredTarget.Table))
+	qualifiedSQL, err := rewriteDDLTargetTable(sql, canonicalTarget)
+	if err != nil {
+		return "", TableInfo{}, fmt.Errorf("failed to qualify validated DDL target: %w", err)
+	}
+	if err := rejectUnsafeMultiObjectAlter(qualifiedSQL); err != nil {
+		return "", TableInfo{}, err
+	}
+	qualifiedSQL, err = qualifyUnqualifiedReferences(qualifiedSQL, configuredTarget.Database)
+	if err != nil {
+		return "", TableInfo{}, err
+	}
+	return qualifiedSQL, configuredTarget, nil
+}
+
+func resolvedExecutionTarget(options ExecuteOptions) (TableInfo, error) {
+	if options.Target == nil {
+		return TableInfo{}, fmt.Errorf("resolved schema change target is required")
+	}
+	target := *options.Target
+	if strings.TrimSpace(target.Database) == "" || strings.TrimSpace(target.Table) == "" {
+		return TableInfo{}, fmt.Errorf("resolved schema change target requires database and table")
+	}
+	return target, nil
+}
+
+func rejectUnsafeMultiObjectAlter(sql string) error {
+	masked := maskSQLStringsAndComments(sql, false)
+	if !alterTableTargetPattern.MatchString(masked) {
+		return nil
+	}
+	topLevelTail, err := onlineDDLTopLevelTail(sql)
+	if err != nil {
+		return err
+	}
+	for _, rename := range renameOperationPattern.FindAllStringIndex(topLevelTail, -1) {
+		if !renameMemberPattern.MatchString(topLevelTail[rename[0]:]) {
+			return fmt.Errorf("ALTER TABLE table rename is not supported because preflight cannot isolate the destination table")
+		}
+	}
+	if exchangePartitionPattern.MatchString(topLevelTail) {
+		return fmt.Errorf("ALTER TABLE EXCHANGE PARTITION is not supported because preflight cannot isolate the secondary table")
+	}
+	return nil
+}
+
+func qualifyUnqualifiedReferences(sql, defaultSchema string) (string, error) {
+	keywordMasked := maskSQLStringsAndComments(sql, true)
+	targetMasked := maskSQLStringsAndComments(sql, false)
+	keywords := referenceKeywordPattern.FindAllStringIndex(keywordMasked, -1)
+	if len(keywords) == 0 {
+		return sql, nil
+	}
+
+	result := sql
+	for i := len(keywords) - 1; i >= 0; i-- {
+		keywordEnd := keywords[i][1]
+		match := leadingTableReferencePattern.FindStringSubmatchIndex(targetMasked[keywordEnd:])
+		if len(match) < 4 {
+			return "", fmt.Errorf("could not parse table following REFERENCES")
+		}
+		targetStart := keywordEnd + match[2]
+		targetEnd := keywordEnd + match[3]
+		_, table, qualified, err := parseTableReference(sql[targetStart:targetEnd])
+		if err != nil {
+			return "", fmt.Errorf("invalid REFERENCES target: %w", err)
+		}
+		if qualified {
+			continue
+		}
+		qualifiedTarget := fmt.Sprintf("`%s`.`%s`", escapeIdent(defaultSchema), escapeIdent(table))
+		result = result[:targetStart] + qualifiedTarget + result[targetEnd:]
+	}
+	return result, nil
+}
+
+func (e *Executor) tableTargetsEqual(first, second TableInfo) (bool, error) {
+	if first == second {
+		return true, nil
+	}
+	if !strings.EqualFold(first.Database, second.Database) || !strings.EqualFold(first.Table, second.Table) {
+		return false, nil
+	}
+	if e.conn == nil {
+		return false, fmt.Errorf("database connection is required to check case-insensitive table names")
+	}
+
+	var lowerCaseTableNames int
+	if err := e.conn.QueryRow("SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
+		return false, fmt.Errorf("failed to read lower_case_table_names: %w", err)
+	}
+	return lowerCaseTableNames == 1 || lowerCaseTableNames == 2, nil
+}
+
 func (e *Executor) performBackup(options ExecuteOptions) (string, error) {
+	if options.Config == nil {
+		return "", fmt.Errorf("config is required for backup")
+	}
+	usage, err := prepareBackupFilesystem(options.Config.BackupDir, !options.Config.DisableSpaceChecks)
+	if err != nil {
+		return "", err
+	}
+
 	// Check disk space before performing backup
-	if options.Config == nil || !options.Config.DisableSpaceChecks {
-		if err := e.checkDiskSpace(options); err != nil {
+	if !options.Config.DisableSpaceChecks {
+		if err := e.checkDiskSpace(options, usage); err != nil {
 			if e.logger != nil {
 				e.logger.Errorf("disk space check failed for table %s: %v", options.TableName, err)
 			}
@@ -145,12 +347,22 @@ func (e *Executor) performBackup(options ExecuteOptions) (string, error) {
 	}
 }
 
+func prepareBackupFilesystem(path string, inspectUsage bool) (*disk.UsageStat, error) {
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create backup directory: %w", err)
+	}
+	if !inspectUsage {
+		return nil, nil
+	}
+	usage, err := disk.Usage(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check disk space: %w", err)
+	}
+	return usage, nil
+}
+
 func (e *Executor) checkDataDirFilesystemCapacity(options ExecuteOptions) error {
-	tableInfo, err := ParseTableName(options.TableName, func() (string, error) {
-		var db string
-		err := e.conn.QueryRow("SELECT DATABASE()").Scan(&db)
-		return db, err
-	})
+	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
 		return fmt.Errorf("failed to parse table name: %w", err)
 	}
@@ -165,8 +377,8 @@ func (e *Executor) checkDataDirFilesystemCapacity(options ExecuteOptions) error 
 
 	var dataLength, indexLength sql.NullInt64
 	err = e.conn.QueryRow(`
-		SELECT DATA_LENGTH, INDEX_LENGTH
-		FROM information_schema.TABLES
+			SELECT DATA_LENGTH, INDEX_LENGTH
+			FROM information_schema.TABLES
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 	`, tableInfo.Database, tableInfo.Table).Scan(&dataLength, &indexLength)
 	if err != nil {
@@ -181,13 +393,13 @@ func (e *Executor) checkDataDirFilesystemCapacity(options ExecuteOptions) error 
 		tableSizeBytes += indexLength.Int64
 	}
 
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(dataDir.String, &stat); err != nil {
+	usage, err := disk.Usage(dataDir.String)
+	if err != nil {
 		return fmt.Errorf("failed to check datadir filesystem capacity: %w", err)
 	}
 
-	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
-	freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
+	totalBytes := int64(usage.Total)
+	freeBytes := int64(usage.Free)
 	usedBytes := totalBytes - freeBytes
 	if totalBytes <= 0 {
 		return fmt.Errorf("invalid datadir filesystem size")
@@ -228,12 +440,7 @@ func (e *Executor) backupWithMysqldump(options ExecuteOptions) (string, error) {
 		return "", fmt.Errorf("mysql_host is required for backup")
 	}
 
-	// Parse table name
-	tableInfo, err := ParseTableName(options.TableName, func() (string, error) {
-		var db string
-		err := e.conn.QueryRow("SELECT DATABASE()").Scan(&db)
-		return db, err
-	})
+	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
 		return "", err
 	}
@@ -244,27 +451,19 @@ func (e *Executor) backupWithMysqldump(options ExecuteOptions) (string, error) {
 		mysqldump = "mysqldump"
 	}
 
-	// Ensure backup directory exists
-	if err := os.MkdirAll(options.Config.BackupDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create backup directory: %w", err)
-	}
-
 	// Generate timestamp prefix in YYMMDDHHMMSS format
 	timestamp := time.Now().Format("060102150405")
 	backupPath := fmt.Sprintf("%s/%s_%s_%s.sql", options.Config.BackupDir, timestamp, tableInfo.Database, tableInfo.Table)
 
-	args := []string{
-		"-h", host,
-		"-P", port,
-		"-u", user,
-		"-p" + password,
+	args := buildMysqldumpConnectionArgs(host, port, user, password)
+	args = append(args,
 		tableInfo.Database,
 		tableInfo.Table,
 		"--single-transaction",
 		"--quick",
 		"--lock-tables=false",
 		"-r", backupPath,
-	}
+	)
 
 	cmd := exec.Command(mysqldump, args...)
 
@@ -299,6 +498,14 @@ func (e *Executor) backupWithMysqldump(options ExecuteOptions) (string, error) {
 	return backupPath, nil
 }
 
+func buildMysqldumpConnectionArgs(host, port, user, password string) []string {
+	args := []string{"-u", user, "-p" + password}
+	if strings.HasPrefix(host, "/") {
+		return append([]string{"--socket=" + host}, args...)
+	}
+	return append([]string{"-h", host, "-P", port}, args...)
+}
+
 func buildXtrabackupConnectionArgs(host, port, user, password string) []string {
 	args := []string{
 		"--user=" + user,
@@ -323,12 +530,7 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 		return "", fmt.Errorf("mysql_host is required for backup")
 	}
 
-	// Parse table name
-	tableInfo, err := ParseTableName(options.TableName, func() (string, error) {
-		var db string
-		err := e.conn.QueryRow("SELECT DATABASE()").Scan(&db)
-		return db, err
-	})
+	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
 		return "", err
 	}
@@ -337,11 +539,6 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 	xtrabackup := options.Config.XtrabackupPath
 	if xtrabackup == "" {
 		xtrabackup = "xtrabackup"
-	}
-
-	// Ensure backup directory exists
-	if err := os.MkdirAll(options.Config.BackupDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create backup directory: %w", err)
 	}
 
 	// Generate timestamp prefix in YYMMDDHHMMSS format
@@ -425,15 +622,10 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 }
 
 // checkDiskSpace checks if there's enough disk space for the backup
-func (e *Executor) checkDiskSpace(options ExecuteOptions) error {
+func (e *Executor) checkDiskSpace(options ExecuteOptions, usage *disk.UsageStat) error {
 	var estimatedSize int64
 
-	// Parse table name to get database and table
-	tableInfo, err := ParseTableName(options.TableName, func() (string, error) {
-		var db string
-		err := e.conn.QueryRow("SELECT DATABASE()").Scan(&db)
-		return db, err
-	})
+	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
 		return fmt.Errorf("failed to parse table name: %w", err)
 	}
@@ -464,15 +656,11 @@ func (e *Executor) checkDiskSpace(options ExecuteOptions) error {
 	}
 	requiredSize := estimatedSize + int64(float64(estimatedSize)*bufferPercent/100.0)
 
-	// Check available space in backup directory
-	var stat syscall.Statfs_t
-	err = syscall.Statfs(options.Config.BackupDir, &stat)
-	if err != nil {
-		return fmt.Errorf("failed to check disk space: %w", err)
+	if usage == nil {
+		return fmt.Errorf("backup filesystem usage is required for disk space check")
 	}
 
-	// Calculate available space (blocks * block size)
-	availableBytes := int64(stat.Bavail) * int64(stat.Bsize)
+	availableBytes := int64(usage.Free)
 
 	if options.Debug {
 		e.debugf(options, "[DEBUG] Estimated backup size: %.2f MB", float64(estimatedSize)/(1024*1024))
@@ -494,8 +682,8 @@ func (e *Executor) checkDiskSpace(options ExecuteOptions) error {
 func (e *Executor) estimateMysqldumpSize(dbName, tableName string) (float64, error) {
 	var dataLength, indexLength sql.NullInt64
 	err := e.conn.QueryRow(`
-		SELECT DATA_LENGTH, INDEX_LENGTH 
-		FROM information_schema.TABLES 
+		SELECT DATA_LENGTH, INDEX_LENGTH
+		FROM information_schema.TABLES
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 	`, dbName, tableName).Scan(&dataLength, &indexLength)
 	if err != nil {
@@ -524,8 +712,8 @@ func (e *Executor) estimateMysqldumpSize(dbName, tableName string) (float64, err
 func (e *Executor) estimateXtrabackupSize(dbName string) (float64, error) {
 	var totalBytes sql.NullInt64
 	err := e.conn.QueryRow(`
-		SELECT SUM(DATA_LENGTH + INDEX_LENGTH) 
-		FROM information_schema.TABLES 
+		SELECT SUM(DATA_LENGTH + INDEX_LENGTH)
+		FROM information_schema.TABLES
 		WHERE TABLE_SCHEMA = ?
 	`, dbName).Scan(&totalBytes)
 	if err != nil {
@@ -571,28 +759,21 @@ func (e *Executor) dryRunPTOSC(options ExecuteOptions) error {
 		return fmt.Errorf("mysql_host is required for pt-online-schema-change")
 	}
 
-	tableInfo, err := ParseTableName(options.TableName, func() (string, error) {
-		var db string
-		err := e.conn.QueryRow("SELECT DATABASE()").Scan(&db)
-		return db, err
-	})
+	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
 		return err
 	}
 
-	// Extract ALTER statement
-	alterSQL := ExtractAlterStatement(options.SQL)
-	if alterSQL == "" {
-		alterSQL = options.SQL
+	alterSQL, err := buildPTOSCAlterSQL(options.SQL)
+	if err != nil {
+		return err
 	}
 
 	args := []string{
 		"--dry-run",
-		fmt.Sprintf("h=%s,P=%s,u=%s,p=%s,D=%s,t=%s", host, port, user, password, tableInfo.Database, tableInfo.Table),
+		buildPTOSCDSN(host, port, user, password, tableInfo.Database, tableInfo.Table),
 		fmt.Sprintf("--alter=%s", alterSQL),
 	}
-
-	cmd := exec.Command(ptosc, args...)
 
 	if options.Debug {
 		// Mask password in debug output
@@ -623,12 +804,10 @@ func (e *Executor) dryRunPTOSC(options ExecuteOptions) error {
 		e.debugf(options, "[DEBUG] pt-online-schema-change dry-run args: %s", strings.Join(safeArgs, " "))
 	}
 
-	output, err := cmd.CombinedOutput()
-	if options.Debug {
-		e.debugf(options, "[DEBUG] pt-online-schema-change dry-run output:\n%s", string(output))
-		if err != nil {
-			e.debugf(options, "[DEBUG] pt-online-schema-change dry-run error: %v", err)
-		}
+	output, err := e.combinedOutput(ptosc, args...)
+	e.debugf(options, "[DEBUG] pt-online-schema-change dry-run output:\n%s", string(output))
+	if err != nil {
+		e.debugf(options, "[DEBUG] pt-online-schema-change dry-run error: %v", err)
 	}
 
 	if err != nil {
@@ -656,27 +835,21 @@ func (e *Executor) runPTOSC(options ExecuteOptions) error {
 		return fmt.Errorf("mysql_host is required for pt-online-schema-change")
 	}
 
-	tableInfo, err := ParseTableName(options.TableName, func() (string, error) {
-		var db string
-		err := e.conn.QueryRow("SELECT DATABASE()").Scan(&db)
-		return db, err
-	})
+	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
 		return err
 	}
 
-	alterSQL := ExtractAlterStatement(options.SQL)
-	if alterSQL == "" {
-		alterSQL = options.SQL
+	alterSQL, err := buildPTOSCAlterSQL(options.SQL)
+	if err != nil {
+		return err
 	}
 
 	args := []string{
 		"--execute",
-		fmt.Sprintf("h=%s,P=%s,u=%s,p=%s,D=%s,t=%s", host, port, user, password, tableInfo.Database, tableInfo.Table),
+		buildPTOSCDSN(host, port, user, password, tableInfo.Database, tableInfo.Table),
 		fmt.Sprintf("--alter=%s", alterSQL),
 	}
-
-	cmd := exec.Command(ptosc, args...)
 
 	if options.Debug {
 		// Mask password in debug output
@@ -707,12 +880,10 @@ func (e *Executor) runPTOSC(options ExecuteOptions) error {
 		e.debugf(options, "[DEBUG] pt-online-schema-change execute args: %s", strings.Join(safeArgs, " "))
 	}
 
-	output, err := cmd.CombinedOutput()
-	if options.Debug {
-		e.debugf(options, "[DEBUG] pt-online-schema-change execute output:\n%s", string(output))
-		if err != nil {
-			e.debugf(options, "[DEBUG] pt-online-schema-change execute error: %v", err)
-		}
+	output, err := e.combinedOutput(ptosc, args...)
+	e.debugf(options, "[DEBUG] pt-online-schema-change execute output:\n%s", string(output))
+	if err != nil {
+		e.debugf(options, "[DEBUG] pt-online-schema-change execute error: %v", err)
 	}
 
 	if err != nil {
@@ -722,12 +893,172 @@ func (e *Executor) runPTOSC(options ExecuteOptions) error {
 	return nil
 }
 
+func buildPTOSCDSN(host, port, user, password, database, table string) string {
+	parts := make([]string, 0, 6)
+	if strings.HasPrefix(host, "/") {
+		parts = append(parts, "S="+host)
+	} else {
+		parts = append(parts, "h="+host, "P="+port)
+	}
+	parts = append(parts, "u="+user, "p="+password, "D="+database, "t="+table)
+	return strings.Join(parts, ",")
+}
+
+func buildPTOSCAlterSQL(sql string) (string, error) {
+	if containsExecutableSQLComment(sql) {
+		return "", fmt.Errorf("executable SQL comments are not allowed in pt-online-schema-change input")
+	}
+	if containsAmbiguousBackslashQuote(sql) {
+		return "", fmt.Errorf("backslash-escaped quotes are not allowed in pt-online-schema-change input because their meaning depends on sql_mode")
+	}
+
+	statement, _ := splitDDLStatementSuffix(sql)
+	if statement == "" {
+		return "", fmt.Errorf("empty SQL statement")
+	}
+	if strings.Contains(maskSQLStringsAndComments(statement, true), ";") {
+		return "", fmt.Errorf("multiple SQL statements are not allowed in pt-online-schema-change input")
+	}
+
+	masked := maskSQLStringsAndComments(statement, false)
+	if match := alterTableTargetPattern.FindStringSubmatchIndex(masked); len(match) >= 4 {
+		modifiers := strings.Fields(masked[:match[2]])
+		for i, modifier := range modifiers {
+			if strings.EqualFold(modifier, "IGNORE") {
+				return "", fmt.Errorf("ALTER IGNORE cannot be represented safely by pt-online-schema-change")
+			}
+			if strings.EqualFold(modifier, "IF") && i+1 < len(modifiers) && strings.EqualFold(modifiers[i+1], "EXISTS") {
+				return "", fmt.Errorf("ALTER TABLE IF EXISTS cannot be represented safely by pt-online-schema-change")
+			}
+		}
+		return stripAlterOnlineDDLClauses(statement[match[3]:])
+	}
+
+	match := createIndexPTOSCPattern.FindStringSubmatchIndex(masked)
+	if len(match) < 6 {
+		return "", fmt.Errorf("unsupported DDL for pt-online-schema-change; expected ALTER TABLE or CREATE INDEX")
+	}
+	definition := strings.TrimSpace(statement[match[2]:match[3]])
+	tail := stripCreateIndexOnlineDDLClauses(statement[match[5]:])
+	if tail == "" || !strings.HasPrefix(strings.TrimSpace(tail), "(") {
+		return "", fmt.Errorf("invalid CREATE INDEX column definition")
+	}
+	if createIndexWaitPattern.MatchString(maskTopLevelSQL(tail)) {
+		return "", fmt.Errorf("CREATE INDEX WAIT/NOWAIT cannot be represented safely by pt-online-schema-change")
+	}
+	return "ADD " + definition + " " + strings.TrimSpace(tail), nil
+}
+
+func stripAlterOnlineDDLClauses(body string) (string, error) {
+	masked := maskSQLStringsAndComments(body, true)
+	start := 0
+	depth := 0
+	kept := make([]string, 0, 4)
+
+	appendClause := func(end int) {
+		rawClause := strings.TrimSpace(body[start:end])
+		maskedClause := strings.TrimSpace(masked[start:end])
+		if rawClause != "" && !alterOnlineDDLClausePattern.MatchString(maskedClause) {
+			kept = append(kept, rawClause)
+		}
+	}
+
+	for i := range masked {
+		switch masked[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				appendClause(i)
+				start = i + 1
+			}
+		}
+	}
+	appendClause(len(body))
+
+	if len(kept) == 0 {
+		return "", fmt.Errorf("ALTER TABLE contains no change supported by pt-online-schema-change")
+	}
+	return strings.Join(kept, ", "), nil
+}
+
+func stripCreateIndexOnlineDDLClauses(tail string) string {
+	masked := []byte(maskTopLevelSQL(tail))
+
+	clausePattern := regexp.MustCompile(`(?i)\b(?:ALGORITHM|LOCK)\b\s*(?:=\s*|\s+)(?:DEFAULT|INPLACE|COPY|INSTANT|NOCOPY|NONE|SHARED|EXCLUSIVE)\b`)
+	spans := clausePattern.FindAllStringIndex(string(masked), -1)
+	if len(spans) == 0 {
+		return strings.TrimSpace(tail)
+	}
+
+	var result strings.Builder
+	last := 0
+	for _, span := range spans {
+		result.WriteString(tail[last:span[0]])
+		last = span[1]
+	}
+	result.WriteString(tail[last:])
+	return strings.TrimSpace(result.String())
+}
+
+func maskTopLevelSQL(sql string) string {
+	masked := []byte(maskSQLStringsAndComments(sql, true))
+	depth := 0
+	for i := range masked {
+		switch masked[i] {
+		case '(':
+			depth++
+			masked[i] = ' '
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			masked[i] = ' '
+		default:
+			if depth > 0 {
+				masked[i] = ' '
+			}
+		}
+	}
+	return string(masked)
+}
+
+func isOnlineDDLUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errOnlineDDLUnsupported) {
+		return true
+	}
+
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case 1845, 1846, 1847, 1848, 1849, 1850, 1851, 1852, 1853, 1854, 1855, 1856, 1857,
+			1861, 3060, 3103, 3178, 3187, 4083, 4157, 4158:
+			return true
+		}
+	}
+
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "try algorithm=copy") {
+		return true
+	}
+	for _, qualifier := range []string{"algorithm=inplace", "algorithm=nocopy", "algorithm=instant", "lock=none"} {
+		if strings.Contains(message, qualifier) &&
+			(strings.Contains(message, "not supported") || strings.Contains(message, "unsupported")) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Executor) executeWithOnlineDDL(options ExecuteOptions, result *ExecuteResult) error {
-	tableInfo, err := ParseTableName(options.TableName, func() (string, error) {
-		var db string
-		err := e.conn.QueryRow("SELECT DATABASE()").Scan(&db)
-		return db, err
-	})
+	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
 		return fmt.Errorf("failed to parse table name: %w", err)
 	}
@@ -740,19 +1071,9 @@ func (e *Executor) executeWithOnlineDDL(options ExecuteOptions, result *ExecuteR
 		return fmt.Errorf("test schema is required for online DDL preflight")
 	}
 
-	testTableName := fmt.Sprintf("_releem_ddl_test_%s_%d", tableInfo.Table, time.Now().UnixNano())
+	testTableName := buildOnlineDDLTestTableName(tableInfo.Database, tableInfo.Table, time.Now().UnixNano())
 	testTableRef := fmt.Sprintf("`%s`.`%s`", escapeIdent(testSchema), escapeIdent(testTableName))
 	sourceTableRef := fmt.Sprintf("`%s`.`%s`", escapeIdent(tableInfo.Database), escapeIdent(tableInfo.Table))
-
-	if _, err = e.conn.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", escapeIdent(testSchema))); err != nil {
-		return fmt.Errorf("failed to create test schema %s: %w", testSchema, err)
-	}
-	if _, err = e.conn.Exec(fmt.Sprintf("CREATE TABLE %s LIKE %s", testTableRef, sourceTableRef)); err != nil {
-		return fmt.Errorf("failed to create test table %s: %w", testTableRef, err)
-	}
-	defer func() {
-		_, _ = e.conn.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", testTableRef))
-	}()
 
 	finalSQL, err := buildOnlineDDLSQL(options.SQL)
 	if err != nil {
@@ -763,34 +1084,54 @@ func (e *Executor) executeWithOnlineDDL(options ExecuteOptions, result *ExecuteR
 		return fmt.Errorf("failed to prepare test DDL SQL: %w", err)
 	}
 
-	if options.Debug {
-		e.debugf(options, "[DEBUG] Online DDL preflight SQL (test table):\n%s", testSQL)
-	}
-	if _, err = e.conn.Exec(testSQL); err != nil {
-		return fmt.Errorf("online DDL preflight failed on test table %s: %w", testTableRef, err)
-	}
+	var scratchCleanupErr error
+	executionErr, cleanupErr := withPinnedLockWaitTimeout(
+		context.Background(), e.conn, 20,
+		func(ctx context.Context, conn *sql.Conn) (callbackErr error) {
+			if _, callbackErr = conn.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", escapeIdent(testSchema))); callbackErr != nil {
+				return fmt.Errorf("failed to create test schema %s: %w", testSchema, callbackErr)
+			}
+			if _, callbackErr = conn.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %s LIKE %s", testTableRef, sourceTableRef)); callbackErr != nil {
+				return fmt.Errorf("failed to create test table %s: %w", testTableRef, callbackErr)
+			}
+			defer func() {
+				if dropErr := cleanupOnlineDDLTestTable(conn, testTableRef, onlineDDLCleanupTimeout); dropErr != nil {
+					scratchCleanupErr = fmt.Errorf("failed to drop Online DDL test table %s: %w", testTableRef, dropErr)
+				}
+			}()
 
-	if options.Debug {
-		e.debugf(options, "[DEBUG] Executing Online DDL statement:\n%s", finalSQL)
-	}
-	if _, err = e.conn.Exec("SET SESSION lock_wait_timeout = 20"); err != nil {
-		return fmt.Errorf("failed to set session lock_wait_timeout: %w", err)
-	}
-	_, err = e.conn.Exec(finalSQL)
-	if options.Debug {
-		if err != nil {
-			e.debugf(options, "[DEBUG] Online DDL execution error: %v", err)
-		} else {
-			e.debugf(options, "[DEBUG] Online DDL execution successful")
+			e.debugf(options, "[DEBUG] Online DDL preflight SQL (test table):\n%s", testSQL)
+			if _, callbackErr = conn.ExecContext(ctx, testSQL); callbackErr != nil {
+				return fmt.Errorf("online DDL preflight failed on test table %s: %w", testTableRef, callbackErr)
+			}
+
+			e.debugf(options, "[DEBUG] Executing Online DDL statement:\n%s", finalSQL)
+			_, callbackErr = conn.ExecContext(ctx, finalSQL)
+			return callbackErr
+		},
+	)
+	if scratchCleanupErr != nil {
+		result.Warnings = append(result.Warnings, scratchCleanupErr.Error())
+		if e.logger != nil {
+			e.logger.Errorf("Online DDL scratch cleanup failed for table %s: %v", options.TableName, scratchCleanupErr)
 		}
+	}
+	if cleanupErr != nil {
+		result.Warnings = append(result.Warnings, cleanupErr.Error())
+		if e.logger != nil {
+			e.logger.Errorf("Online DDL session cleanup failed for table %s: %v", options.TableName, cleanupErr)
+		}
+	}
+	err = executionErr
+	if err != nil {
+		result.Warnings = append(result.Warnings, err.Error())
+		e.debugf(options, "[DEBUG] Online DDL execution error: %v", err)
+	} else {
+		e.debugf(options, "[DEBUG] Online DDL execution successful")
 	}
 
 	if err != nil {
-		// Check if error is due to Online DDL not being supported
-		errStr := err.Error()
-		if strings.Contains(errStr, "ALGORITHM=INPLACE") ||
-			strings.Contains(errStr, "LOCK=NONE") ||
-			strings.Contains(errStr, "ALGORITHM=INPLACE is not supported") {
+		if isOnlineDDLUnsupported(err) {
 			result.Warnings = append(result.Warnings,
 				"Online DDL not supported for this operation")
 			return err
@@ -801,45 +1142,226 @@ func (e *Executor) executeWithOnlineDDL(options ExecuteOptions, result *ExecuteR
 	return nil
 }
 
+func buildOnlineDDLTestTableName(schema, table string, nonce int64) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", schema, table, nonce)))
+	return fmt.Sprintf("_releem_ddl_test_%x", digest[:16])
+}
+
+func executeOnlineDDLOnPinnedConn(ctx context.Context, db *sql.DB, ddl string, lockWaitTimeout int64) (executionErr, cleanupErr error) {
+	return withPinnedLockWaitTimeout(ctx, db, lockWaitTimeout, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, ddl)
+		return err
+	})
+}
+
+func withPinnedLockWaitTimeout(
+	ctx context.Context,
+	db *sql.DB,
+	lockWaitTimeout int64,
+	callback func(context.Context, *sql.Conn) error,
+) (executionErr, cleanupErr error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire SQL connection: %w", err), nil
+	}
+	defer conn.Close()
+
+	var previousTimeout int64
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.lock_wait_timeout").Scan(&previousTimeout); err != nil {
+		return fmt.Errorf("failed to read session lock_wait_timeout: %w", err), nil
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION lock_wait_timeout = %d", lockWaitTimeout)); err != nil {
+		return fmt.Errorf("failed to set session lock_wait_timeout: %w", err), nil
+	}
+
+	defer func() {
+		restoreCtx, cancel := context.WithTimeout(context.Background(), onlineDDLCleanupTimeout)
+		defer cancel()
+		_, restoreErr := conn.ExecContext(restoreCtx, fmt.Sprintf("SET SESSION lock_wait_timeout = %d", previousTimeout))
+		if restoreErr != nil {
+			cleanupErr = fmt.Errorf("failed to restore session lock_wait_timeout: %w", restoreErr)
+			// Never return a session with the reduced timeout to the shared pool.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}()
+
+	executionErr = callback(ctx, conn)
+	return executionErr, cleanupErr
+}
+
+func cleanupOnlineDDLTestTable(conn *sql.Conn, tableRef string, timeout time.Duration) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	_, err := conn.ExecContext(cleanupCtx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tableRef))
+	if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+	return err
+}
+
 func buildOnlineDDLSQL(sql string) (string, error) {
-	sql = strings.TrimSpace(strings.TrimSuffix(sql, ";"))
-	if sql == "" {
+	if containsExecutableSQLComment(sql) {
+		return "", fmt.Errorf("executable SQL comments are not allowed in Online DDL")
+	}
+	if containsAmbiguousBackslashQuote(sql) {
+		return "", fmt.Errorf("backslash-escaped quotes are not allowed in Online DDL because their meaning depends on sql_mode")
+	}
+	statement, suffix := splitDDLStatementSuffix(sql)
+	if statement == "" {
 		return "", fmt.Errorf("empty SQL statement")
 	}
-
-	upperSQL := strings.ToUpper(sql)
-	hasAlgorithm := strings.Contains(upperSQL, "ALGORITHM=")
-	hasLock := strings.Contains(upperSQL, "LOCK=")
-	if hasAlgorithm && hasLock {
-		return sql, nil
+	if strings.Contains(maskSQLStringsAndComments(statement, true), ";") {
+		return "", fmt.Errorf("multiple SQL statements are not allowed in Online DDL")
 	}
 
-	separator, err := getOnlineDDLClauseSeparator(upperSQL)
+	topLevelTail, err := onlineDDLTopLevelTail(statement)
+	if err != nil {
+		return "", err
+	}
+	algorithm, hasAlgorithm, err := onlineDDLClauseValue(topLevelTail, "ALGORITHM")
+	if err != nil {
+		return "", err
+	}
+	lock, hasLock, err := onlineDDLClauseValue(topLevelTail, "LOCK")
+	if err != nil {
+		return "", err
+	}
+	if hasAlgorithm && algorithm != "INPLACE" && algorithm != "INSTANT" && algorithm != "NOCOPY" {
+		if algorithm == "COPY" || algorithm == "DEFAULT" {
+			return "", fmt.Errorf("%w: unsafe Online DDL algorithm %s; expected INPLACE, INSTANT, or NOCOPY", errOnlineDDLUnsupported, algorithm)
+		}
+		return "", fmt.Errorf("unsafe Online DDL algorithm %s; expected INPLACE, INSTANT, or NOCOPY", algorithm)
+	}
+	if hasLock && lock != "NONE" {
+		if lock == "DEFAULT" || lock == "SHARED" || lock == "EXCLUSIVE" {
+			return "", fmt.Errorf("%w: unsafe Online DDL lock %s; expected NONE", errOnlineDDLUnsupported, lock)
+		}
+		return "", fmt.Errorf("unsafe Online DDL lock %s; expected NONE", lock)
+	}
+	if hasAlgorithm && hasLock {
+		return statement + normalizeDDLSuffix(suffix), nil
+	}
+
+	separator, err := getOnlineDDLClauseSeparator(statement)
 	if err != nil {
 		return "", err
 	}
 
 	if !hasAlgorithm {
-		sql += separator + "ALGORITHM=INPLACE"
+		statement += separator + "ALGORITHM=INPLACE"
 	}
 	if !hasLock {
-		sql += separator + "LOCK=NONE"
+		statement += separator + "LOCK=NONE"
 	}
 
-	return sql, nil
+	return statement + normalizeDDLSuffix(suffix), nil
 }
 
-func getOnlineDDLClauseSeparator(upperSQL string) (string, error) {
+func splitDDLStatementSuffix(sql string) (string, string) {
+	sql = strings.TrimSpace(sql)
+	if sql == "" {
+		return "", ""
+	}
+
+	commentMasked := maskSQLComments(sql)
+	lastCodeEnd := len(strings.TrimRightFunc(commentMasked, unicode.IsSpace))
+	if lastCodeEnd == 0 {
+		return "", ""
+	}
+
+	semicolonIndex := -1
+	statementEnd := lastCodeEnd
+	if commentMasked[lastCodeEnd-1] == ';' {
+		semicolonIndex = lastCodeEnd - 1
+		statementEnd = len(strings.TrimRightFunc(commentMasked[:semicolonIndex], unicode.IsSpace))
+		if statementEnd == 0 {
+			return "", ""
+		}
+	}
+
+	suffix := sql[statementEnd:]
+	if semicolonIndex >= 0 {
+		suffix = sql[statementEnd:semicolonIndex] + sql[semicolonIndex+1:]
+	}
+	return strings.TrimSpace(sql[:statementEnd]), strings.TrimSpace(suffix)
+}
+
+func normalizeDDLSuffix(suffix string) string {
+	if suffix == "" {
+		return ""
+	}
+	if unicode.IsSpace(rune(suffix[0])) {
+		return suffix
+	}
+	return " " + suffix
+}
+
+func onlineDDLTopLevelTail(sql string) (string, error) {
+	targetMasked := maskSQLStringsAndComments(sql, false)
+	match := alterTableTargetPattern.FindStringSubmatchIndex(targetMasked)
+	if len(match) < 4 {
+		match = createIndexTargetPattern.FindStringSubmatchIndex(targetMasked)
+	}
+	if len(match) < 4 {
+		return "", fmt.Errorf("unsupported DDL for online clauses; expected ALTER TABLE or CREATE INDEX variant")
+	}
+
+	masked := []byte(maskSQLStringsAndComments(sql, true))
+	depth := 0
+	for i := match[3]; i < len(masked); i++ {
+		switch masked[i] {
+		case '(':
+			depth++
+			masked[i] = ' '
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			masked[i] = ' '
+		default:
+			if depth > 0 {
+				masked[i] = ' '
+			}
+		}
+	}
+	return string(masked[match[3]:]), nil
+}
+
+func onlineDDLClauseValue(topLevelTail, clause string) (string, bool, error) {
+	knownValues := "DEFAULT|INPLACE|COPY|INSTANT|NOCOPY"
+	if clause == "LOCK" {
+		knownValues = "DEFAULT|NONE|SHARED|EXCLUSIVE"
+	}
+
+	assignmentPattern := regexp.MustCompile("(?i)\\b" + clause + "\\s*=\\s*([A-Z_]+)")
+	assignmentStartPattern := regexp.MustCompile("(?i)\\b" + clause + "\\s*=")
+	spacePattern := regexp.MustCompile("(?i)\\b" + clause + "\\s+(" + knownValues + ")\\b")
+	assignmentStarts := assignmentStartPattern.FindAllStringIndex(topLevelTail, -1)
+	assignments := assignmentPattern.FindAllStringSubmatch(topLevelTail, -1)
+	spaces := spacePattern.FindAllStringSubmatch(topLevelTail, -1)
+	if len(assignmentStarts) != len(assignments) {
+		return "", false, fmt.Errorf("invalid Online DDL clause %s", clause)
+	}
+	if len(assignments)+len(spaces) == 0 {
+		return "", false, nil
+	}
+	if len(assignments)+len(spaces) > 1 {
+		return "", false, fmt.Errorf("duplicate Online DDL clause %s", clause)
+	}
+	if len(assignments) == 1 {
+		return strings.ToUpper(assignments[0][1]), true, nil
+	}
+	return strings.ToUpper(spaces[0][1]), true, nil
+}
+
+func getOnlineDDLClauseSeparator(sql string) (string, error) {
+	masked := maskSQLStringsAndComments(sql, false)
 	switch {
-	case strings.HasPrefix(upperSQL, "ALTER TABLE "):
+	case alterTableTargetPattern.MatchString(masked):
 		// ALTER TABLE appends options as table_options separated by commas.
 		return ", ", nil
-	case strings.HasPrefix(upperSQL, "CREATE INDEX "),
-		strings.HasPrefix(upperSQL, "CREATE UNIQUE INDEX "),
-		strings.HasPrefix(upperSQL, "CREATE FULLTEXT INDEX "),
-		strings.HasPrefix(upperSQL, "CREATE SPATIAL INDEX "),
-		strings.HasPrefix(upperSQL, "CREATE OR REPLACE INDEX "),
-		strings.HasPrefix(upperSQL, "CREATE INDEX IF NOT EXISTS "):
+	case createIndexTargetPattern.MatchString(masked):
 		// CREATE INDEX forms use whitespace before ALGORITHM/LOCK clauses.
 		return " ", nil
 	default:
@@ -848,16 +1370,15 @@ func getOnlineDDLClauseSeparator(upperSQL string) (string, error) {
 }
 
 func rewriteDDLTargetTable(sql, newTableRef string) (string, error) {
-	reAlter := regexp.MustCompile("(?i)^\\s*ALTER\\s+TABLE\\s+((`[^`]+`|[A-Za-z0-9_]+)(\\.(?:`[^`]+`|[A-Za-z0-9_]+))?)")
-	if m := reAlter.FindStringSubmatch(sql); len(m) > 1 {
-		return strings.Replace(sql, m[1], newTableRef, 1), nil
+	masked := maskSQLStringsAndComments(sql, false)
+	if match := alterTableTargetPattern.FindStringSubmatchIndex(masked); len(match) >= 4 {
+		return sql[:match[2]] + newTableRef + sql[match[3]:], nil
 	}
 
 	// Column list may follow the table ref immediately (e.g. ON `db`.`tbl`(`col`)).
 	// No trailing \b: a word boundary is absent between `)` and `(`.
-	reCreateIdx := regexp.MustCompile("(?i)\\bON\\s+((`[^`]+`|[A-Za-z0-9_]+)(\\.(?:`[^`]+`|[A-Za-z0-9_]+))?)")
-	if m := reCreateIdx.FindStringSubmatch(sql); len(m) > 1 {
-		return strings.Replace(sql, m[1], newTableRef, 1), nil
+	if match := createIndexTargetPattern.FindStringSubmatchIndex(masked); len(match) >= 4 {
+		return sql[:match[2]] + newTableRef + sql[match[3]:], nil
 	}
 
 	return "", fmt.Errorf("could not locate target table in DDL statement")
