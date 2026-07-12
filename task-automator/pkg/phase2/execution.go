@@ -91,6 +91,65 @@ type ExecuteResult struct {
 	Errors          []string
 }
 
+type executionStage struct {
+	executor *Executor
+	options  ExecuteOptions
+	name     string
+	started  time.Time
+	finished bool
+}
+
+func (e *Executor) beginStage(options ExecuteOptions, name string) *executionStage {
+	stage := &executionStage{executor: e, options: options, name: name, started: time.Now()}
+	e.logStage(options, name, "started", 0, "")
+	return stage
+}
+
+func (s *executionStage) finish(status, reason string) {
+	if s == nil || s.finished {
+		return
+	}
+	s.finished = true
+	s.executor.logStage(s.options, s.name, status, time.Since(s.started), reason)
+}
+
+func (e *Executor) logStage(options ExecuteOptions, stage, status string, duration time.Duration, reason string) {
+	if e.logger == nil {
+		return
+	}
+	table := executionLogTable(options)
+	message := fmt.Sprintf("Schema change check: stage=%s status=%s table=%s", stage, status, table)
+	if status != "started" {
+		message += fmt.Sprintf(" duration_ms=%d", duration.Milliseconds())
+	}
+	if reason = sanitizeExecutionLogReason(options, reason); reason != "" {
+		message += fmt.Sprintf(" reason=%q", reason)
+	}
+	if status == "failed" {
+		e.logger.Errorf("%s", message)
+		return
+	}
+	e.logger.Infof("%s", message)
+}
+
+func executionLogTable(options ExecuteOptions) string {
+	if options.Target != nil && options.Target.Database != "" && options.Target.Table != "" {
+		return options.Target.Database + "." + options.Target.Table
+	}
+	if table := strings.Trim(options.TableName, " `"); table != "" {
+		return strings.ReplaceAll(table, "`.`", ".")
+	}
+	return "unknown"
+}
+
+func sanitizeExecutionLogReason(options ExecuteOptions, reason string) string {
+	reason = strings.Join(strings.Fields(reason), " ")
+	if options.Config != nil && options.Config.MysqlPassword != "" {
+		reason = strings.ReplaceAll(reason, options.Config.MysqlPassword, "***")
+	}
+	return reason
+}
+
 // Execute performs Phase 2 schema change execution
 func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 	result := &ExecuteResult{
@@ -98,65 +157,106 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 		Errors:   []string{},
 	}
 
+	targetStage := e.beginStage(options, "target_validation")
 	if options.Target == nil && strings.TrimSpace(options.TableName) == "" {
+		targetStage.finish("failed", "table name is required")
 		return nil, fmt.Errorf("table name is required for schema change execution")
 	}
 	qualifiedSQL, resolvedTarget, err := e.validateDDLTarget(options.SQL, options.TableName, options.Target)
 	if err != nil {
+		targetStage.finish("failed", err.Error())
 		return nil, err
 	}
 	canonicalTable := fmt.Sprintf("`%s`.`%s`", escapeIdent(resolvedTarget.Database), escapeIdent(resolvedTarget.Table))
 	options.SQL = qualifiedSQL
 	options.TableName = canonicalTable
 	options.Target = &resolvedTarget
+	targetStage.options = options
+	targetStage.finish("passed", "SQL target matches analyzed target")
+
+	policyStage := e.beginStage(options, "execution_policy")
+	policyStage.finish("passed", fmt.Sprintf("ok_online_ddl=%t ok_pt_osc=%t backup_method=%s", options.OkOnlineDDL, options.OkPTOSC, options.BackupMethod))
 
 	// Validate datadir filesystem headroom before attempting any schema change.
 	if options.Config == nil || !options.Config.DisableSpaceChecks {
+		capacityStage := e.beginStage(options, "datadir_capacity")
 		if err := e.checkDataDirFilesystemCapacity(options); err != nil {
+			capacityStage.finish("failed", err.Error())
 			return nil, err
 		}
+		capacityStage.finish("passed", "")
+	} else {
+		stage := e.beginStage(options, "datadir_capacity")
+		stage.finish("skipped", "space checks are disabled")
 	}
 
 	// 2.1. Perform backup if specified
 	if options.BackupMethod != BackupNone {
+		backupStage := e.beginStage(options, "backup")
 		backupPath, err := e.performBackup(options)
 		if err != nil {
+			backupStage.finish("failed", err.Error())
 			return nil, fmt.Errorf("backup failed: %w", err)
 		}
+		backupStage.finish("passed", fmt.Sprintf("method=%s", options.BackupMethod))
 		result.BackupPerformed = true
 		result.BackupPath = backupPath
+	} else {
+		stage := e.beginStage(options, "backup")
+		stage.finish("skipped", "backup is not required")
 	}
 
 	// 2.3. Execute using Online DDL if allowed
 	if options.OkOnlineDDL {
+		methodStage := e.beginStage(options, "online_ddl")
 		if err := e.executeWithOnlineDDL(options, result); err != nil {
+			methodStage.finish("failed", err.Error())
 			if options.OkPTOSC && isOnlineDDLUnsupported(err) {
+				fallbackStage := e.beginStage(options, "ptosc_fallback")
+				fallbackStage.finish("passed", err.Error())
 				result.Warnings = append(result.Warnings,
 					fmt.Sprintf("Online DDL unavailable; used pt-online-schema-change: %v", err))
 				if e.logger != nil {
 					e.logger.Infof("Online DDL not possible for table %s (%v); falling back to pt-online-schema-change", options.TableName, err)
 				}
+				ptoscStage := e.beginStage(options, "ptosc")
 				if ptErr := e.executeWithPTOSC(options); ptErr != nil {
+					ptoscStage.finish("failed", ptErr.Error())
 					return nil, fmt.Errorf("pt-online-schema-change execution failed: %w", ptErr)
 				}
+				ptoscStage.finish("passed", "fallback completed")
 				result.ChangeExecuted = true
 				result.MethodUsed = "pt-online-schema-change"
+				completedStage := e.beginStage(options, "execution_complete")
+				completedStage.finish("passed", "method=pt-online-schema-change fallback=true")
 				return result, nil
 			}
 			return nil, fmt.Errorf("schema change execution failed: %w", err)
 		}
+		methodStage.finish("passed", "")
 		// <<<<< TEST ONLINE DDL AGAINST EMPTY TABLE with SAME ENGINE AND SCHEMA
 		result.ChangeExecuted = true
 		result.MethodUsed = "Online DDL"
+		completedStage := e.beginStage(options, "execution_complete")
+		completedStage.finish("passed", "method=Online DDL")
 		return result, nil
 	} else if options.OkPTOSC {
+		stage := e.beginStage(options, "online_ddl")
+		stage.finish("skipped", "Platform analysis did not allow Online DDL")
+		ptoscStage := e.beginStage(options, "ptosc")
 		if err := e.executeWithPTOSC(options); err != nil {
+			ptoscStage.finish("failed", err.Error())
 			return nil, fmt.Errorf("pt-online-schema-change execution failed: %w", err)
 		}
+		ptoscStage.finish("passed", "")
 		result.ChangeExecuted = true
 		result.MethodUsed = "pt-online-schema-change"
+		completedStage := e.beginStage(options, "execution_complete")
+		completedStage.finish("passed", "method=pt-online-schema-change")
 		return result, nil
 	} else {
+		stage := e.beginStage(options, "execution_method")
+		stage.finish("failed", "neither Online DDL nor pt-online-schema-change is allowed")
 		result.ChangeExecuted = false
 		return nil, fmt.Errorf("schema change could not be executed")
 
@@ -322,19 +422,28 @@ func (e *Executor) performBackup(options ExecuteOptions) (string, error) {
 	if options.Config == nil {
 		return "", fmt.Errorf("config is required for backup")
 	}
+	filesystemStage := e.beginStage(options, "backup_filesystem")
 	usage, err := prepareBackupFilesystem(options.Config.BackupDir, !options.Config.DisableSpaceChecks)
 	if err != nil {
+		filesystemStage.finish("failed", err.Error())
 		return "", err
 	}
+	filesystemStage.finish("passed", "backup directory is ready")
 
 	// Check disk space before performing backup
 	if !options.Config.DisableSpaceChecks {
+		capacityStage := e.beginStage(options, "backup_capacity")
 		if err := e.checkDiskSpace(options, usage); err != nil {
+			capacityStage.finish("failed", err.Error())
 			if e.logger != nil {
 				e.logger.Errorf("disk space check failed for table %s: %v", options.TableName, err)
 			}
 			return "", err
 		}
+		capacityStage.finish("passed", "")
+	} else {
+		stage := e.beginStage(options, "backup_capacity")
+		stage.finish("skipped", "space checks are disabled")
 	}
 
 	switch options.BackupMethod {
@@ -733,12 +842,22 @@ func (e *Executor) estimateXtrabackupSize(dbName string) (float64, error) {
 
 func (e *Executor) executeWithPTOSC(options ExecuteOptions) error {
 	// Perform dry-run first
+	dryRunStage := e.beginStage(options, "ptosc_dry_run")
 	if err := e.dryRunPTOSC(options); err != nil {
+		dryRunStage.finish("failed", err.Error())
 		return fmt.Errorf("pt-online-schema-change dry-run failed: %w", err)
 	}
+	dryRunStage.finish("passed", "")
 
 	// Execute actual change
-	return e.runPTOSC(options)
+	executionStage := e.beginStage(options, "ptosc_execution")
+	err := e.runPTOSC(options)
+	if err != nil {
+		executionStage.finish("failed", err.Error())
+		return err
+	}
+	executionStage.finish("passed", "")
+	return nil
 }
 
 func (e *Executor) dryRunPTOSC(options ExecuteOptions) error {
@@ -1058,8 +1177,10 @@ func isOnlineDDLUnsupported(err error) bool {
 }
 
 func (e *Executor) executeWithOnlineDDL(options ExecuteOptions, result *ExecuteResult) error {
+	prepareStage := e.beginStage(options, "online_ddl_prepare")
 	tableInfo, err := resolvedExecutionTarget(options)
 	if err != nil {
+		prepareStage.finish("failed", err.Error())
 		return fmt.Errorf("failed to parse table name: %w", err)
 	}
 
@@ -1068,6 +1189,7 @@ func (e *Executor) executeWithOnlineDDL(options ExecuteOptions, result *ExecuteR
 		testSchema = options.Config.OnlineDDLTestSchema
 	}
 	if strings.TrimSpace(testSchema) == "" {
+		prepareStage.finish("failed", "test schema is required")
 		return fmt.Errorf("test schema is required for online DDL preflight")
 	}
 
@@ -1077,39 +1199,70 @@ func (e *Executor) executeWithOnlineDDL(options ExecuteOptions, result *ExecuteR
 
 	finalSQL, err := buildOnlineDDLSQL(options.SQL)
 	if err != nil {
+		prepareStage.finish("failed", err.Error())
 		return err
 	}
 	testSQL, err := rewriteDDLTargetTable(finalSQL, testTableRef)
 	if err != nil {
+		prepareStage.finish("failed", err.Error())
 		return fmt.Errorf("failed to prepare test DDL SQL: %w", err)
 	}
+	prepareStage.finish("passed", "Online DDL and scratch statements are ready")
 
 	var scratchCleanupErr error
+	sessionStage := e.beginStage(options, "online_ddl_session")
 	executionErr, cleanupErr := withPinnedLockWaitTimeout(
 		context.Background(), e.conn, 20,
 		func(ctx context.Context, conn *sql.Conn) (callbackErr error) {
+			schemaStage := e.beginStage(options, "online_ddl_scratch_schema")
 			if _, callbackErr = conn.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", escapeIdent(testSchema))); callbackErr != nil {
+				schemaStage.finish("failed", callbackErr.Error())
 				return fmt.Errorf("failed to create test schema %s: %w", testSchema, callbackErr)
 			}
+			schemaStage.finish("passed", "")
+
+			tableStage := e.beginStage(options, "online_ddl_scratch_table")
 			if _, callbackErr = conn.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %s LIKE %s", testTableRef, sourceTableRef)); callbackErr != nil {
+				tableStage.finish("failed", callbackErr.Error())
 				return fmt.Errorf("failed to create test table %s: %w", testTableRef, callbackErr)
 			}
+			tableStage.finish("passed", "")
 			defer func() {
+				cleanupStage := e.beginStage(options, "online_ddl_scratch_cleanup")
 				if dropErr := cleanupOnlineDDLTestTable(conn, testTableRef, onlineDDLCleanupTimeout); dropErr != nil {
 					scratchCleanupErr = fmt.Errorf("failed to drop Online DDL test table %s: %w", testTableRef, dropErr)
+					cleanupStage.finish("failed", dropErr.Error())
+					return
 				}
+				cleanupStage.finish("passed", "")
 			}()
 
 			e.debugf(options, "[DEBUG] Online DDL preflight SQL (test table):\n%s", testSQL)
+			preflightStage := e.beginStage(options, "online_ddl_preflight")
 			if _, callbackErr = conn.ExecContext(ctx, testSQL); callbackErr != nil {
+				preflightStage.finish("failed", callbackErr.Error())
 				return fmt.Errorf("online DDL preflight failed on test table %s: %w", testTableRef, callbackErr)
 			}
+			preflightStage.finish("passed", "")
 
 			e.debugf(options, "[DEBUG] Executing Online DDL statement:\n%s", finalSQL)
+			productionStage := e.beginStage(options, "online_ddl_production")
 			_, callbackErr = conn.ExecContext(ctx, finalSQL)
+			if callbackErr != nil {
+				productionStage.finish("failed", callbackErr.Error())
+			} else {
+				productionStage.finish("passed", "")
+			}
 			return callbackErr
 		},
 	)
+	if executionErr != nil {
+		sessionStage.finish("failed", executionErr.Error())
+	} else if cleanupErr != nil {
+		sessionStage.finish("failed", cleanupErr.Error())
+	} else {
+		sessionStage.finish("passed", "lock_wait_timeout restored")
+	}
 	if scratchCleanupErr != nil {
 		result.Warnings = append(result.Warnings, scratchCleanupErr.Error())
 		if e.logger != nil {

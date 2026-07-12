@@ -52,6 +52,44 @@ func TestBackupMethod(t *testing.T) {
 	}
 }
 
+func TestExecutionStageLoggerTracksOutcomeAndRedactsPassword(t *testing.T) {
+	logger := &recordingStageLogger{}
+	executor := &Executor{logger: logger}
+	options := ExecuteOptions{
+		Target: &TableInfo{Database: "app", Table: "users"},
+		Config: &config.Config{MysqlPassword: "top-secret"},
+	}
+
+	stage := executor.beginStage(options, "target_validation")
+	stage.finish("failed", "connection rejected password=top-secret\nretry stopped")
+
+	joined := strings.Join(logger.messages, "\n")
+	for _, want := range []string{
+		"stage=target_validation status=started table=app.users",
+		"stage=target_validation status=failed table=app.users duration_ms=",
+		`reason="connection rejected password=*** retry stopped"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("stage logs = %q, want %q", joined, want)
+		}
+	}
+	if strings.Contains(joined, "top-secret") {
+		t.Fatalf("stage logs exposed password: %q", joined)
+	}
+}
+
+type recordingStageLogger struct {
+	messages []string
+}
+
+func (l *recordingStageLogger) Infof(format string, values ...interface{}) {
+	l.messages = append(l.messages, fmt.Sprintf(format, values...))
+}
+
+func (l *recordingStageLogger) Errorf(format string, values ...interface{}) {
+	l.messages = append(l.messages, fmt.Sprintf(format, values...))
+}
+
 func TestSharedDDLExecutionContract(t *testing.T) {
 	type contractTarget struct {
 		Database string `json:"database"`
@@ -1076,7 +1114,9 @@ func TestExecuteResolvesUnqualifiedConfiguredTableOnce(t *testing.T) {
 
 func TestExecuteUsesStructuredTargetWithoutDatabaseLookup(t *testing.T) {
 	var calls []externalCommandCall
+	logger := &recordingStageLogger{}
 	executor := &Executor{
+		logger: logger,
 		runCommand: func(name string, args ...string) ([]byte, error) {
 			calls = append(calls, externalCommandCall{name: name, args: append([]string(nil), args...)})
 			return []byte("ok"), nil
@@ -1104,6 +1144,26 @@ func TestExecuteUsesStructuredTargetWithoutDatabaseLookup(t *testing.T) {
 		if len(call.args) < 2 || !strings.Contains(call.args[1], "D=app,t=users") {
 			t.Fatalf("pt-osc call %d args = %#v, want structured target", i, call.args)
 		}
+	}
+	joinedLogs := strings.Join(logger.messages, "\n")
+	for _, stage := range []string{
+		"target_validation",
+		"execution_policy",
+		"datadir_capacity",
+		"backup",
+		"online_ddl",
+		"ptosc",
+		"ptosc_dry_run",
+		"ptosc_execution",
+		"execution_complete",
+	} {
+		if !strings.Contains(joinedLogs, "stage="+stage) {
+			t.Fatalf("execution logs are missing stage %q: %s", stage, joinedLogs)
+		}
+	}
+	if !strings.Contains(joinedLogs, `stage=execution_complete status=passed table=app.users`) ||
+		!strings.Contains(joinedLogs, `reason="method=pt-online-schema-change"`) {
+		t.Fatalf("execution completion log = %q", joinedLogs)
 	}
 }
 
