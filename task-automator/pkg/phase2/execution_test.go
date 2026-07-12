@@ -1035,6 +1035,39 @@ func TestExecuteRejectsMultiObjectAlterBeforeExternalCommands(t *testing.T) {
 	}
 }
 
+func TestExecuteValidatesDDLMethodBeforeBackup(t *testing.T) {
+	commandCalls := 0
+	executor := &Executor{
+		runCommand: func(string, ...string) ([]byte, error) {
+			commandCalls++
+			return []byte("ok"), nil
+		},
+	}
+	target := TableInfo{Database: "app", Table: "users"}
+
+	result, err := executor.Execute(ExecuteOptions{
+		SQL: "CREATE INDEX idx_a ON app.users(email); " +
+			"CREATE INDEX idx_b ON app.users(created_at)",
+		Target:       &target,
+		BackupMethod: BackupXtrabackup,
+		OkOnlineDDL:  true,
+		OkPTOSC:      true,
+		Config: &config.Config{
+			DisableSpaceChecks:  true,
+			BackupDir:           t.TempDir(),
+			XtrabackupPath:      "xtrabackup",
+			OnlineDDLTestSchema: "releem_online_ddl_test",
+		},
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "multiple SQL statements") {
+		t.Fatalf("Execute() result = %#v, error = %v, want pre-backup validation failure", result, err)
+	}
+	if commandCalls != 0 {
+		t.Fatalf("external command calls = %d, want validation before backup", commandCalls)
+	}
+}
+
 func TestExecutePTOSCQualifiesUnqualifiedForeignKeyReference(t *testing.T) {
 	var calls []externalCommandCall
 	executor := &Executor{
@@ -1149,6 +1182,7 @@ func TestExecuteUsesStructuredTargetWithoutDatabaseLookup(t *testing.T) {
 	for _, stage := range []string{
 		"target_validation",
 		"execution_policy",
+		"execution_plan_validation",
 		"datadir_capacity",
 		"backup",
 		"online_ddl",

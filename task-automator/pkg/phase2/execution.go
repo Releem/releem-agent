@@ -177,6 +177,13 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 	policyStage := e.beginStage(options, "execution_policy")
 	policyStage.finish("passed", fmt.Sprintf("ok_online_ddl=%t ok_pt_osc=%t backup_method=%s", options.OkOnlineDDL, options.OkPTOSC, options.BackupMethod))
 
+	planStage := e.beginStage(options, "execution_plan_validation")
+	if err := validateExecutionPlan(options); err != nil {
+		planStage.finish("failed", err.Error())
+		return nil, fmt.Errorf("schema change execution plan is invalid: %w", err)
+	}
+	planStage.finish("passed", "")
+
 	// Validate datadir filesystem headroom before attempting any schema change.
 	if options.Config == nil || !options.Config.DisableSpaceChecks {
 		capacityStage := e.beginStage(options, "datadir_capacity")
@@ -261,6 +268,23 @@ func (e *Executor) Execute(options ExecuteOptions) (*ExecuteResult, error) {
 		return nil, fmt.Errorf("schema change could not be executed")
 
 	}
+}
+
+func validateExecutionPlan(options ExecuteOptions) error {
+	if options.OkOnlineDDL {
+		if _, err := buildOnlineDDLSQL(options.SQL); err == nil {
+			return nil
+		} else if !options.OkPTOSC || !isOnlineDDLUnsupported(err) {
+			return err
+		}
+		_, err := buildPTOSCAlterSQL(options.SQL)
+		return err
+	}
+	if options.OkPTOSC {
+		_, err := buildPTOSCAlterSQL(options.SQL)
+		return err
+	}
+	return fmt.Errorf("neither Online DDL nor pt-online-schema-change is allowed")
 }
 
 func (e *Executor) validateDDLTarget(sql, configuredTable string, suppliedTarget *TableInfo) (string, TableInfo, error) {

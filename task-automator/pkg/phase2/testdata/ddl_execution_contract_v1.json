@@ -175,16 +175,16 @@
       }
     },
     {
-      "id": "multiple_statements_rejected_by_agent",
+      "id": "multiple_statements_rejected",
       "schema_name": "app",
       "ddl_statement": "ALTER TABLE app.users ADD COLUMN a INT; ALTER TABLE app.users ADD COLUMN b INT",
       "server_flavor": "mysql",
       "server_version": "8.0.35",
       "expected": {
-        "syntax_valid": true,
-        "target": {"database": "app", "table": "users"},
-        "flags": {"ok_online_ddl": true, "ok_pt_osc": true},
-        "rejection_reason": "multiple SQL statements are not allowed"
+        "syntax_valid": false,
+        "target": null,
+        "flags": {"ok_online_ddl": false, "ok_pt_osc": false},
+        "rejection_reason": "syntax validation failed"
       }
     },
     {
