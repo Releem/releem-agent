@@ -11,7 +11,6 @@ var (
 	ddlQualifiedTablePattern     = ddlIdentifierPattern + "(?:\\s*\\.\\s*" + ddlIdentifierPattern + ")?"
 	alterTableTargetPattern      = regexp.MustCompile("(?i)^\\s*ALTER\\s+(?:(?:ONLINE|IGNORE)\\s+){0,2}TABLE\\s+(?:IF\\s+EXISTS\\s+)?(" + ddlQualifiedTablePattern + ")(?:\\s|$)")
 	createIndexTargetPattern     = regexp.MustCompile("(?i)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:(?:UNIQUE|FULLTEXT|SPATIAL)\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?" + ddlIdentifierPattern + "(?:\\s+USING\\s+(?:BTREE|HASH|RTREE))?\\s+ON\\s+(" + ddlQualifiedTablePattern + ")(?:\\s|\\(|$)")
-	createIndexPTOSCPattern      = regexp.MustCompile("(?i)^\\s*CREATE\\s+((?:(?:UNIQUE|FULLTEXT|SPATIAL)\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?" + ddlIdentifierPattern + "(?:\\s+USING\\s+(?:BTREE|HASH|RTREE))?)\\s+ON\\s+(" + ddlQualifiedTablePattern + ")(?:\\s|\\(|$)")
 	tableReferencePattern        = regexp.MustCompile("^\\s*(" + ddlIdentifierPattern + ")(?:\\s*\\.\\s*(" + ddlIdentifierPattern + "))?\\s*$")
 	leadingTableReferencePattern = regexp.MustCompile("^\\s*(" + ddlQualifiedTablePattern + ")(?:\\s|\\(|$)")
 )

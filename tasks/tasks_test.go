@@ -199,7 +199,7 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			exitCode, status, output, taskError := ApplySchemaChanges(logger, tt.cfg, tt.details)
+			exitCode, status, output, taskError := ApplySchemaChanges(logger, tt.cfg, tt.details, 1023)
 
 			if exitCode != tt.wantExitCode {
 				t.Fatalf("exit code = %d, want %d", exitCode, tt.wantExitCode)
@@ -267,6 +267,7 @@ func TestApplySchemaChangesIncludesExecutorMethodAndWarnings(t *testing.T) {
 			"ok_pitr": true,
 			"ok_online_physical_backup": true
 		}`),
+		1023,
 	)
 	if exitCode != 0 || status != 1 || taskError != "" {
 		t.Fatalf("ApplySchemaChanges() = exit %d status %d error %q", exitCode, status, taskError)
@@ -281,6 +282,9 @@ func TestApplySchemaChangesIncludesExecutorMethodAndWarnings(t *testing.T) {
 	}
 	if capturedOptions.Target == nil || *capturedOptions.Target != (phase2.TableInfo{Database: "app", Table: "users"}) {
 		t.Fatalf("executor target = %#v, want structured Platform target", capturedOptions.Target)
+	}
+	if capturedOptions.TaskID != 1023 || capturedOptions.StatementIndex != 0 {
+		t.Fatalf("executor correlation = task %d statement %d, want task 1023 statement 0", capturedOptions.TaskID, capturedOptions.StatementIndex)
 	}
 }
 

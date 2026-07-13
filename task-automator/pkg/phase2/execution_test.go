@@ -56,8 +56,10 @@ func TestExecutionStageLoggerTracksOutcomeAndRedactsPassword(t *testing.T) {
 	logger := &recordingStageLogger{}
 	executor := &Executor{logger: logger}
 	options := ExecuteOptions{
-		Target: &TableInfo{Database: "app", Table: "users"},
-		Config: &config.Config{MysqlPassword: "top-secret"},
+		TaskID:         1023,
+		StatementIndex: 4,
+		Target:         &TableInfo{Database: "app", Table: "users"},
+		Config:         &config.Config{MysqlPassword: "top-secret"},
 	}
 
 	stage := executor.beginStage(options, "target_validation")
@@ -65,8 +67,8 @@ func TestExecutionStageLoggerTracksOutcomeAndRedactsPassword(t *testing.T) {
 
 	joined := strings.Join(logger.messages, "\n")
 	for _, want := range []string{
-		"stage=target_validation status=started table=app.users",
-		"stage=target_validation status=failed table=app.users duration_ms=",
+		"task_id=1023 statement_index=4 stage=target_validation status=started table=app.users",
+		"task_id=1023 statement_index=4 stage=target_validation status=failed table=app.users duration_ms=",
 		`reason="connection rejected password=*** retry stopped"`,
 	} {
 		if !strings.Contains(joined, want) {
@@ -75,6 +77,85 @@ func TestExecutionStageLoggerTracksOutcomeAndRedactsPassword(t *testing.T) {
 	}
 	if strings.Contains(joined, "top-secret") {
 		t.Fatalf("stage logs exposed password: %q", joined)
+	}
+}
+
+func TestPTOSCDebugLoggingRedactsPasswordWithComma(t *testing.T) {
+	logger := &recordingStageLogger{}
+	executor := &Executor{
+		logger: logger,
+		runCommand: func(string, ...string) ([]byte, error) {
+			return []byte("dry run complete"), nil
+		},
+	}
+	options := ExecuteOptions{
+		TaskID:         1023,
+		StatementIndex: 2,
+		SQL:            "ALTER TABLE app.users ADD COLUMN c INT",
+		Target:         &TableInfo{Database: "app", Table: "users"},
+		Debug:          true,
+		Config: &config.Config{
+			PTOSCPath:     "pt-online-schema-change",
+			MysqlHost:     "127.0.0.1",
+			MysqlPort:     "3306",
+			MysqlUser:     "releem",
+			MysqlPassword: "first,secret",
+		},
+	}
+
+	if err := executor.dryRunPTOSC(options); err != nil {
+		t.Fatalf("dryRunPTOSC() error = %v", err)
+	}
+	joined := strings.Join(logger.messages, "\n")
+	if strings.Contains(joined, "first") || strings.Contains(joined, "secret") {
+		t.Fatalf("pt-osc debug logs exposed password: %q", joined)
+	}
+	if !strings.Contains(joined, "p=***") {
+		t.Fatalf("pt-osc debug logs did not contain redacted DSN: %q", joined)
+	}
+}
+
+func TestExternalCommandOutputLoggingPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		debug      bool
+		commandErr error
+		wantOutput bool
+	}{
+		{name: "successful normal execution is quiet", wantOutput: false},
+		{name: "successful debug execution includes output", debug: true, wantOutput: true},
+		{name: "failed normal execution includes output", commandErr: errors.New("exit status 1"), wantOutput: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := &recordingStageLogger{}
+			executor := &Executor{
+				logger: logger,
+				runCommand: func(string, ...string) ([]byte, error) {
+					return []byte("tool diagnostic output"), tt.commandErr
+				},
+			}
+			options := ExecuteOptions{
+				TaskID:         1023,
+				StatementIndex: 1,
+				SQL:            "ALTER TABLE app.users ADD COLUMN c INT",
+				Target:         &TableInfo{Database: "app", Table: "users"},
+				Debug:          tt.debug,
+				Config: &config.Config{
+					PTOSCPath: "pt-online-schema-change",
+					MysqlHost: "127.0.0.1",
+					MysqlPort: "3306",
+					MysqlUser: "releem",
+				},
+			}
+
+			_ = executor.dryRunPTOSC(options)
+			joined := strings.Join(logger.messages, "\n")
+			if got := strings.Contains(joined, "tool diagnostic output"); got != tt.wantOutput {
+				t.Fatalf("output logged = %t, want %t; logs: %q", got, tt.wantOutput, joined)
+			}
+		})
 	}
 }
 
@@ -684,8 +765,10 @@ func TestExecuteFallsBackFromCreateIndexPreflightOnPinnedSession(t *testing.T) {
 	defer db.Close()
 
 	var calls []externalCommandCall
+	logger := &recordingStageLogger{}
 	executor := &Executor{
-		conn: db,
+		conn:   db,
+		logger: logger,
 		runCommand: func(name string, args ...string) ([]byte, error) {
 			calls = append(calls, externalCommandCall{name: name, args: append([]string(nil), args...)})
 			return []byte("ok"), nil
@@ -732,6 +815,10 @@ func TestExecuteFallsBackFromCreateIndexPreflightOnPinnedSession(t *testing.T) {
 	}
 	if !containsString(result.Warnings, "used pt-online-schema-change") {
 		t.Fatalf("Execute() warnings = %#v, want fallback warning", result.Warnings)
+	}
+	joinedLogs := strings.Join(logger.messages, "\n")
+	if got := strings.Count(joinedLogs, "localized unsupported Online DDL"); got != 1 {
+		t.Fatalf("root Online DDL error logged %d times, want once: %s", got, joinedLogs)
 	}
 
 	records := drv.snapshot()
@@ -1353,9 +1440,12 @@ func TestExecuteOnlineDDLUsesOneSessionAndRestoresTimeout(t *testing.T) {
 	defer db.Close()
 
 	ddl := "ALTER TABLE users ADD COLUMN c INT"
-	executionErr, cleanupErr := executeOnlineDDLOnPinnedConn(context.Background(), db, ddl, 20)
+	executionErr, cleanupErr := withPinnedLockWaitTimeout(context.Background(), db, 20, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, ddl)
+		return err
+	})
 	if executionErr != nil || cleanupErr != nil {
-		t.Fatalf("executeOnlineDDLOnPinnedConn() errors = (%v, %v)", executionErr, cleanupErr)
+		t.Fatalf("withPinnedLockWaitTimeout() errors = (%v, %v)", executionErr, cleanupErr)
 	}
 
 	records := drv.snapshot()
@@ -1388,12 +1478,15 @@ func TestExecuteOnlineDDLRestoresTimeoutAfterDDLError(t *testing.T) {
 	}
 	defer db.Close()
 
-	executionErr, cleanupErr := executeOnlineDDLOnPinnedConn(context.Background(), db, drv.failQuery, 20)
+	executionErr, cleanupErr := withPinnedLockWaitTimeout(context.Background(), db, 20, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, drv.failQuery)
+		return err
+	})
 	if executionErr == nil || !strings.Contains(executionErr.Error(), "forced query failure") {
-		t.Fatalf("executeOnlineDDLOnPinnedConn() execution error = %v, want forced query failure", executionErr)
+		t.Fatalf("withPinnedLockWaitTimeout() execution error = %v, want forced query failure", executionErr)
 	}
 	if cleanupErr != nil {
-		t.Fatalf("executeOnlineDDLOnPinnedConn() cleanup error = %v, want nil", cleanupErr)
+		t.Fatalf("withPinnedLockWaitTimeout() cleanup error = %v, want nil", cleanupErr)
 	}
 
 	records := drv.snapshot()
@@ -1412,14 +1505,15 @@ func TestExecuteOnlineDDLDiscardsSessionAfterRestoreFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	executionErr, cleanupErr := executeOnlineDDLOnPinnedConn(
-		context.Background(), db, "ALTER TABLE users ADD COLUMN c INT", 20,
-	)
+	executionErr, cleanupErr := withPinnedLockWaitTimeout(context.Background(), db, 20, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, "ALTER TABLE users ADD COLUMN c INT")
+		return err
+	})
 	if executionErr != nil {
-		t.Fatalf("executeOnlineDDLOnPinnedConn() execution error = %v, want nil after successful DDL", executionErr)
+		t.Fatalf("withPinnedLockWaitTimeout() execution error = %v, want nil after successful DDL", executionErr)
 	}
 	if cleanupErr == nil || !strings.Contains(cleanupErr.Error(), "restore session lock_wait_timeout") {
-		t.Fatalf("executeOnlineDDLOnPinnedConn() cleanup error = %v, want restore failure", cleanupErr)
+		t.Fatalf("withPinnedLockWaitTimeout() cleanup error = %v, want restore failure", cleanupErr)
 	}
 
 	if _, err := db.ExecContext(context.Background(), "SELECT 1"); err != nil {

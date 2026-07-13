@@ -139,7 +139,9 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 			logger.Info(errMsg)
 			break
 		}
-		TaskStruct.ExitCode, TaskStruct.Status, TaskStruct.Output, TaskStruct.Error = ApplySchemaChanges(logger, configuration, TaskStruct.Details)
+		TaskStruct.ExitCode, TaskStruct.Status, TaskStruct.Output, TaskStruct.Error = ApplySchemaChanges(
+			logger, configuration, TaskStruct.Details, TaskStruct.ID,
+		)
 
 	case 7:
 		TaskStruct.ExitCode, TaskStruct.Status, TaskStruct.Output, TaskStruct.Error = ProcessQueryExplainTask(
@@ -168,7 +170,7 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 	utils.ProcessRepeaters(metrics, repeaters, configuration, logger, models.ModeType{Name: "Task", Type: "Status"})
 }
 
-func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, taskdetails string) (int, int, string, string) {
+func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, taskdetails string, taskID int) (int, int, string, string) {
 	var task_exit_code, task_status int = 0, 1
 	var task_output, task_error string
 	var backupMethod phase2.BackupMethod
@@ -311,13 +313,15 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 		}
 
 		executionResult, err := executor.Execute(phase2.ExecuteOptions{
-			SQL:          statement,
-			Target:       &target,
-			BackupMethod: backupMethod,
-			OkPTOSC:      analysis.OKPTOSC,
-			OkOnlineDDL:  analysis.OKOnlineDDL,
-			Config:       configuration,
-			Debug:        configuration.Debug,
+			TaskID:         taskID,
+			StatementIndex: i,
+			SQL:            statement,
+			Target:         &target,
+			BackupMethod:   backupMethod,
+			OkPTOSC:        analysis.OKPTOSC,
+			OkOnlineDDL:    analysis.OKOnlineDDL,
+			Config:         configuration,
+			Debug:          configuration.Debug,
 		})
 		if err != nil {
 			logger.Infof("* Statement %d failed: %s\n", i, err.Error())
