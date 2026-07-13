@@ -149,6 +149,13 @@ func TestApplySchemaChangesSetsDetailedTaskErrorByExitCode(t *testing.T) {
 			wantErrorText: "Statement 0 skipped: syntax validation failed: near ADDD",
 		},
 		{
+			name:          "target table missing from metadata",
+			details:       `{"statements":[{"schema_name":"app","ddl_statement":"CREATE INDEX idx_missing ON app.missing_table(c)","analysis_results":{"schema_name":"app","table_name":"missing_table","syntax_valid":true,"storage_engine":"","ok_online_ddl":false,"ok_pt_osc":false,"ok_pitr":true,"ok_online_physical_backup":false}}]}`,
+			cfg:           &config.Config{},
+			wantExitCode:  5,
+			wantErrorText: "Statement 0 skipped: target table app.missing_table was not found in metadata",
+		},
+		{
 			name: "no safe execution method",
 			details: taskType6Details(`{
 				"syntax_valid": true,

@@ -274,6 +274,15 @@ func ApplySchemaChanges(logger logging.Logger, configuration *config.Config, tas
 			return fail(4, fmt.Sprintf("Statement %d skipped: %s\n", i, errMsg), "")
 		}
 
+		if strings.TrimSpace(analysis.StorageEngine) == "" {
+			errMsg := fmt.Sprintf(
+				"Statement %d skipped: target table %s.%s was not found in metadata\n",
+				i, target.Database, target.Table,
+			)
+			logger.Error(errMsg)
+			return fail(5, errMsg, "")
+		}
+
 		if !analysis.OKOnlineDDL && !analysis.OKPTOSC {
 			logger.Errorf("Statement %d skipped: cannot be executed without blocking the table\n", i)
 			return fail(5, fmt.Sprintf("Statement %d skipped: cannot be executed without blocking the table\n", i), "")
