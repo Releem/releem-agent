@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mysqlconfigurer.sh - Version 1.23.7
+# mysqlconfigurer.sh - Version 1.24.0
 # (C) Releem, Inc 2022
 # All rights reserved
 
@@ -14,7 +14,7 @@ else
 fi
 
 # Variables
-VERSION="1.23.7"
+VERSION="1.24.0"
 RELEEM_WORKDIR="${RELEEM_WORKDIR:-/opt/releem}"
 RELEEM_CONF_DIR="$RELEEM_WORKDIR/conf/"
 RELEEM_CONF_FILE="$RELEEM_WORKDIR/releem.conf"
