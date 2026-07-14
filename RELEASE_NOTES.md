@@ -191,3 +191,12 @@
 - Updated Go toolchain to 1.26.4
 - Updated Go module dependencies, including Azure, AWS, Google API, OpenTelemetry, and `golang.org/x/*` packages
 - Bumped agent, installer, configurer, and Windows script versions to 1.23.7
+
+## 1.24.0
+- Added the first iteration of the automatic task executor
+- Added installer support for custom MySQL and PostgreSQL root login overrides
+- Added explicit installer flags for selecting the database type
+- Fixed root password prompt handling in the installer
+- Fixed Windows installer exit handling and added custom root login tests
+- Added startup delay to ensure the server is registered before follow-up operations
+- Bumped agent, installer, configurer, and Windows script versions to 1.24.0
