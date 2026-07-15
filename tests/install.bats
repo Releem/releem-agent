@@ -565,6 +565,29 @@ pgprompt"
     [ "$status" -eq 0 ]
 }
 
+@test "windows installer resolves system utilities without PATH and uses language-neutral principals" {
+    run grep -F '[Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)' "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+
+    run grep -F '& icacls ' "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -ne 0 ]
+
+    run grep -F '& powershell.exe ' "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -ne 0 ]
+
+    run grep -F "'System32\WindowsPowerShell\v1.0\powershell.exe'" "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+
+    run grep -F "'*S-1-5-18:(R)'" "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+
+    run grep -F "'*S-1-5-32-544:(M)'" "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+
+    run grep -F 'if ($LASTEXITCODE -ne 0)' "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+}
+
 @test "create_mysql_user omits root password option when root password env is unset and root connects" {
     load_install_functions
     set -e
