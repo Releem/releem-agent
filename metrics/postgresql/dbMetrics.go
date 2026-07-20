@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"time"
@@ -10,24 +11,57 @@ import (
 	"github.com/Releem/mysqlconfigurer/utils"
 	u "github.com/Releem/mysqlconfigurer/utils"
 	logging "github.com/google/logger"
-	"github.com/hashicorp/go-version"
 )
 
 type DBMetricsBaseGatherer struct {
 	logger        logging.Logger
 	configuration *config.Config
+	capabilities  *PostgresCapabilities
 }
 
-func NewDBMetricsBaseGatherer(logger logging.Logger, configuration *config.Config) *DBMetricsBaseGatherer {
+func NewDBMetricsBaseGatherer(logger logging.Logger, configuration *config.Config, capabilities *PostgresCapabilities) *DBMetricsBaseGatherer {
 	return &DBMetricsBaseGatherer{
 		logger:        logger,
 		configuration: configuration,
+		capabilities:  capabilities,
 	}
 }
 
 type DBMetricsConfigGatherer struct {
 	logger        logging.Logger
 	configuration *config.Config
+}
+
+type pgDatabaseConnection interface {
+	Query(string, ...interface{}) (*sql.Rows, error)
+	QueryRow(string, ...interface{}) *sql.Row
+	Close() error
+}
+
+func forEachPGDatabase(databases []string, connect func(string) pgDatabaseConnection, collect func(string, pgDatabaseConnection) error, logError func(string, error)) {
+	for _, database := range databases {
+		db := connect(database)
+		if db == nil {
+			continue
+		}
+		err := collect(database, db)
+		closeErr := db.Close()
+		if err != nil && logError != nil {
+			logError(database, err)
+		}
+		if closeErr != nil && logError != nil {
+			logError(database, closeErr)
+		}
+	}
+}
+
+func addPGDatabaseTableCount(total *uint64, scan func(*uint64) error) error {
+	var tablesCount uint64
+	if err := scan(&tablesCount); err != nil {
+		return err
+	}
+	*total += tablesCount
+	return nil
 }
 
 func NewDBMetricsConfigGatherer(logger logging.Logger, configuration *config.Config) *DBMetricsConfigGatherer {
@@ -39,13 +73,6 @@ func NewDBMetricsConfigGatherer(logger logging.Logger, configuration *config.Con
 
 func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) error {
 	defer utils.HandlePanic(DBMetricsBase.configuration, DBMetricsBase.logger)
-	{
-		// Check if pg_stat_statements extension is available
-		err := models.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')").Scan(&models.PgStatStatementsEnabled)
-		if err != nil {
-			DBMetricsBase.logger.Error("Error checking pg_stat_statements extension: ", err)
-		}
-	}
 	{
 		pg_stat := make(models.MetricGroupValue)
 		// ver_current, _ := version.NewVersion(metrics.DB.Info["Version"].(string))
@@ -108,17 +135,17 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 
 	// Query latency from pg_stat_statements if available
 	{
-		ver_current, _ := version.NewVersion(metrics.DB.Info["Version"].(string))
-		if models.PgStatStatementsEnabled {
-			supportsRows := DetectPgStatStatementsSupportsRows(models.DB, DBMetricsBase.logger)
-			pgStatStatements := PgStatStatementsQuery(ver_current, supportsRows)
-
+		capabilities, err := DBMetricsBase.capabilities.Resolve(context.Background(), models.DB)
+		if err != nil {
+			DBMetricsBase.logger.Error("Unable to collect pg_stat_statements capabilities: ", err)
+			metrics.DB.Queries = nil
+		} else {
 			var dealloc uint64
 			var stats_reset string
 
-			err := models.DB.QueryRow("SELECT dealloc, stats_reset FROM pg_stat_statements_info").Scan(&dealloc, &stats_reset)
-			if err != nil {
-				if !strings.Contains(err.Error(), "relation \"pg_stat_statements_info\" does not exist") {
+			if capabilities.PgStatStatementsInfoRelation != "" {
+				err = models.DB.QueryRow("SELECT dealloc, stats_reset FROM "+capabilities.PgStatStatementsInfoRelation).Scan(&dealloc, &stats_reset)
+				if err != nil && err != sql.ErrNoRows {
 					DBMetricsBase.logger.Error(err)
 				}
 			}
@@ -129,7 +156,7 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 
 			var count_statements uint64
 
-			err = models.DB.QueryRow("SELECT COUNT(*) FROM pg_stat_statements").Scan(&count_statements)
+			err = models.DB.QueryRow("SELECT COUNT(*) FROM " + capabilities.PgStatStatementsRelation).Scan(&count_statements)
 			if err != nil {
 				if err != sql.ErrNoRows {
 					DBMetricsBase.logger.Error(err)
@@ -137,36 +164,15 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 			}
 			metrics.DB.Metrics.CountQueriesLatency = count_statements
 
-			var output []models.MetricGroupValue
-			var queryid, datname string
-			var calls int
-			var total_exec_time, mean_exec_time float64
-			var rows_sent uint64
-			// Collect query statistics from pg_stat_statements
-			rows, err := models.DB.Query(pgStatStatements)
-
+			statementRows, err := collectPostgresQueryStats(context.Background(), models.DB, capabilities)
 			if err != nil {
+				DBMetricsBase.capabilities.InvalidateForError(err)
 				if err != sql.ErrNoRows {
 					DBMetricsBase.logger.Error(err)
 				}
 			} else {
-				defer rows.Close()
-				for rows.Next() {
-					var query string
-					err := rows.Scan(&datname, &queryid, &query, &calls, &total_exec_time, &mean_exec_time, &rows_sent)
-					_ = query // shared pg_stat_statements query; omitted from base metrics payload
-					if err != nil {
-						DBMetricsBase.logger.Error(err)
-						return err
-					}
-
-					// Convert to microseconds for compatibility with MySQL metrics
-					total_exec_time_us := total_exec_time * 1000
-					mean_exec_time_us := mean_exec_time * 1000
-					output = append(output, pgQueryMetricLatency(datname, queryid, calls, total_exec_time_us, mean_exec_time_us, rows_sent))
-				}
+				metrics.DB.Queries = postgresQueryStatsLegacyMetrics(statementRows)
 			}
-			metrics.DB.Queries = output
 		}
 	}
 
@@ -210,7 +216,7 @@ func (DBMetricsConfig *DBMetricsConfigGatherer) GetMetrics(metrics *models.Metri
 	defer utils.HandlePanic(DBMetricsConfig.configuration, DBMetricsConfig.logger)
 
 	output := make(map[string]models.MetricGroupValue)
-	var total_tables, row, size, count uint64
+	var total_tables, size, count uint64
 	var table_type string
 	i := 0
 
@@ -251,34 +257,38 @@ func (DBMetricsConfig *DBMetricsConfigGatherer) GetMetrics(metrics *models.Metri
 	// 	rows.Close()
 	// }
 
-	for _, database := range metrics.DB.Metrics.Databases {
+	forEachPGDatabase(metrics.DB.Metrics.Databases, func(database string) pgDatabaseConnection {
 		// if database == "postgres" {
 		// 	continue
 		// }
 		// Switch to each database to get table statistics
 		db := u.ConnectionDatabase(DBMetricsConfig.configuration, DBMetricsConfig.logger, database)
-		defer db.Close()
-
+		if db == nil {
+			DBMetricsConfig.logger.Error("Connection to database failed: ", database)
+			return nil
+		}
+		return db
+	}, func(database string, db pgDatabaseConnection) error {
 		for _, view := range PG_STAT_PER_DB_VIEWS {
 			rows, err := db.Query(`
 			SELECT * FROM ` + view)
 			if err != nil {
-				DBMetricsConfig.logger.Error(err)
 				return err
 			}
-			defer rows.Close()
 			var existing []models.MetricGroupValue
 			if val, ok := metrics.DB.Metrics.Status[view].([]models.MetricGroupValue); ok {
 				existing = val
 			}
 			metrics.DB.Metrics.Status[view] = append(existing, utils.ScanRows(rows, DBMetricsConfig.logger)...)
+			rows.Close()
 		}
 		// Total tables count
-		err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog')").Scan(&row)
+		err := addPGDatabaseTableCount(&total_tables, func(tablesCount *uint64) error {
+			return db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog')").Scan(tablesCount)
+		})
 		if err != nil {
 			DBMetricsConfig.logger.Error(err)
 		}
-		total_tables += row
 
 		// PostgreSQL table engine statistics (PostgreSQL doesn't have engines like MySQL, but we can collect table types)
 		rows, err := db.Query(`
@@ -313,7 +323,10 @@ func (DBMetricsConfig *DBMetricsConfigGatherer) GetMetrics(metrics *models.Metri
 		if i%25 == 0 {
 			time.Sleep(3 * time.Second)
 		}
-	}
+		return nil
+	}, func(_ string, err error) {
+		DBMetricsConfig.logger.Error(err)
+	})
 	metrics.DB.Metrics.Engine = output
 	metrics.DB.Metrics.TotalTables = total_tables
 

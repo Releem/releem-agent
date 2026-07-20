@@ -1,308 +1,568 @@
 package postgresql
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"io"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
-	"github.com/hashicorp/go-version"
+	logging "github.com/google/logger"
+	"github.com/lib/pq"
 )
 
-func TestPostgresqlSchemaMetricsUseCollectorCompatibleKeys(t *testing.T) {
-	table := pgTableSchemaMetric(pgTableSchemaMetricInput{
-		TABLE_CATALOG:       "shop",
-		TABLE_SCHEMA:        "app",
-		TABLE_NAME:          "orders",
-		TABLE_TYPE:          "BASE TABLE",
-		ENGINE:              "HEAP",
-		TABLE_ROWS:          "42",
-		AVG_ROW_LENGTH:      "128",
-		DATA_LENGTH:         "4096",
-		INDEX_LENGTH:        "1024",
-		TABLE_COLLATION:     "NULL",
-		TABLE_SIZE_BYTES:    "5120",
-		N_MOD_SINCE_ANALYZE: "7",
-		LAST_ANALYZE:        "2026-07-01 00:00:00+00",
-		LAST_AUTOANALYZE:    "NULL",
-	})
-	if table["TABLE_CATALOG"] != "shop" {
-		t.Fatalf("table metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", table)
+func TestGetMetricsClearsLightweightQueriesWhenFullCollectionFails(t *testing.T) {
+	logger := *logging.Init("postgresql-full-query-failure-test", false, false, io.Discard)
+	defer logger.Close()
+	recorder := &pgExplainRecordingDriver{queryError: errors.New("full query collection failed")}
+	driverName := "releem_pg_full_query_collection_failure_test"
+	sql.Register(driverName, recorder)
+	db, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if table["TABLE_SCHEMA"] != "app" || table["TABLE_NAME"] != "orders" {
-		t.Fatalf("table identity keys are not collector-compatible: %#v", table)
-	}
-	if table["ENGINE"] != "HEAP" || table["TABLE_ROWS"] != "42" || table["AVG_ROW_LENGTH"] != "128" {
-		t.Fatalf("table statistics keys are not collector-compatible: %#v", table)
-	}
-	if table["DATA_LENGTH"] != "4096" || table["INDEX_LENGTH"] != "1024" || table["TABLE_COLLATION"] != "NULL" {
-		t.Fatalf("table size/collation keys are not collector-compatible: %#v", table)
-	}
-	if table["N_MOD_SINCE_ANALYZE"] != "7" || table["LAST_ANALYZE"] != "2026-07-01 00:00:00+00" || table["LAST_AUTOANALYZE"] != "NULL" || table["TABLE_SIZE_BYTES"] != "5120" {
-		t.Fatalf("postgresql table metrics should expose planner statistics keys: %#v", table)
-	}
+	defer db.Close()
+	previousDB := models.DB
+	models.DB = db
+	defer func() { models.DB = previousDB }()
 
-	column := pgColumnSchemaMetric("shop", "app", "orders", "customer_id", "2", "NULL", "NO", "bigint", "NULL", "64", "0", "NULL")
-	if column["TABLE_CATALOG"] != "shop" {
-		t.Fatalf("column metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", column)
+	gatherer := &DBCollectQueriesOptimization{
+		logger:        logger,
+		configuration: &config.Config{},
+		capabilities: &PostgresCapabilities{detect: func(context.Context, *sql.DB) (PostgresCapabilitySnapshot, error) {
+			return PostgresCapabilitySnapshot{
+				PgStatStatementsRelation: `"public"."pg_stat_statements"`,
+				TimingColumn:             "total_exec_time",
+				HasRows:                  true,
+			}, nil
+		}},
 	}
-	if column["COLUMN_NAME"] != "customer_id" || column["ORDINAL_POSITION"] != "2" {
-		t.Fatalf("column identity keys are not collector-compatible: %#v", column)
-	}
-	if column["CHARACTER_MAXIMUM_LENGTH"] != "NULL" || column["NUMERIC_PRECISION"] != "64" || column["NUMERIC_SCALE"] != "0" {
-		t.Fatalf("column numeric metadata keys are not collector-compatible: %#v", column)
-	}
-	if column["CHARACTER_SET_NAME"] != "NULL" {
-		t.Fatalf("postgresql columns should expose NULL character set: %#v", column)
-	}
-
-	index := pgIndexSchemaMetric(pgIndexInput("shop", "app", "orders", "idx_orders_customer", "customer_id", "NULL", "NULL"))
-	if index["TABLE_CATALOG"] != "shop" {
-		t.Fatalf("index metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", index)
-	}
-	if index["INDEX_NAME"] != "idx_orders_customer" || index["COLUMN_NAME"] != "customer_id" {
-		t.Fatalf("index identity keys are not collector-compatible: %#v", index)
-	}
-	if index["NON_UNIQUE"] != "1" || index["SEQ_IN_INDEX"] != "1" || index["INDEX_TYPE"] != "btree" {
-		t.Fatalf("index metadata keys are not collector-compatible: %#v", index)
-	}
-	if index["CARDINALITY"] != "NULL" {
-		t.Fatalf("postgresql indexes should expose NULL cardinality when estimate is unavailable: %#v", index)
-	}
-	if index["LAST_IDX_SCAN"] != "NULL" {
-		t.Fatalf("postgresql indexes should expose last_idx_scan key: %#v", index)
-	}
-	if index["EXPRESSION"] != "" || index["PREDICATE"] != "" {
-		t.Fatalf("plain index should expose empty absent expression/predicate: %#v", index)
-	}
-
-	expressionIndex := pgIndexSchemaMetric(pgIndexInput("shop", "app", "users", "idx_users_lower_email", "NULL", "lower(email)", "NULL"))
-	if expressionIndex["COLUMN_NAME"] != "lower(email)" || expressionIndex["EXPRESSION"] != "lower(email)" {
-		t.Fatalf("expression index should preserve expression identity in COLUMN_NAME and EXPRESSION: %#v", expressionIndex)
-	}
-
-	partialIndex := pgIndexSchemaMetric(pgIndexInput("shop", "app", "orders", "idx_orders_customer_open", "customer_id", "NULL", "status = 'open'"))
-	if partialIndex["PREDICATE"] != "status = 'open'" {
-		t.Fatalf("partial index should preserve predicate identity: %#v", partialIndex)
-	}
-}
-
-func TestPostgresqlSequenceMetricUsesCollectorCompatibleKeys(t *testing.T) {
-	sequence := pgSequenceSchemaMetric("shop", "app", "orders_id_seq", "1700000000", "2147483647", "1")
-
-	if sequence["TABLE_CATALOG"] != "shop" {
-		t.Fatalf("sequence metrics must include PostgreSQL database name as TABLE_CATALOG: %#v", sequence)
-	}
-	if sequence["SEQUENCE_SCHEMA"] != "app" || sequence["SEQUENCE_NAME"] != "orders_id_seq" {
-		t.Fatalf("sequence identity keys are not collector-compatible: %#v", sequence)
-	}
-	if sequence["LAST_VALUE"] != "1700000000" || sequence["MAX_VALUE"] != "2147483647" || sequence["INCREMENT_BY"] != "1" {
-		t.Fatalf("sequence range keys are not collector-compatible: %#v", sequence)
-	}
-}
-
-func TestPostgresqlIndexMetricExposesExactPgIndexIdentity(t *testing.T) {
-	index := pgIndexSchemaMetric(pgIndexInput("shop", "app", "orders", "idx_orders_customer", "customer_id", "", ""))
-
-	for _, key := range []string{
-		"PG_RELAM",
-		"PG_INDKEY",
-		"PG_INDCLASS",
-		"PG_INDCOLLATION",
-		"PG_INDOPTION",
-		"PG_INDNKEYATTS",
-		"PG_INDNATTS",
-		"PG_INDEXPRS",
-		"PG_INDPRED",
-		"PG_INDISVALID",
-		"PG_INDISREADY",
-		"PG_INDISEXCLUSION",
-		"LAST_IDX_SCAN",
-	} {
-		if _, ok := index[key]; !ok {
-			t.Fatalf("postgresql index metric should expose exact pg_index key %s: %#v", key, index)
-		}
-	}
-}
-
-func TestPostgresqlIndexSchemaQueryCollectsUsageStatistics(t *testing.T) {
-	if !strings.Contains(pgIndexSchemaQuery("app"), "pg_stat_user_indexes") {
-		t.Fatalf("postgresql index schema query should collect pg_stat_user_indexes usage statistics")
-	}
-	if !strings.Contains(pgIndexSchemaQuery("app"), "idx_scan") {
-		t.Fatalf("postgresql index schema query should collect idx_scan")
-	}
-	if !strings.Contains(pgIndexSchemaQuery("app"), "last_idx_scan") {
-		t.Fatalf("postgresql index schema query should collect last_idx_scan")
-	}
-}
-
-func TestPostgresqlIndexVectorExpressionUsesTextCast(t *testing.T) {
-	for input, expected := range map[string]string{
-		"idx.indkey":       "idx.indkey::text",
-		"idx.indclass":     "idx.indclass::text",
-		"idx.indcollation": "idx.indcollation::text",
-		"idx.indoption":    "idx.indoption::text",
-	} {
-		if got := pgIndexVectorExpression(input); got != expected {
-			t.Fatalf("postgresql vector expression for %s should use text cast, got %s", input, got)
-		}
-	}
-}
-
-func TestPostgresqlIndexAttributeCountExpressionsUseVersionSafeFallback(t *testing.T) {
-	nkeyatts, natts := pgIndexAttributeCountExpressions(110000)
-	if nkeyatts != "idx.indnkeyatts::text" || natts != "idx.indnatts::text" {
-		t.Fatalf("postgresql 11+ should use native pg_index attribute counts, got %s and %s", nkeyatts, natts)
-	}
-
-	nkeyatts, natts = pgIndexAttributeCountExpressions(100000)
-	expected := "array_length(idx.indkey::int2[], 1)::text"
-	if nkeyatts != expected || natts != expected {
-		t.Fatalf("postgresql before 11 should derive index attribute counts from indkey, got %s and %s", nkeyatts, natts)
-	}
-}
-
-func TestPostgresqlIndexSchemaQueryAvoidsVersionSpecificColumnsOnOlderServers(t *testing.T) {
-	pg10Query := pgIndexSchemaQueryForVersion(100000)
-	if strings.Contains(pg10Query, "idx.indnkeyatts") || strings.Contains(pg10Query, "idx.indnatts") {
-		t.Fatalf("postgresql before 11 query should not reference pg_index attribute count columns: %s", pg10Query)
-	}
-
-	pg12Query := pgIndexSchemaQueryForVersion(120000)
-	if strings.Contains(pg12Query, "sui.last_idx_scan") {
-		t.Fatalf("postgresql before 16 query should not reference pg_stat_user_indexes.last_idx_scan: %s", pg12Query)
-	}
-
-	pg16Query := pgIndexSchemaQueryForVersion(160000)
-	if !strings.Contains(pg16Query, "sui.last_idx_scan") {
-		t.Fatalf("postgresql 16+ query should collect last_idx_scan: %s", pg16Query)
-	}
-}
-
-func TestPostgresqlIndexSchemaQueryExcludesIncludeColumns(t *testing.T) {
-	pg11Query := pgIndexSchemaQueryForVersion(110000)
-	if !strings.Contains(pg11Query, "key_info.seq_in_index <= idx.indnkeyatts") {
-		t.Fatalf("postgresql 11+ index query should exclude INCLUDE columns using indnkeyatts: %s", pg11Query)
-	}
-
-	pg10Query := pgIndexSchemaQueryForVersion(100000)
-	if strings.Contains(pg10Query, "idx.indnkeyatts") {
-		t.Fatalf("postgresql before 11 should not filter INCLUDE columns with indnkeyatts: %s", pg10Query)
-	}
-	if !strings.Contains(pg10Query, "key_info.seq_in_index <=") {
-		t.Fatalf("postgresql before 11 should still bound unnest ordinality to key attributes: %s", pg10Query)
-	}
-}
-
-func TestPostgresqlSchemaCollectionCommitsOnlyOnSuccess(t *testing.T) {
-	existing := models.MetricGroupValue{"TABLE_CATALOG": "other", "TABLE_SCHEMA": "public", "TABLE_NAME": "keep_me"}
 	metrics := &models.Metrics{}
-	metrics.DB.DatabaseSchema = map[string][]models.MetricGroupValue{
-		"information_schema_tables": {existing},
-	}
+	metrics.DB.Queries = []models.MetricGroupValue{{"queryid": "42", "calls": uint64(1)}}
 
-	partial := map[string][]models.MetricGroupValue{
-		"information_schema_tables": {
-			{"TABLE_CATALOG": "shop", "TABLE_SCHEMA": "public", "TABLE_NAME": "orders"},
-		},
-		"information_schema_columns": {
-			{"TABLE_CATALOG": "shop", "TABLE_SCHEMA": "public", "TABLE_NAME": "orders", "COLUMN_NAME": "id"},
-		},
+	if err := gatherer.GetMetrics(metrics); err != nil {
+		t.Fatal(err)
 	}
-
-	commitPgDatabaseSchema(metrics, partial)
-	if len(metrics.DB.DatabaseSchema["information_schema_tables"]) != 2 {
-		t.Fatalf("successful schema should append to existing metrics, got %#v", metrics.DB.DatabaseSchema["information_schema_tables"])
-	}
-	if len(metrics.DB.DatabaseSchema["information_schema_columns"]) != 1 {
-		t.Fatalf("successful schema should commit columns, got %#v", metrics.DB.DatabaseSchema["information_schema_columns"])
-	}
-
-	// Simulate failure path: partial buffer is discarded and never committed.
-	failedPartial := map[string][]models.MetricGroupValue{
-		"information_schema_indexes": {
-			{"TABLE_CATALOG": "shop", "TABLE_SCHEMA": "public", "INDEX_NAME": "idx_orders_id"},
-		},
-	}
-	_ = failedPartial
-	if _, ok := metrics.DB.DatabaseSchema["information_schema_indexes"]; ok {
-		t.Fatalf("failed schema collection must not leave partial indexes in shared metrics")
+	if metrics.DB.Queries != nil {
+		t.Fatalf("failed full collection must not retain lightweight queries: %#v", metrics.DB.Queries)
 	}
 }
 
-func TestPostgresqlSequencesAreCollectedOnlyWhenViewExists(t *testing.T) {
-	if !pgSupportsSequencesView(100000) {
-		t.Fatalf("postgresql 10+ should support pg_sequences")
-	}
-	if pgSupportsSequencesView(90600) {
-		t.Fatalf("postgresql before 10 should not query pg_sequences")
-	}
-}
-
-func pgIndexInput(catalog, schema, tableName, indexName, columnName, expression, predicate string) pgIndexSchemaMetricInput {
-	return pgIndexSchemaMetricInput{
-		TABLE_CATALOG:     catalog,
-		TABLE_SCHEMA:      schema,
-		TABLE_NAME:        tableName,
-		INDEX_NAME:        indexName,
-		NON_UNIQUE:        "1",
-		SEQ_IN_INDEX:      "1",
-		COLUMN_NAME:       columnName,
-		COLLATION:         "NULL",
-		CARDINALITY:       "NULL",
-		SUB_PART:          "NULL",
-		PACKED:            "NULL",
-		NULLABLE:          "NO",
-		INDEX_TYPE:        "btree",
-		EXPRESSION:        expression,
-		PREDICATE:         predicate,
-		PG_RELAM:          "btree",
-		PG_INDKEY:         "1",
-		PG_INDCLASS:       "1978",
-		PG_INDCOLLATION:   "0",
-		PG_INDOPTION:      "0",
-		PG_INDNKEYATTS:    "1",
-		PG_INDNATTS:       "1",
-		PG_INDEXPRS:       expression,
-		PG_INDPRED:        predicate,
-		PG_INDISVALID:     "true",
-		PG_INDISREADY:     "true",
-		PG_INDISEXCLUSION: "false",
-		LAST_IDX_SCAN:     "NULL",
+func TestPostgresqlExplainableStatementsMatchPostgresqlCommands(t *testing.T) {
+	for query, want := range map[string]bool{
+		"SELECT * FROM orders":                             true,
+		"  with recent AS (SELECT 1) SELECT * FROM recent": true,
+		"/* app=checkout */ SELECT * FROM orders":          true,
+		"-- trace\nUPDATE orders SET status = 'done'":      true,
+		"/* SELECT */ VACUUM orders":                       false,
+		"TABLE orders":                                     true,
+		"DELETE FROM orders WHERE id = 1":                  true,
+		"INSERT INTO orders(id) VALUES (1)":                true,
+		"UPDATE orders SET status = 'done'":                true,
+		"EXPLAIN SELECT * FROM orders":                     false,
+		"PREPARE q AS SELECT * FROM orders":                false,
+		"VACUUM orders":                                    false,
+		"":                                                 false,
+	} {
+		if got := isPgExplainableStatement(query); got != want {
+			t.Fatalf("isPgExplainableStatement(%q) = %v, want %v", query, got, want)
+		}
 	}
 }
 
-func TestPostgresqlExplainSearchPathRetryHelpers(t *testing.T) {
-	if !isUndefinedRelationError(fmt.Errorf("pq: relation \"orders\" does not exist")) {
-		t.Fatalf("undefined relation errors should trigger search_path retry")
-	}
-	if isUndefinedRelationError(fmt.Errorf("pq: permission denied for table orders")) {
-		t.Fatalf("permission errors should not trigger search_path retry")
-	}
-
-	searchPath, ok := pgSearchPathList([]string{"app", `tenant"one`})
-	if !ok {
-		t.Fatalf("user schemas should produce a search_path")
-	}
-	if searchPath != `"app","tenant""one"` {
-		t.Fatalf("search_path should quote PostgreSQL identifiers safely, got %s", searchPath)
-	}
-
-	if _, ok := pgSearchPathList([]string{"public"}); ok {
-		t.Fatalf("public-only schema list should not add a retry search_path")
-	}
-
-	if !shouldRetryPreparedExplainWithSearchPath(fmt.Errorf("pq: relation \"orders\" does not exist"), []string{"app"}) {
-		t.Fatalf("prepared explain should retry with search_path on undefined relation")
-	}
-	if shouldRetryPreparedExplainWithSearchPath(fmt.Errorf("pq: there is no parameter $1"), []string{"app"}) {
-		t.Fatalf("prepared explain should not retry search_path for parameter binding errors")
-	}
-	if shouldRetryPreparedExplainWithSearchPath(fmt.Errorf("pq: relation \"orders\" does not exist"), []string{"public"}) {
-		t.Fatalf("prepared explain should not retry search_path without non-public schemas")
+func TestContainsUnquotedPgParameterUsesPostgresqlLexing(t *testing.T) {
+	for query, want := range map[string]bool{
+		"SELECT * FROM orders WHERE id = $1":        true,
+		`SELECT E'it\'s' FROM orders WHERE id = $1`: true,
+		"SELECT '$1'":                 false,
+		"SELECT 1 /* $1 */":           false,
+		"SELECT 1 -- $1\n":            false,
+		"SELECT $tag$literal $1$tag$": false,
+		`SELECT "$1" FROM orders`:     false,
+	} {
+		if got := containsUnquotedPgParameter(query); got != want {
+			t.Fatalf("containsUnquotedPgParameter(%q) = %v, want %v", query, got, want)
+		}
 	}
 }
+
+func TestPostgresqlExplainCollectsIndependentSuccessfulQuotas(t *testing.T) {
+	logger := *logging.Init("postgresql-explain-success-quota-test", false, false, io.Discard)
+	defer logger.Close()
+
+	details := make(map[string]PostgresQueryDetail, 205)
+	for i := 0; i < 205; i++ {
+		queryID := fmt.Sprintf("%03d", i)
+		detail := PostgresQueryDetail{
+			PostgresQueryStats: PostgresQueryStats{Datname: "app", QueryID: queryID},
+			Query:              "SELECT 1",
+		}
+		if i < 105 {
+			detail.TotalExecTimeUS = float64(205 - i)
+		} else {
+			detail.MeanExecTimeUS = float64(i)
+		}
+		details[pgDigestKey("app", queryID)] = detail
+	}
+
+	recorder := &pgExplainRecordingDriver{}
+	sql.Register("releem_pg_explain_success_quota_test", recorder)
+	db, err := sql.Open("releem_pg_explain_success_quota_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := newPgExplainCollectionState()
+	defer state.close()
+	state.connect = func(*config.Config, logging.Logger, string) *sql.DB { return db }
+	state.executeExplain = func(_ *sql.DB, queryID, _ string, _ bool, _ logging.Logger) (string, error) {
+		if queryID < "005" {
+			return "", errors.New("expected explain failure")
+		}
+		return "{}", nil
+	}
+
+	totalSuccesses := collectExplainDetails(details, "total_exec_time_us", true, logger, &config.Config{}, state)
+	meanSuccesses := collectExplainDetails(details, "mean_exec_time_us", true, logger, &config.Config{}, state)
+	if totalSuccesses != 100 || meanSuccesses != 100 {
+		t.Fatalf("success quotas: total=%d mean=%d", totalSuccesses, meanSuccesses)
+	}
+
+	explained := 0
+	for _, detail := range details {
+		if detail.Explain != "" {
+			explained++
+		}
+	}
+	if explained != 200 {
+		t.Fatalf("expected 200 unique plans, got %d", explained)
+	}
+}
+
+func TestPostgresqlExplainAttemptsAreDeduplicatedOnlyWithinCollection(t *testing.T) {
+	first := newPgExplainCollectionState()
+	if !first.tryBeginAttempt("app\x0042") {
+		t.Fatalf("first EXPLAIN attempt should be allowed")
+	}
+	if first.tryBeginAttempt("app\x0042") {
+		t.Fatalf("same query should not be attempted twice within one collection")
+	}
+	second := newPgExplainCollectionState()
+	if !second.tryBeginAttempt("app\x0042") {
+		t.Fatalf("a new payload collection must retry the query")
+	}
+}
+
+func TestPostgresqlExplainCollectionStateKeepsOnlyCurrentDatabaseConnection(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{}
+	sql.Register("releem_pg_explain_connection_state_test", recorder)
+	dbA, err := sql.Open("releem_pg_explain_connection_state_test", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbB, err := sql.Open("releem_pg_explain_connection_state_test", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbA.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbB.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	state := newPgExplainCollectionState()
+	opens := 0
+	dbs := map[string]*sql.DB{"db_a": dbA, "db_b": dbB}
+	connect := func() *sql.DB {
+		opens++
+		return dbs[map[int]string{1: "db_a", 2: "db_b"}[opens]]
+	}
+
+	state.connection("db_a", connect)
+	state.connection("db_b", connect)
+	if opens != 2 {
+		t.Fatalf("database switch should open the second handle, got %d opens", opens)
+	}
+	if err := dbA.Ping(); err == nil {
+		t.Fatalf("previous database handle must be closed when switching databases")
+	}
+	state.close()
+	if err := dbB.Ping(); err == nil {
+		t.Fatalf("current database handle must be closed with collection state")
+	}
+}
+
+func TestPostgresqlExplainCollectionStateCachesFailedDatabaseForCurrentCollection(t *testing.T) {
+	state := newPgExplainCollectionState()
+	attempts := 0
+
+	connect := func() *sql.DB {
+		attempts++
+		return nil
+	}
+
+	if db := state.connection("app", connect); db != nil {
+		t.Fatalf("failed connection should return nil")
+	}
+	if db := state.connection("app", connect); db != nil {
+		t.Fatalf("repeated failed connection should return nil")
+	}
+	if attempts != 1 {
+		t.Fatalf("failed database should be attempted once per collection, got %d attempts", attempts)
+	}
+}
+
+func TestPostgresqlExplainPreservesOriginalQuotedIdentifiers(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{}
+	sql.Register("releem_pg_explain_quotes_test", recorder)
+	db, err := sql.Open("releem_pg_explain_quotes_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	logger := *logging.Init("postgresql-explain-quotes-test", false, false, io.Discard)
+	query := `SELECT "OrderID" FROM "SalesOrders"`
+	_, _ = ExecuteExplain(db, "42", query, true, logger)
+
+	explains := recorder.queriesWithPrefix("EXPLAIN (FORMAT JSON)")
+	if len(explains) != 1 {
+		t.Fatalf("EXPLAIN should execute the original query once, got %#v", explains)
+	}
+	if explains[0] != "EXPLAIN (FORMAT JSON) "+query {
+		t.Fatalf("EXPLAIN must preserve PostgreSQL quoted identifiers, got %q", explains[0])
+	}
+	if !recordedQueryContains(recorder.queries, `SET LOCAL search_path = "pg_catalog"`) {
+		t.Fatalf("direct EXPLAIN must use a catalog-only baseline search_path: %#v", recorder.queries)
+	}
+}
+
+func TestPostgresqlParameterizedExplainDoesNotFallBackToDirectExplain(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{failPrepare: true}
+	sql.Register("releem_pg_explain_prepared_test", recorder)
+	db, err := sql.Open("releem_pg_explain_prepared_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	logger := *logging.Init("postgresql-explain-prepared-test", false, false, io.Discard)
+	_, err = ExecuteExplain(db, "42", "SELECT * FROM orders WHERE id = $1", true, logger)
+	if err == nil {
+		t.Fatalf("prepared-statement failure should be returned")
+	}
+	if explains := recorder.queriesWithPrefix("EXPLAIN (FORMAT JSON) SELECT"); len(explains) != 0 {
+		t.Fatalf("parameterized query must not fall back to direct EXPLAIN: %#v", explains)
+	}
+}
+
+func TestPostgresqlParameterizedExplainNormalizesPgStatStatementsTypedLiterals(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{}
+	sql.Register("releem_pg_explain_typed_literals_test", recorder)
+	db, err := sql.Open("releem_pg_explain_typed_literals_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	logger := *logging.Init("postgresql-explain-typed-literals-test", false, false, io.Discard)
+	query := "SELECT * FROM events WHERE created_at >= timestamp $2 AND event_date = date $3"
+	_, _ = ExecuteExplain(db, "42", query, true, logger)
+
+	prepares := recorder.queriesWithPrefix("PREPARE ")
+	if len(prepares) != 1 {
+		t.Fatalf("expected one prepared statement, got %#v", prepares)
+	}
+	want := "PREPARE releem_42 AS SELECT * FROM events WHERE created_at >= $2::timestamp AND event_date = $3::date"
+	if prepares[0] != want {
+		t.Fatalf("prepared EXPLAIN query = %q, want %q", prepares[0], want)
+	}
+}
+
+func TestNormalizePgStatStatementsTypedParametersSkipsQuotedTextAndComments(t *testing.T) {
+	query := `SELECT 'date $1', "timestamp $2", $$date $3$$, /* timestamp $4 */ date $5`
+	want := `SELECT 'date $1', "timestamp $2", $$date $3$$, /* timestamp $4 */ $5::date`
+	if got := normalizePgStatStatementsTypedParameters(query); got != want {
+		t.Fatalf("normalizePgStatStatementsTypedParameters() = %q, want %q", got, want)
+	}
+}
+
+func TestPostgresqlParameterizedExplainCleansUpSessionAfterExplainError(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{queryError: fmt.Errorf("explain failed")}
+	sql.Register("releem_pg_explain_cleanup_test", recorder)
+	db, err := sql.Open("releem_pg_explain_cleanup_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	logger := *logging.Init("postgresql-explain-cleanup-test", false, false, io.Discard)
+	_, err = ExecuteExplain(db, "42", "SELECT * FROM orders WHERE id = $1", true, logger)
+	if err == nil {
+		t.Fatalf("EXPLAIN error should be returned")
+	}
+
+	for _, expected := range []string{
+		"SET plan_cache_mode = force_generic_plan",
+		"DEALLOCATE PREPARE releem_42",
+		"RESET plan_cache_mode",
+	} {
+		found := false
+		for _, query := range recorder.queries {
+			if query == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("prepared EXPLAIN must execute cleanup query %q after failure: %#v", expected, recorder.queries)
+		}
+	}
+}
+
+func TestPostgresqlParameterizedExplainLooksUpCandidateSchemas(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{prepareError: fmt.Errorf(`pq: relation "orders" does not exist`)}
+	sql.Register("releem_pg_explain_prepared_no_search_path_test", recorder)
+	db, err := sql.Open("releem_pg_explain_prepared_no_search_path_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	logger := *logging.Init("postgresql-explain-prepared-no-search-path-test", false, false, io.Discard)
+	_, err = ExecuteExplain(db, "42", "SELECT * FROM orders WHERE id = $1", true, logger)
+	if err == nil || !strings.Contains(err.Error(), `relation "orders" does not exist`) {
+		t.Fatalf("original undefined relation error should be returned, got %v", err)
+	}
+	if !recordedQueryContains(recorder.queries, "FROM pg_namespace") {
+		t.Fatalf("undefined relations should trigger candidate schema lookup: %#v", recorder.queries)
+	}
+	if !recordedQueryContains(recorder.queries, `SET search_path = "pg_catalog"`) {
+		t.Fatalf("prepared EXPLAIN must use a catalog-only baseline search_path: %#v", recorder.queries)
+	}
+}
+
+func TestPostgresqlExplainErrorClassificationUsesSQLState(t *testing.T) {
+	undefinedRelation := &pq.Error{Code: "42P01", Message: "localized undefined relation"}
+	if !isUndefinedRelationError(undefinedRelation) {
+		t.Fatalf("undefined relation must be detected from SQLSTATE: %v", undefinedRelation)
+	}
+
+	insufficientPrivilege := &pq.Error{Code: "42501", Message: "localized insufficient privilege"}
+	if !isExplainPermissionError(insufficientPrivilege) {
+		t.Fatalf("permission errors must be detected from SQLSTATE: %v", insufficientPrivilege)
+	}
+}
+
+func TestPostgresqlExplainLooksUpCandidateSchemas(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{queryError: fmt.Errorf(`pq: relation "orders" does not exist`)}
+	sql.Register("releem_pg_explain_no_search_path_test", recorder)
+	db, err := sql.Open("releem_pg_explain_no_search_path_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	logger := *logging.Init("postgresql-explain-no-search-path-test", false, false, io.Discard)
+	query := `SELECT "OrderID" FROM orders`
+	_, err = ExecuteExplain(db, "42", query, true, logger)
+	if err == nil || !strings.Contains(err.Error(), `relation "orders" does not exist`) {
+		t.Fatalf("original undefined relation error should be returned, got %v", err)
+	}
+	explains := recorder.queriesWithPrefix("EXPLAIN (FORMAT JSON)")
+	if len(explains) != 1 || explains[0] != "EXPLAIN (FORMAT JSON) "+query {
+		t.Fatalf("EXPLAIN must execute the original statement exactly once: %#v", explains)
+	}
+	if !recordedQueryContains(recorder.queries, "FROM pg_namespace") {
+		t.Fatalf("undefined relations should trigger candidate schema lookup: %#v", recorder.queries)
+	}
+}
+
+func recordedQueryContains(queries []string, fragment string) bool {
+	for _, query := range queries {
+		if strings.Contains(query, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestPostgresqlExplainCandidateSchemasRequireUniqueSuccess(t *testing.T) {
+	attempted := []string{}
+	explain, err := resolvePgExplainCandidateSchemas([]string{"app", "archive"}, func(schema string) (string, error) {
+		attempted = append(attempted, schema)
+		if schema == "app" {
+			return `[{"Plan":{"Node Type":"Seq Scan"}}]`, nil
+		}
+		return "", fmt.Errorf(`pq: relation "orders" does not exist`)
+	})
+	if err != nil || explain == "" {
+		t.Fatalf("one successful schema should return its plan, got explain=%q err=%v", explain, err)
+	}
+	if !reflect.DeepEqual([]string{"app", "archive"}, attempted) {
+		t.Fatalf("all candidates must be checked for ambiguity, got %#v", attempted)
+	}
+
+	_, err = resolvePgExplainCandidateSchemas([]string{"app", "archive"}, func(string) (string, error) {
+		return `[{"Plan":{"Node Type":"Seq Scan"}}]`, nil
+	})
+	if err == nil || err.Error() != pgExplainAmbiguousSchemaError {
+		t.Fatalf("multiple successful schemas must fail deterministically, got %v", err)
+	}
+}
+
+func TestPostgresqlExplainSupportsMerge(t *testing.T) {
+	if !isPgExplainableStatement("MERGE INTO target USING source ON false WHEN NOT MATCHED THEN INSERT DEFAULT VALUES") {
+		t.Fatalf("PostgreSQL 15+ MERGE statements should be eligible for EXPLAIN")
+	}
+}
+
+type pgExplainRecordingDriver struct {
+	queries      []string
+	failPrepare  bool
+	prepareError error
+	queryError   error
+	queryRows    driver.Rows
+	closes       int
+}
+
+func (d *pgExplainRecordingDriver) Open(string) (driver.Conn, error) {
+	return &pgExplainRecordingConn{driver: d}, nil
+}
+
+func (d *pgExplainRecordingDriver) queriesWithPrefix(prefix string) []string {
+	var matched []string
+	for _, query := range d.queries {
+		if strings.HasPrefix(query, prefix) {
+			matched = append(matched, query)
+		}
+	}
+	return matched
+}
+
+type pgExplainRecordingConn struct {
+	driver *pgExplainRecordingDriver
+}
+
+func (c *pgExplainRecordingConn) Prepare(string) (driver.Stmt, error) {
+	return &pgExplainRecordingStmt{conn: c}, nil
+}
+
+func (c *pgExplainRecordingConn) PrepareContext(_ context.Context, query string) (driver.Stmt, error) {
+	return &pgExplainRecordingStmt{conn: c, query: query}, nil
+}
+
+func (c *pgExplainRecordingConn) Close() error {
+	c.driver.closes++
+	return nil
+}
+
+func (c *pgExplainRecordingConn) Begin() (driver.Tx, error) {
+	return nil, fmt.Errorf("unexpected transaction")
+}
+
+func (c *pgExplainRecordingConn) BeginTx(_ context.Context, _ driver.TxOptions) (driver.Tx, error) {
+	return pgExplainRecordingTx{}, nil
+}
+
+func (c *pgExplainRecordingConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.driver.queries = append(c.driver.queries, query)
+	if c.driver.failPrepare && strings.HasPrefix(query, "PREPARE ") {
+		return nil, fmt.Errorf("prepare failed")
+	}
+	if c.driver.prepareError != nil && strings.HasPrefix(query, "PREPARE ") {
+		return nil, c.driver.prepareError
+	}
+	return driver.RowsAffected(0), nil
+}
+
+func (c *pgExplainRecordingConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	c.driver.queries = append(c.driver.queries, query)
+	if c.driver.queryRows != nil {
+		return c.driver.queryRows, nil
+	}
+	if query == "SELECT COALESCE(cardinality(parameter_types), 0) FROM pg_prepared_statements WHERE name = $1" {
+		return &pgExplainRows{
+			columns: []string{"coalesce"},
+			rows:    [][]driver.Value{{int64(1)}},
+		}, nil
+	}
+	if c.driver.queryError != nil {
+		return nil, c.driver.queryError
+	}
+	return nil, fmt.Errorf("query failed")
+}
+
+type pgExplainRows struct {
+	columns []string
+	rows    [][]driver.Value
+	index   int
+}
+
+func (r *pgExplainRows) Columns() []string {
+	return r.columns
+}
+
+func (r *pgExplainRows) Close() error {
+	return nil
+}
+
+func (r *pgExplainRows) Next(dest []driver.Value) error {
+	if r.index >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.index])
+	r.index++
+	return nil
+}
+
+type pgExplainRecordingStmt struct {
+	conn  *pgExplainRecordingConn
+	query string
+}
+
+func (s *pgExplainRecordingStmt) Close() error {
+	return nil
+}
+
+func (s *pgExplainRecordingStmt) NumInput() int {
+	return -1
+}
+
+func (s *pgExplainRecordingStmt) Exec(args []driver.Value) (driver.Result, error) {
+	return s.conn.ExecContext(context.Background(), s.query, namedValuesFromValues(args))
+}
+
+func (s *pgExplainRecordingStmt) Query(args []driver.Value) (driver.Rows, error) {
+	return s.conn.QueryContext(context.Background(), s.query, namedValuesFromValues(args))
+}
+
+func (s *pgExplainRecordingStmt) ExecContext(_ context.Context, args []driver.NamedValue) (driver.Result, error) {
+	return s.conn.ExecContext(context.Background(), s.query, args)
+}
+
+func (s *pgExplainRecordingStmt) QueryContext(_ context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return s.conn.QueryContext(context.Background(), s.query, args)
+}
+
+func namedValuesFromValues(values []driver.Value) []driver.NamedValue {
+	named := make([]driver.NamedValue, 0, len(values))
+	for i, value := range values {
+		named = append(named, driver.NamedValue{Ordinal: i + 1, Value: value})
+	}
+	return named
+}
+
+type pgExplainRecordingTx struct{}
+
+func (pgExplainRecordingTx) Commit() error   { return nil }
+func (pgExplainRecordingTx) Rollback() error { return nil }
 
 func TestPostgresqlUserSchemaPredicateExcludesInternalSchemas(t *testing.T) {
 	predicate := pgUserSchemaPredicate("n.nspname")
@@ -321,119 +581,5 @@ func TestPostgresqlTableRelkindPredicateIncludesPartitionedTables(t *testing.T) 
 	predicate := pgTableRelkindPredicate("c.relkind")
 	if !strings.Contains(predicate, "'p'") {
 		t.Fatalf("postgresql table relkind predicate should include partitioned tables: %s", predicate)
-	}
-}
-
-func TestPostgresqlQueryMetricIncludesRowsSentForPlatformCollector(t *testing.T) {
-	query := pgQueryMetric("appdb", "42", "select * from orders", 3, 9000, 3000, 12)
-
-	if query["SUM_ROWS_SENT"] != uint64(12) {
-		t.Fatalf("query metric should expose SUM_ROWS_SENT for rows_sent calculation: %#v", query)
-	}
-}
-
-func TestPgStatStatementsQueriesCollectRows(t *testing.T) {
-	for name, query := range map[string]string{
-		"new":         PG_STAT_STATEMENTS,
-		"old":         PG_STAT_STATEMENTS_OLD_VERSION,
-		"newFallback": PG_STAT_STATEMENTS_NO_ROWS,
-		"oldFallback": PG_STAT_STATEMENTS_OLD_VERSION_NO_ROWS,
-	} {
-		if !strings.Contains(query, "rows_sent") {
-			t.Fatalf("%s pg_stat_statements query should expose rows_sent: %s", name, query)
-		}
-		if !strings.Contains(query, "NULLIF(sum(s.calls), 0)") {
-			t.Fatalf("%s pg_stat_statements query should guard mean_exec_time division: %s", name, query)
-		}
-	}
-	if !strings.Contains(PG_STAT_STATEMENTS, "sum(s.rows)") {
-		t.Fatalf("pg_stat_statements query should collect rows when supported: %s", PG_STAT_STATEMENTS)
-	}
-	if strings.Contains(PG_STAT_STATEMENTS_NO_ROWS, "sum(s.rows)") {
-		t.Fatalf("pg_stat_statements fallback query should not reference rows column: %s", PG_STAT_STATEMENTS_NO_ROWS)
-	}
-}
-
-func TestPgStatStatementsQuerySelectsRowsFallback(t *testing.T) {
-	query := PgStatStatementsQuery(version.Must(version.NewVersion("14.0")), false)
-	if query != PG_STAT_STATEMENTS_NO_ROWS {
-		t.Fatalf("expected rows fallback query for PG 14, got: %s", query)
-	}
-
-	query = PgStatStatementsQuery(version.Must(version.NewVersion("14.0")), true)
-	if query != PG_STAT_STATEMENTS {
-		t.Fatalf("expected rows-enabled query for PG 14, got: %s", query)
-	}
-
-	query = PgStatStatementsQuery(version.Must(version.NewVersion("12.0")), true)
-	if query != PG_STAT_STATEMENTS_OLD_VERSION {
-		t.Fatalf("expected old timing query for PG 12, got: %s", query)
-	}
-}
-
-func TestPgStatStatementsRowsSupportIsCached(t *testing.T) {
-	models.PgStatStatementsSupportsRows = false
-	models.PgStatStatementsSupportsRowsDetected = false
-	t.Cleanup(func() {
-		models.PgStatStatementsSupportsRows = false
-		models.PgStatStatementsSupportsRowsDetected = false
-	})
-
-	calls := 0
-	probe := func() (bool, error) {
-		calls++
-		return calls == 1, nil
-	}
-
-	if !detectPgStatStatementsSupportsRows(probe, nil) {
-		t.Fatalf("first rows-support probe should return the database result")
-	}
-	if !detectPgStatStatementsSupportsRows(probe, nil) {
-		t.Fatalf("second rows-support probe should return cached result")
-	}
-	if calls != 1 {
-		t.Fatalf("rows-support detection should query once, got %d probes", calls)
-	}
-}
-
-func TestPgStatStatementsRowsSupportProbeErrorIsNotCached(t *testing.T) {
-	models.PgStatStatementsSupportsRows = false
-	models.PgStatStatementsSupportsRowsDetected = false
-	t.Cleanup(func() {
-		models.PgStatStatementsSupportsRows = false
-		models.PgStatStatementsSupportsRowsDetected = false
-	})
-
-	calls := 0
-	probe := func() (bool, error) {
-		calls++
-		if calls == 1 {
-			return false, fmt.Errorf("temporary connection error")
-		}
-		return true, nil
-	}
-
-	if detectPgStatStatementsSupportsRows(probe, nil) {
-		t.Fatalf("failed rows-support probe should return false")
-	}
-	if models.PgStatStatementsSupportsRowsDetected {
-		t.Fatalf("failed rows-support probe should not mark detection complete")
-	}
-	if !detectPgStatStatementsSupportsRows(probe, nil) {
-		t.Fatalf("successful retry should return the database result")
-	}
-	if calls != 2 {
-		t.Fatalf("rows-support detection should retry after a probe error, got %d probes", calls)
-	}
-}
-
-func TestPostgresqlBaseQueryMetricLatencyExcludesQueryText(t *testing.T) {
-	query := pgQueryMetricLatency("appdb", "42", 3, 9000, 3000, 12)
-
-	if _, ok := query["query"]; ok {
-		t.Fatalf("base query metric should not include query text: %#v", query)
-	}
-	if query["SUM_ROWS_SENT"] != uint64(12) {
-		t.Fatalf("base query metric should expose SUM_ROWS_SENT: %#v", query)
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/Releem/mysqlconfigurer/models"
 	u "github.com/Releem/mysqlconfigurer/utils"
+	mysqldriver "github.com/go-sql-driver/mysql"
 
 	"github.com/Releem/mysqlconfigurer/config"
 	logging "github.com/google/logger"
@@ -23,7 +24,93 @@ const mysqlTableSchemaSelectQuery = `SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABL
 
 const mysqlIndexSchemaSelectQuery = `SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(INDEX_NAME, 'NULL') as INDEX_NAME, IFNULL(NON_UNIQUE, 'NULL') as NON_UNIQUE, IFNULL(SEQ_IN_INDEX, 'NULL') as SEQ_IN_INDEX, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(COLLATION, 'NULL') as COLLATION, IFNULL(CARDINALITY, 'NULL') as CARDINALITY, IFNULL(SUB_PART, 'NULL') as SUB_PART, IFNULL(PACKED, 'NULL') as PACKED, IFNULL(NULLABLE, 'NULL') as NULLABLE, IFNULL(INDEX_TYPE, 'NULL') as INDEX_TYPE, IFNULL(EXPRESSION, 'NULL') as EXPRESSION, IFNULL(IS_VISIBLE, 'YES') as IS_VISIBLE FROM information_schema.statistics WHERE TABLE_SCHEMA = ? `
 
-const mysqlIndexSchemaSelectQueryLegacy = `SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(INDEX_NAME, 'NULL') as INDEX_NAME, IFNULL(NON_UNIQUE, 'NULL') as NON_UNIQUE, IFNULL(SEQ_IN_INDEX, 'NULL') as SEQ_IN_INDEX, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(COLLATION, 'NULL') as COLLATION, IFNULL(CARDINALITY, 'NULL') as CARDINALITY, IFNULL(SUB_PART, 'NULL') as SUB_PART, IFNULL(PACKED, 'NULL') as PACKED, IFNULL(NULLABLE, 'NULL') as NULLABLE, IFNULL(INDEX_TYPE, 'NULL') as INDEX_TYPE FROM information_schema.statistics WHERE TABLE_SCHEMA = ? `
+const mysqlIndexSchemaSelectQueryMariaDB = `SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(INDEX_NAME, 'NULL') as INDEX_NAME, IFNULL(NON_UNIQUE, 'NULL') as NON_UNIQUE, IFNULL(SEQ_IN_INDEX, 'NULL') as SEQ_IN_INDEX, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(COLLATION, 'NULL') as COLLATION, IFNULL(CARDINALITY, 'NULL') as CARDINALITY, IFNULL(SUB_PART, 'NULL') as SUB_PART, IFNULL(PACKED, 'NULL') as PACKED, IFNULL(NULLABLE, 'NULL') as NULLABLE, IFNULL(INDEX_TYPE, 'NULL') as INDEX_TYPE, 'NULL' AS EXPRESSION, CASE WHEN UPPER(IFNULL(IGNORED, 'NO')) = 'YES' THEN 'NO' ELSE 'YES' END AS IS_VISIBLE FROM information_schema.statistics WHERE TABLE_SCHEMA = ? `
+
+const mysqlIndexSchemaSelectQueryVisibility = `SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(INDEX_NAME, 'NULL') as INDEX_NAME, IFNULL(NON_UNIQUE, 'NULL') as NON_UNIQUE, IFNULL(SEQ_IN_INDEX, 'NULL') as SEQ_IN_INDEX, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(COLLATION, 'NULL') as COLLATION, IFNULL(CARDINALITY, 'NULL') as CARDINALITY, IFNULL(SUB_PART, 'NULL') as SUB_PART, IFNULL(PACKED, 'NULL') as PACKED, IFNULL(NULLABLE, 'NULL') as NULLABLE, IFNULL(INDEX_TYPE, 'NULL') as INDEX_TYPE, 'NULL' AS EXPRESSION, IFNULL(IS_VISIBLE, 'YES') as IS_VISIBLE FROM information_schema.statistics WHERE TABLE_SCHEMA = ? `
+
+const mysqlIndexSchemaSelectQueryLegacy = `SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(INDEX_NAME, 'NULL') as INDEX_NAME, IFNULL(NON_UNIQUE, 'NULL') as NON_UNIQUE, IFNULL(SEQ_IN_INDEX, 'NULL') as SEQ_IN_INDEX, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(COLLATION, 'NULL') as COLLATION, IFNULL(CARDINALITY, 'NULL') as CARDINALITY, IFNULL(SUB_PART, 'NULL') as SUB_PART, IFNULL(PACKED, 'NULL') as PACKED, IFNULL(NULLABLE, 'NULL') as NULLABLE, IFNULL(INDEX_TYPE, 'NULL') as INDEX_TYPE, 'NULL' AS EXPRESSION, 'YES' AS IS_VISIBLE FROM information_schema.statistics WHERE TABLE_SCHEMA = ? `
+
+func mysqlIndexSchemaSelectQueries() []string {
+	return []string{
+		mysqlIndexSchemaSelectQuery,
+		mysqlIndexSchemaSelectQueryVisibility,
+		mysqlIndexSchemaSelectQueryMariaDB,
+		mysqlIndexSchemaSelectQueryLegacy,
+	}
+}
+
+func isMysqlUnknownColumnError(err error) bool {
+	var mysqlErr *mysqldriver.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 1054
+	}
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unknown column")
+}
+
+func resetFailedDatabaseSchema(metrics *models.Metrics) {
+	metrics.DB.FailedDatabaseSchema = nil
+}
+
+func hasFailedDatabaseSchema(metrics *models.Metrics, section string) bool {
+	for _, failedSection := range metrics.DB.FailedDatabaseSchema {
+		if failedSection == section {
+			return true
+		}
+	}
+	return false
+}
+
+func recordFailedDatabaseSchema(metrics *models.Metrics, section string) {
+	if hasFailedDatabaseSchema(metrics, section) {
+		return
+	}
+	metrics.DB.FailedDatabaseSchema = append(metrics.DB.FailedDatabaseSchema, section)
+}
+
+func recordSchemaCollectionError(logger logging.Logger, metrics *models.Metrics, section string, err error, firstErr *error) {
+	logger.Error(err)
+	recordFailedDatabaseSchema(metrics, section)
+	if *firstErr == nil {
+		*firstErr = err
+	}
+}
+
+func collectMysqlSchemaSectionRows(rows *sql.Rows, scan func() (models.MetricGroupValue, error)) ([]models.MetricGroupValue, error) {
+	sectionMetrics := make([]models.MetricGroupValue, 0)
+	for rows.Next() {
+		value, err := scan()
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		sectionMetrics = append(sectionMetrics, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return sectionMetrics, nil
+}
+
+func appendMysqlSchemaSection(metrics *models.Metrics, logger logging.Logger, section string, rows *sql.Rows, queryErr error, scan func() (models.MetricGroupValue, error), firstErr *error) {
+	if queryErr != nil {
+		logger.Error(queryErr)
+		recordFailedDatabaseSchema(metrics, section)
+		return
+	}
+	sectionMetrics, err := collectMysqlSchemaSectionRows(rows, scan)
+	if err != nil {
+		recordSchemaCollectionError(logger, metrics, section, err, firstErr)
+		return
+	}
+	if len(sectionMetrics) == 0 {
+		return
+	}
+	metrics.DB.DatabaseSchema[section] = append(metrics.DB.DatabaseSchema[section], sectionMetrics...)
+}
 
 func NewDBCollectQueriesOptimization(logger logging.Logger, configuration *config.Config) *DBCollectQueriesOptimization {
 	return &DBCollectQueriesOptimization{
@@ -116,6 +203,7 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 	}
 
 	metrics.DB.DatabaseSchema = make(map[string][]models.MetricGroupValue)
+	resetFailedDatabaseSchema(metrics)
 	i := 0
 	for _, database := range metrics.DB.Metrics.Databases {
 		if u.IsSchemaNameExclude(database, DBCollectQueriesOptimization.configuration.DatabasesQueryOptimization) {
@@ -140,6 +228,9 @@ func CollectIndexUsageSchema(logger logging.Logger, metrics *models.Metrics) err
 	if metrics.DB.Metrics.TotalTables > 1000000 {
 		return nil
 	}
+
+	var firstErr error
+
 	type performance_schema_table_io_waits_summary_by_index_usage_type struct {
 		OBJECT_TYPE      string
 		OBJECT_SCHEMA    string
@@ -184,23 +275,19 @@ func CollectIndexUsageSchema(logger logging.Logger, metrics *models.Metrics) err
 	var performance_schema_table_io_waits_summary_by_index_usage performance_schema_table_io_waits_summary_by_index_usage_type
 
 	rows, err := models.DB.Query(`SELECT IFNULL(OBJECT_TYPE, 'NULL') as OBJECT_TYPE, IFNULL(OBJECT_SCHEMA, 'NULL') as  OBJECT_SCHEMA, IFNULL(OBJECT_NAME, 'NULL') as  OBJECT_NAME, IFNULL(INDEX_NAME, 'NULL') as  INDEX_NAME, IFNULL(COUNT_STAR, 'NULL') as  COUNT_STAR, IFNULL(SUM_TIMER_WAIT, 'NULL') as  SUM_TIMER_WAIT, IFNULL(MIN_TIMER_WAIT, 'NULL') as  MIN_TIMER_WAIT, IFNULL(AVG_TIMER_WAIT, 'NULL') as  AVG_TIMER_WAIT, IFNULL(MAX_TIMER_WAIT, 'NULL') as  MAX_TIMER_WAIT, IFNULL(COUNT_READ, 'NULL') as  COUNT_READ, IFNULL(SUM_TIMER_READ, 'NULL') as  SUM_TIMER_READ, IFNULL(MIN_TIMER_READ, 'NULL') as  MIN_TIMER_READ, IFNULL(AVG_TIMER_READ, 'NULL') as  AVG_TIMER_READ, IFNULL(MAX_TIMER_READ, 'NULL') as  MAX_TIMER_READ, IFNULL(COUNT_WRITE, 'NULL') as  COUNT_WRITE, IFNULL(SUM_TIMER_WRITE, 'NULL') as  SUM_TIMER_WRITE, IFNULL(MIN_TIMER_WRITE, 'NULL') as  MIN_TIMER_WRITE, IFNULL(AVG_TIMER_WRITE, 'NULL') as  AVG_TIMER_WRITE, IFNULL(MAX_TIMER_WRITE, 'NULL') as  MAX_TIMER_WRITE, IFNULL(COUNT_FETCH, 'NULL') as  COUNT_FETCH, IFNULL(SUM_TIMER_FETCH, 'NULL') as  SUM_TIMER_FETCH, IFNULL(MIN_TIMER_FETCH, 'NULL') as  MIN_TIMER_FETCH, IFNULL(AVG_TIMER_FETCH, 'NULL') as  AVG_TIMER_FETCH, IFNULL(MAX_TIMER_FETCH, 'NULL') as  MAX_TIMER_FETCH, IFNULL(COUNT_INSERT, 'NULL') as  COUNT_INSERT, IFNULL(SUM_TIMER_INSERT, 'NULL') as  SUM_TIMER_INSERT, IFNULL(MIN_TIMER_INSERT, 'NULL') as  MIN_TIMER_INSERT, IFNULL(AVG_TIMER_INSERT, 'NULL') as  AVG_TIMER_INSERT, IFNULL(MAX_TIMER_INSERT, 'NULL') as  MAX_TIMER_INSERT, IFNULL(COUNT_UPDATE, 'NULL') as  COUNT_UPDATE, IFNULL(SUM_TIMER_UPDATE, 'NULL') as  SUM_TIMER_UPDATE, IFNULL(MIN_TIMER_UPDATE, 'NULL') as  MIN_TIMER_UPDATE, IFNULL(AVG_TIMER_UPDATE, 'NULL') as  AVG_TIMER_UPDATE, IFNULL(MAX_TIMER_UPDATE, 'NULL') as  MAX_TIMER_UPDATE, IFNULL(COUNT_DELETE, 'NULL') as  COUNT_DELETE, IFNULL(SUM_TIMER_DELETE, 'NULL') as  SUM_TIMER_DELETE, IFNULL(MIN_TIMER_DELETE, 'NULL') as  MIN_TIMER_DELETE, IFNULL(AVG_TIMER_DELETE, 'NULL') as  AVG_TIMER_DELETE, IFNULL(MAX_TIMER_DELETE, 'NULL') as  MAX_TIMER_DELETE FROM performance_schema.table_io_waits_summary_by_index_usage`)
-	if err != nil {
-		logger.Error(err)
-	} else {
-		for rows.Next() {
-			err := rows.Scan(&performance_schema_table_io_waits_summary_by_index_usage.OBJECT_TYPE, &performance_schema_table_io_waits_summary_by_index_usage.OBJECT_SCHEMA, &performance_schema_table_io_waits_summary_by_index_usage.OBJECT_NAME, &performance_schema_table_io_waits_summary_by_index_usage.INDEX_NAME, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_STAR, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_READ, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_DELETE)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["performance_schema_table_io_waits_summary_by_index_usage"] = append(metrics.DB.DatabaseSchema["performance_schema_table_io_waits_summary_by_index_usage"], models.MetricGroupValue{"OBJECT_TYPE": performance_schema_table_io_waits_summary_by_index_usage.OBJECT_TYPE, "OBJECT_SCHEMA": performance_schema_table_io_waits_summary_by_index_usage.OBJECT_SCHEMA, "OBJECT_NAME": performance_schema_table_io_waits_summary_by_index_usage.OBJECT_NAME, "INDEX_NAME": performance_schema_table_io_waits_summary_by_index_usage.INDEX_NAME, "COUNT_STAR": performance_schema_table_io_waits_summary_by_index_usage.COUNT_STAR, "SUM_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WAIT, "MIN_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WAIT, "AVG_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WAIT, "MAX_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WAIT, "COUNT_READ": performance_schema_table_io_waits_summary_by_index_usage.COUNT_READ, "SUM_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_READ, "MIN_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_READ, "AVG_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_READ, "MAX_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_READ, "COUNT_WRITE": performance_schema_table_io_waits_summary_by_index_usage.COUNT_WRITE, "SUM_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WRITE, "MIN_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WRITE, "AVG_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WRITE, "MAX_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WRITE, "COUNT_FETCH": performance_schema_table_io_waits_summary_by_index_usage.COUNT_FETCH, "SUM_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_FETCH, "MIN_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_FETCH, "AVG_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_FETCH, "MAX_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_FETCH, "COUNT_INSERT": performance_schema_table_io_waits_summary_by_index_usage.COUNT_INSERT, "SUM_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_INSERT, "MIN_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_INSERT, "AVG_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_INSERT, "MAX_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_INSERT, "COUNT_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.COUNT_UPDATE, "SUM_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_UPDATE, "MIN_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_UPDATE, "AVG_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_UPDATE, "MAX_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_UPDATE, "COUNT_DELETE": performance_schema_table_io_waits_summary_by_index_usage.COUNT_DELETE, "SUM_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_DELETE, "MIN_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_DELETE, "AVG_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_DELETE, "MAX_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_DELETE})
+	appendMysqlSchemaSection(metrics, logger, "performance_schema_table_io_waits_summary_by_index_usage", rows, err, func() (models.MetricGroupValue, error) {
+		err := rows.Scan(&performance_schema_table_io_waits_summary_by_index_usage.OBJECT_TYPE, &performance_schema_table_io_waits_summary_by_index_usage.OBJECT_SCHEMA, &performance_schema_table_io_waits_summary_by_index_usage.OBJECT_NAME, &performance_schema_table_io_waits_summary_by_index_usage.INDEX_NAME, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_STAR, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WAIT, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_READ, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_READ, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WRITE, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_FETCH, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_INSERT, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_UPDATE, &performance_schema_table_io_waits_summary_by_index_usage.COUNT_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_DELETE, &performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_DELETE)
+		if err != nil {
+			return nil, err
 		}
-		rows.Close()
-	}
-	return nil
+		return models.MetricGroupValue{"OBJECT_TYPE": performance_schema_table_io_waits_summary_by_index_usage.OBJECT_TYPE, "OBJECT_SCHEMA": performance_schema_table_io_waits_summary_by_index_usage.OBJECT_SCHEMA, "OBJECT_NAME": performance_schema_table_io_waits_summary_by_index_usage.OBJECT_NAME, "INDEX_NAME": performance_schema_table_io_waits_summary_by_index_usage.INDEX_NAME, "COUNT_STAR": performance_schema_table_io_waits_summary_by_index_usage.COUNT_STAR, "SUM_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WAIT, "MIN_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WAIT, "AVG_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WAIT, "MAX_TIMER_WAIT": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WAIT, "COUNT_READ": performance_schema_table_io_waits_summary_by_index_usage.COUNT_READ, "SUM_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_READ, "MIN_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_READ, "AVG_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_READ, "MAX_TIMER_READ": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_READ, "COUNT_WRITE": performance_schema_table_io_waits_summary_by_index_usage.COUNT_WRITE, "SUM_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_WRITE, "MIN_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_WRITE, "AVG_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_WRITE, "MAX_TIMER_WRITE": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_WRITE, "COUNT_FETCH": performance_schema_table_io_waits_summary_by_index_usage.COUNT_FETCH, "SUM_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_FETCH, "MIN_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_FETCH, "AVG_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_FETCH, "MAX_TIMER_FETCH": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_FETCH, "COUNT_INSERT": performance_schema_table_io_waits_summary_by_index_usage.COUNT_INSERT, "SUM_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_INSERT, "MIN_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_INSERT, "AVG_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_INSERT, "MAX_TIMER_INSERT": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_INSERT, "COUNT_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.COUNT_UPDATE, "SUM_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_UPDATE, "MIN_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_UPDATE, "AVG_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_UPDATE, "MAX_TIMER_UPDATE": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_UPDATE, "COUNT_DELETE": performance_schema_table_io_waits_summary_by_index_usage.COUNT_DELETE, "SUM_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.SUM_TIMER_DELETE, "MIN_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.MIN_TIMER_DELETE, "AVG_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.AVG_TIMER_DELETE, "MAX_TIMER_DELETE": performance_schema_table_io_waits_summary_by_index_usage.MAX_TIMER_DELETE}, nil
+	}, &firstErr)
+
+	return firstErr
 }
 
 func CollectDbSchema(database string, logger logging.Logger, metrics *models.Metrics) error {
+	var firstErr error
 	type information_schema_table_type struct {
 		TABLE_SCHEMA    string
 		TABLE_NAME      string
@@ -219,19 +306,13 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 	var information_schema_table information_schema_table_type
 
 	rows, err := models.DB.Query(mysqlTableSchemaSelectQuery, database)
-	if err != nil {
-		logger.Error(err)
-	} else {
-		defer rows.Close()
-		for rows.Next() {
-			err := rows.Scan(&information_schema_table.TABLE_SCHEMA, &information_schema_table.TABLE_NAME, &information_schema_table.TABLE_TYPE, &information_schema_table.ENGINE, &information_schema_table.ROW_FORMAT, &information_schema_table.TABLE_ROWS, &information_schema_table.AVG_ROW_LENGTH, &information_schema_table.MAX_DATA_LENGTH, &information_schema_table.DATA_LENGTH, &information_schema_table.INDEX_LENGTH, &information_schema_table.TABLE_COLLATION, &information_schema_table.DATA_FREE, &information_schema_table.AUTO_INCREMENT)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["information_schema_tables"] = append(metrics.DB.DatabaseSchema["information_schema_tables"], models.MetricGroupValue{"TABLE_SCHEMA": information_schema_table.TABLE_SCHEMA, "TABLE_NAME": information_schema_table.TABLE_NAME, "TABLE_TYPE": information_schema_table.TABLE_TYPE, "ENGINE": information_schema_table.ENGINE, "ROW_FORMAT": information_schema_table.ROW_FORMAT, "TABLE_ROWS": information_schema_table.TABLE_ROWS, "AVG_ROW_LENGTH": information_schema_table.AVG_ROW_LENGTH, "MAX_DATA_LENGTH": information_schema_table.MAX_DATA_LENGTH, "DATA_LENGTH": information_schema_table.DATA_LENGTH, "INDEX_LENGTH": information_schema_table.INDEX_LENGTH, "TABLE_COLLATION": information_schema_table.TABLE_COLLATION, "DATA_FREE": information_schema_table.DATA_FREE, "AUTO_INCREMENT": information_schema_table.AUTO_INCREMENT})
+	appendMysqlSchemaSection(metrics, logger, "information_schema_tables", rows, err, func() (models.MetricGroupValue, error) {
+		err := rows.Scan(&information_schema_table.TABLE_SCHEMA, &information_schema_table.TABLE_NAME, &information_schema_table.TABLE_TYPE, &information_schema_table.ENGINE, &information_schema_table.ROW_FORMAT, &information_schema_table.TABLE_ROWS, &information_schema_table.AVG_ROW_LENGTH, &information_schema_table.MAX_DATA_LENGTH, &information_schema_table.DATA_LENGTH, &information_schema_table.INDEX_LENGTH, &information_schema_table.TABLE_COLLATION, &information_schema_table.DATA_FREE, &information_schema_table.AUTO_INCREMENT)
+		if err != nil {
+			return nil, err
 		}
-	}
+		return models.MetricGroupValue{"TABLE_SCHEMA": information_schema_table.TABLE_SCHEMA, "TABLE_NAME": information_schema_table.TABLE_NAME, "TABLE_TYPE": information_schema_table.TABLE_TYPE, "ENGINE": information_schema_table.ENGINE, "ROW_FORMAT": information_schema_table.ROW_FORMAT, "TABLE_ROWS": information_schema_table.TABLE_ROWS, "AVG_ROW_LENGTH": information_schema_table.AVG_ROW_LENGTH, "MAX_DATA_LENGTH": information_schema_table.MAX_DATA_LENGTH, "DATA_LENGTH": information_schema_table.DATA_LENGTH, "INDEX_LENGTH": information_schema_table.INDEX_LENGTH, "TABLE_COLLATION": information_schema_table.TABLE_COLLATION, "DATA_FREE": information_schema_table.DATA_FREE, "AUTO_INCREMENT": information_schema_table.AUTO_INCREMENT}, nil
+	}, &firstErr)
 
 	type information_schema_column_type struct {
 		TABLE_SCHEMA             string
@@ -253,35 +334,23 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 	}
 	var information_schema_column information_schema_column_type
 	rows, err = models.DB.Query(`SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(ORDINAL_POSITION, 'NULL') as ORDINAL_POSITION, IFNULL(COLUMN_DEFAULT, 'NULL') as COLUMN_DEFAULT, IFNULL(IS_NULLABLE, 'NULL') as IS_NULLABLE, IFNULL(DATA_TYPE, 'NULL') as DATA_TYPE, IFNULL(CHARACTER_MAXIMUM_LENGTH, 'NULL') as CHARACTER_MAXIMUM_LENGTH, IFNULL(NUMERIC_PRECISION, 'NULL') as NUMERIC_PRECISION, IFNULL(NUMERIC_SCALE, 'NULL') as NUMERIC_SCALE, IFNULL(CHARACTER_SET_NAME, 'NULL') as CHARACTER_SET_NAME, IFNULL(COLLATION_NAME, 'NULL') as COLLATION_NAME, IFNULL(COLUMN_TYPE, 'NULL') as COLUMN_TYPE, IFNULL(COLUMN_KEY, 'NULL') as COLUMN_KEY, IFNULL(EXTRA, 'NULL') as EXTRA, IFNULL(GENERATION_EXPRESSION, 'NULL') as GENERATION_EXPRESSION FROM information_schema.columns WHERE TABLE_SCHEMA = ? `, database)
-	if err != nil {
-		if err != sql.ErrNoRows && !strings.Contains(err.Error(), "Unknown column") {
-			logger.Error(err)
-		}
+	legacyColumns := isMysqlUnknownColumnError(err)
+	if legacyColumns {
 		rows, err = models.DB.Query(`SELECT IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(ORDINAL_POSITION, 'NULL') as ORDINAL_POSITION, IFNULL(COLUMN_DEFAULT, 'NULL') as COLUMN_DEFAULT, IFNULL(IS_NULLABLE, 'NULL') as IS_NULLABLE, IFNULL(DATA_TYPE, 'NULL') as DATA_TYPE, IFNULL(CHARACTER_MAXIMUM_LENGTH, 'NULL') as CHARACTER_MAXIMUM_LENGTH, IFNULL(NUMERIC_PRECISION, 'NULL') as NUMERIC_PRECISION, IFNULL(NUMERIC_SCALE, 'NULL') as NUMERIC_SCALE, IFNULL(CHARACTER_SET_NAME, 'NULL') as CHARACTER_SET_NAME, IFNULL(COLLATION_NAME, 'NULL') as COLLATION_NAME, IFNULL(COLUMN_TYPE, 'NULL') as COLUMN_TYPE, IFNULL(COLUMN_KEY, 'NULL') as COLUMN_KEY, IFNULL(EXTRA, 'NULL') as EXTRA FROM information_schema.columns WHERE TABLE_SCHEMA = ? `, database)
-		if err != nil {
-			logger.Error(err)
-		} else {
-			for rows.Next() {
-				err := rows.Scan(&information_schema_column.TABLE_SCHEMA, &information_schema_column.TABLE_NAME, &information_schema_column.COLUMN_NAME, &information_schema_column.ORDINAL_POSITION, &information_schema_column.COLUMN_DEFAULT, &information_schema_column.IS_NULLABLE, &information_schema_column.DATA_TYPE, &information_schema_column.CHARACTER_MAXIMUM_LENGTH, &information_schema_column.NUMERIC_PRECISION, &information_schema_column.NUMERIC_SCALE, &information_schema_column.CHARACTER_SET_NAME, &information_schema_column.COLLATION_NAME, &information_schema_column.COLUMN_TYPE, &information_schema_column.COLUMN_KEY, &information_schema_column.EXTRA)
-				if err != nil {
-					logger.Error(err)
-					return err
-				}
-				metrics.DB.DatabaseSchema["information_schema_columns"] = append(metrics.DB.DatabaseSchema["information_schema_columns"], models.MetricGroupValue{"TABLE_SCHEMA": information_schema_column.TABLE_SCHEMA, "TABLE_NAME": information_schema_column.TABLE_NAME, "COLUMN_NAME": information_schema_column.COLUMN_NAME, "ORDINAL_POSITION": information_schema_column.ORDINAL_POSITION, "COLUMN_DEFAULT": information_schema_column.COLUMN_DEFAULT, "IS_NULLABLE": information_schema_column.IS_NULLABLE, "DATA_TYPE": information_schema_column.DATA_TYPE, "CHARACTER_MAXIMUM_LENGTH": information_schema_column.CHARACTER_MAXIMUM_LENGTH, "NUMERIC_PRECISION": information_schema_column.NUMERIC_PRECISION, "NUMERIC_SCALE": information_schema_column.NUMERIC_SCALE, "CHARACTER_SET_NAME": information_schema_column.CHARACTER_SET_NAME, "COLLATION_NAME": information_schema_column.COLLATION_NAME, "COLUMN_TYPE": information_schema_column.COLUMN_TYPE, "COLUMN_KEY": information_schema_column.COLUMN_KEY, "EXTRA": information_schema_column.EXTRA, "GENERATION_EXPRESSION": "NULL"})
-			}
-			rows.Close()
-		}
-	} else {
-		for rows.Next() {
-			err := rows.Scan(&information_schema_column.TABLE_SCHEMA, &information_schema_column.TABLE_NAME, &information_schema_column.COLUMN_NAME, &information_schema_column.ORDINAL_POSITION, &information_schema_column.COLUMN_DEFAULT, &information_schema_column.IS_NULLABLE, &information_schema_column.DATA_TYPE, &information_schema_column.CHARACTER_MAXIMUM_LENGTH, &information_schema_column.NUMERIC_PRECISION, &information_schema_column.NUMERIC_SCALE, &information_schema_column.CHARACTER_SET_NAME, &information_schema_column.COLLATION_NAME, &information_schema_column.COLUMN_TYPE, &information_schema_column.COLUMN_KEY, &information_schema_column.EXTRA, &information_schema_column.GENERATION_EXPRESSION)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["information_schema_columns"] = append(metrics.DB.DatabaseSchema["information_schema_columns"], models.MetricGroupValue{"TABLE_SCHEMA": information_schema_column.TABLE_SCHEMA, "TABLE_NAME": information_schema_column.TABLE_NAME, "COLUMN_NAME": information_schema_column.COLUMN_NAME, "ORDINAL_POSITION": information_schema_column.ORDINAL_POSITION, "COLUMN_DEFAULT": information_schema_column.COLUMN_DEFAULT, "IS_NULLABLE": information_schema_column.IS_NULLABLE, "DATA_TYPE": information_schema_column.DATA_TYPE, "CHARACTER_MAXIMUM_LENGTH": information_schema_column.CHARACTER_MAXIMUM_LENGTH, "NUMERIC_PRECISION": information_schema_column.NUMERIC_PRECISION, "NUMERIC_SCALE": information_schema_column.NUMERIC_SCALE, "CHARACTER_SET_NAME": information_schema_column.CHARACTER_SET_NAME, "COLLATION_NAME": information_schema_column.COLLATION_NAME, "COLUMN_TYPE": information_schema_column.COLUMN_TYPE, "COLUMN_KEY": information_schema_column.COLUMN_KEY, "EXTRA": information_schema_column.EXTRA, "GENERATION_EXPRESSION": information_schema_column.GENERATION_EXPRESSION})
-		}
-		rows.Close()
 	}
+	appendMysqlSchemaSection(metrics, logger, "information_schema_columns", rows, err, func() (models.MetricGroupValue, error) {
+		var scanErr error
+		if legacyColumns {
+			scanErr = rows.Scan(&information_schema_column.TABLE_SCHEMA, &information_schema_column.TABLE_NAME, &information_schema_column.COLUMN_NAME, &information_schema_column.ORDINAL_POSITION, &information_schema_column.COLUMN_DEFAULT, &information_schema_column.IS_NULLABLE, &information_schema_column.DATA_TYPE, &information_schema_column.CHARACTER_MAXIMUM_LENGTH, &information_schema_column.NUMERIC_PRECISION, &information_schema_column.NUMERIC_SCALE, &information_schema_column.CHARACTER_SET_NAME, &information_schema_column.COLLATION_NAME, &information_schema_column.COLUMN_TYPE, &information_schema_column.COLUMN_KEY, &information_schema_column.EXTRA)
+			information_schema_column.GENERATION_EXPRESSION = "NULL"
+		} else {
+			scanErr = rows.Scan(&information_schema_column.TABLE_SCHEMA, &information_schema_column.TABLE_NAME, &information_schema_column.COLUMN_NAME, &information_schema_column.ORDINAL_POSITION, &information_schema_column.COLUMN_DEFAULT, &information_schema_column.IS_NULLABLE, &information_schema_column.DATA_TYPE, &information_schema_column.CHARACTER_MAXIMUM_LENGTH, &information_schema_column.NUMERIC_PRECISION, &information_schema_column.NUMERIC_SCALE, &information_schema_column.CHARACTER_SET_NAME, &information_schema_column.COLLATION_NAME, &information_schema_column.COLUMN_TYPE, &information_schema_column.COLUMN_KEY, &information_schema_column.EXTRA, &information_schema_column.GENERATION_EXPRESSION)
+		}
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		return models.MetricGroupValue{"TABLE_SCHEMA": information_schema_column.TABLE_SCHEMA, "TABLE_NAME": information_schema_column.TABLE_NAME, "COLUMN_NAME": information_schema_column.COLUMN_NAME, "ORDINAL_POSITION": information_schema_column.ORDINAL_POSITION, "COLUMN_DEFAULT": information_schema_column.COLUMN_DEFAULT, "IS_NULLABLE": information_schema_column.IS_NULLABLE, "DATA_TYPE": information_schema_column.DATA_TYPE, "CHARACTER_MAXIMUM_LENGTH": information_schema_column.CHARACTER_MAXIMUM_LENGTH, "NUMERIC_PRECISION": information_schema_column.NUMERIC_PRECISION, "NUMERIC_SCALE": information_schema_column.NUMERIC_SCALE, "CHARACTER_SET_NAME": information_schema_column.CHARACTER_SET_NAME, "COLLATION_NAME": information_schema_column.COLLATION_NAME, "COLUMN_TYPE": information_schema_column.COLUMN_TYPE, "COLUMN_KEY": information_schema_column.COLUMN_KEY, "EXTRA": information_schema_column.EXTRA, "GENERATION_EXPRESSION": information_schema_column.GENERATION_EXPRESSION}, nil
+	}, &firstErr)
 
 	type information_schema_index_type struct {
 		TABLE_SCHEMA string
@@ -300,36 +369,23 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 		IS_VISIBLE   string
 	}
 	var information_schema_index information_schema_index_type
-	rows, err = models.DB.Query(mysqlIndexSchemaSelectQuery, database)
-	if err != nil {
-		if err != sql.ErrNoRows && !strings.Contains(err.Error(), "Unknown column") {
-			logger.Error(err)
+
+	for _, query := range mysqlIndexSchemaSelectQueries() {
+		rows, err = models.DB.Query(query, database)
+		if err == nil {
+			break
 		}
-		rows, err = models.DB.Query(mysqlIndexSchemaSelectQueryLegacy, database)
-		if err != nil {
-			logger.Error(err)
-		} else {
-			for rows.Next() {
-				err := rows.Scan(&information_schema_index.TABLE_SCHEMA, &information_schema_index.TABLE_NAME, &information_schema_index.INDEX_NAME, &information_schema_index.NON_UNIQUE, &information_schema_index.SEQ_IN_INDEX, &information_schema_index.COLUMN_NAME, &information_schema_index.COLLATION, &information_schema_index.CARDINALITY, &information_schema_index.SUB_PART, &information_schema_index.PACKED, &information_schema_index.NULLABLE, &information_schema_index.INDEX_TYPE)
-				if err != nil {
-					logger.Error(err)
-					return err
-				}
-				metrics.DB.DatabaseSchema["information_schema_indexes"] = append(metrics.DB.DatabaseSchema["information_schema_indexes"], models.MetricGroupValue{"TABLE_SCHEMA": information_schema_index.TABLE_SCHEMA, "TABLE_NAME": information_schema_index.TABLE_NAME, "INDEX_NAME": information_schema_index.INDEX_NAME, "NON_UNIQUE": information_schema_index.NON_UNIQUE, "SEQ_IN_INDEX": information_schema_index.SEQ_IN_INDEX, "COLUMN_NAME": information_schema_index.COLUMN_NAME, "COLLATION": information_schema_index.COLLATION, "CARDINALITY": information_schema_index.CARDINALITY, "SUB_PART": information_schema_index.SUB_PART, "PACKED": information_schema_index.PACKED, "NULLABLE": information_schema_index.NULLABLE, "INDEX_TYPE": information_schema_index.INDEX_TYPE, "IS_VISIBLE": "YES"})
-			}
-			rows.Close()
+		if !isMysqlUnknownColumnError(err) {
+			break
 		}
-	} else {
-		for rows.Next() {
-			err := rows.Scan(&information_schema_index.TABLE_SCHEMA, &information_schema_index.TABLE_NAME, &information_schema_index.INDEX_NAME, &information_schema_index.NON_UNIQUE, &information_schema_index.SEQ_IN_INDEX, &information_schema_index.COLUMN_NAME, &information_schema_index.COLLATION, &information_schema_index.CARDINALITY, &information_schema_index.SUB_PART, &information_schema_index.PACKED, &information_schema_index.NULLABLE, &information_schema_index.INDEX_TYPE, &information_schema_index.EXPRESSION, &information_schema_index.IS_VISIBLE)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["information_schema_indexes"] = append(metrics.DB.DatabaseSchema["information_schema_indexes"], models.MetricGroupValue{"TABLE_SCHEMA": information_schema_index.TABLE_SCHEMA, "TABLE_NAME": information_schema_index.TABLE_NAME, "INDEX_NAME": information_schema_index.INDEX_NAME, "NON_UNIQUE": information_schema_index.NON_UNIQUE, "SEQ_IN_INDEX": information_schema_index.SEQ_IN_INDEX, "COLUMN_NAME": information_schema_index.COLUMN_NAME, "COLLATION": information_schema_index.COLLATION, "CARDINALITY": information_schema_index.CARDINALITY, "SUB_PART": information_schema_index.SUB_PART, "PACKED": information_schema_index.PACKED, "NULLABLE": information_schema_index.NULLABLE, "INDEX_TYPE": information_schema_index.INDEX_TYPE, "EXPRESSION": information_schema_index.EXPRESSION, "IS_VISIBLE": information_schema_index.IS_VISIBLE})
-		}
-		rows.Close()
 	}
+	appendMysqlSchemaSection(metrics, logger, "information_schema_indexes", rows, err, func() (models.MetricGroupValue, error) {
+		err := rows.Scan(&information_schema_index.TABLE_SCHEMA, &information_schema_index.TABLE_NAME, &information_schema_index.INDEX_NAME, &information_schema_index.NON_UNIQUE, &information_schema_index.SEQ_IN_INDEX, &information_schema_index.COLUMN_NAME, &information_schema_index.COLLATION, &information_schema_index.CARDINALITY, &information_schema_index.SUB_PART, &information_schema_index.PACKED, &information_schema_index.NULLABLE, &information_schema_index.INDEX_TYPE, &information_schema_index.EXPRESSION, &information_schema_index.IS_VISIBLE)
+		if err != nil {
+			return nil, err
+		}
+		return models.MetricGroupValue{"TABLE_SCHEMA": information_schema_index.TABLE_SCHEMA, "TABLE_NAME": information_schema_index.TABLE_NAME, "INDEX_NAME": information_schema_index.INDEX_NAME, "NON_UNIQUE": information_schema_index.NON_UNIQUE, "SEQ_IN_INDEX": information_schema_index.SEQ_IN_INDEX, "COLUMN_NAME": information_schema_index.COLUMN_NAME, "COLLATION": information_schema_index.COLLATION, "CARDINALITY": information_schema_index.CARDINALITY, "SUB_PART": information_schema_index.SUB_PART, "PACKED": information_schema_index.PACKED, "NULLABLE": information_schema_index.NULLABLE, "INDEX_TYPE": information_schema_index.INDEX_TYPE, "EXPRESSION": information_schema_index.EXPRESSION, "IS_VISIBLE": information_schema_index.IS_VISIBLE}, nil
+	}, &firstErr)
 
 	// type performance_schema_file_summary_by_instance_type struct {
 	// 	FILE_NAME                 string
@@ -388,19 +444,13 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 	}
 	var information_schema_referential_constraints information_schema_referential_constraints_type
 	rows, err = models.DB.Query(`SELECT IFNULL(CONSTRAINT_SCHEMA, 'NULL') as CONSTRAINT_SCHEMA, IFNULL(CONSTRAINT_NAME, 'NULL') as CONSTRAINT_NAME, IFNULL(UNIQUE_CONSTRAINT_SCHEMA, 'NULL') as UNIQUE_CONSTRAINT_SCHEMA, IFNULL(UNIQUE_CONSTRAINT_NAME, 'NULL') as UNIQUE_CONSTRAINT_NAME, IFNULL(MATCH_OPTION, 'NULL') as MATCH_OPTION, IFNULL(UPDATE_RULE, 'NULL') as UPDATE_RULE, IFNULL(DELETE_RULE, 'NULL') as DELETE_RULE, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(REFERENCED_TABLE_NAME, 'NULL') as REFERENCED_TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = ? `, database)
-	if err != nil {
-		logger.Error(err)
-	} else {
-		for rows.Next() {
-			err := rows.Scan(&information_schema_referential_constraints.CONSTRAINT_SCHEMA, &information_schema_referential_constraints.CONSTRAINT_NAME, &information_schema_referential_constraints.UNIQUE_CONSTRAINT_SCHEMA, &information_schema_referential_constraints.UNIQUE_CONSTRAINT_NAME, &information_schema_referential_constraints.MATCH_OPTION, &information_schema_referential_constraints.UPDATE_RULE, &information_schema_referential_constraints.DELETE_RULE, &information_schema_referential_constraints.TABLE_NAME, &information_schema_referential_constraints.REFERENCED_TABLE_NAME)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["information_schema_referential_constraints"] = append(metrics.DB.DatabaseSchema["information_schema_referential_constraints"], models.MetricGroupValue{"CONSTRAINT_SCHEMA": information_schema_referential_constraints.CONSTRAINT_SCHEMA, "CONSTRAINT_NAME": information_schema_referential_constraints.CONSTRAINT_NAME, "UNIQUE_CONSTRAINT_SCHEMA": information_schema_referential_constraints.UNIQUE_CONSTRAINT_SCHEMA, "UNIQUE_CONSTRAINT_NAME": information_schema_referential_constraints.UNIQUE_CONSTRAINT_NAME, "MATCH_OPTION": information_schema_referential_constraints.MATCH_OPTION, "UPDATE_RULE": information_schema_referential_constraints.UPDATE_RULE, "DELETE_RULE": information_schema_referential_constraints.DELETE_RULE, "TABLE_NAME": information_schema_referential_constraints.TABLE_NAME, "REFERENCED_TABLE_NAME": information_schema_referential_constraints.REFERENCED_TABLE_NAME})
+	appendMysqlSchemaSection(metrics, logger, "information_schema_referential_constraints", rows, err, func() (models.MetricGroupValue, error) {
+		err := rows.Scan(&information_schema_referential_constraints.CONSTRAINT_SCHEMA, &information_schema_referential_constraints.CONSTRAINT_NAME, &information_schema_referential_constraints.UNIQUE_CONSTRAINT_SCHEMA, &information_schema_referential_constraints.UNIQUE_CONSTRAINT_NAME, &information_schema_referential_constraints.MATCH_OPTION, &information_schema_referential_constraints.UPDATE_RULE, &information_schema_referential_constraints.DELETE_RULE, &information_schema_referential_constraints.TABLE_NAME, &information_schema_referential_constraints.REFERENCED_TABLE_NAME)
+		if err != nil {
+			return nil, err
 		}
-		rows.Close()
-	}
+		return models.MetricGroupValue{"CONSTRAINT_SCHEMA": information_schema_referential_constraints.CONSTRAINT_SCHEMA, "CONSTRAINT_NAME": information_schema_referential_constraints.CONSTRAINT_NAME, "UNIQUE_CONSTRAINT_SCHEMA": information_schema_referential_constraints.UNIQUE_CONSTRAINT_SCHEMA, "UNIQUE_CONSTRAINT_NAME": information_schema_referential_constraints.UNIQUE_CONSTRAINT_NAME, "MATCH_OPTION": information_schema_referential_constraints.MATCH_OPTION, "UPDATE_RULE": information_schema_referential_constraints.UPDATE_RULE, "DELETE_RULE": information_schema_referential_constraints.DELETE_RULE, "TABLE_NAME": information_schema_referential_constraints.TABLE_NAME, "REFERENCED_TABLE_NAME": information_schema_referential_constraints.REFERENCED_TABLE_NAME}, nil
+	}, &firstErr)
 
 	type information_schema_key_column_usage_type struct {
 		CONSTRAINT_SCHEMA             string
@@ -416,19 +466,13 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 	}
 	var information_schema_key_column_usage information_schema_key_column_usage_type
 	rows, err = models.DB.Query(`SELECT IFNULL(CONSTRAINT_SCHEMA, 'NULL') as CONSTRAINT_SCHEMA, IFNULL(CONSTRAINT_NAME, 'NULL') as CONSTRAINT_NAME, IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(COLUMN_NAME, 'NULL') as COLUMN_NAME, IFNULL(ORDINAL_POSITION, 'NULL') as ORDINAL_POSITION, IFNULL(POSITION_IN_UNIQUE_CONSTRAINT, 'NULL') as POSITION_IN_UNIQUE_CONSTRAINT, IFNULL(REFERENCED_TABLE_SCHEMA, 'NULL') as REFERENCED_TABLE_SCHEMA, IFNULL(REFERENCED_TABLE_NAME, 'NULL') as REFERENCED_TABLE_NAME, IFNULL(REFERENCED_COLUMN_NAME, 'NULL') as REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? `, database)
-	if err != nil {
-		logger.Error(err)
-	} else {
-		for rows.Next() {
-			err := rows.Scan(&information_schema_key_column_usage.CONSTRAINT_SCHEMA, &information_schema_key_column_usage.CONSTRAINT_NAME, &information_schema_key_column_usage.TABLE_SCHEMA, &information_schema_key_column_usage.TABLE_NAME, &information_schema_key_column_usage.COLUMN_NAME, &information_schema_key_column_usage.ORDINAL_POSITION, &information_schema_key_column_usage.POSITION_IN_UNIQUE_CONSTRAINT, &information_schema_key_column_usage.REFERENCED_TABLE_SCHEMA, &information_schema_key_column_usage.REFERENCED_TABLE_NAME, &information_schema_key_column_usage.REFERENCED_COLUMN_NAME)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["information_schema_key_column_usage"] = append(metrics.DB.DatabaseSchema["information_schema_key_column_usage"], models.MetricGroupValue{"CONSTRAINT_SCHEMA": information_schema_key_column_usage.CONSTRAINT_SCHEMA, "CONSTRAINT_NAME": information_schema_key_column_usage.CONSTRAINT_NAME, "TABLE_SCHEMA": information_schema_key_column_usage.TABLE_SCHEMA, "TABLE_NAME": information_schema_key_column_usage.TABLE_NAME, "COLUMN_NAME": information_schema_key_column_usage.COLUMN_NAME, "ORDINAL_POSITION": information_schema_key_column_usage.ORDINAL_POSITION, "POSITION_IN_UNIQUE_CONSTRAINT": information_schema_key_column_usage.POSITION_IN_UNIQUE_CONSTRAINT, "REFERENCED_TABLE_SCHEMA": information_schema_key_column_usage.REFERENCED_TABLE_SCHEMA, "REFERENCED_TABLE_NAME": information_schema_key_column_usage.REFERENCED_TABLE_NAME, "REFERENCED_COLUMN_NAME": information_schema_key_column_usage.REFERENCED_COLUMN_NAME})
+	appendMysqlSchemaSection(metrics, logger, "information_schema_key_column_usage", rows, err, func() (models.MetricGroupValue, error) {
+		err := rows.Scan(&information_schema_key_column_usage.CONSTRAINT_SCHEMA, &information_schema_key_column_usage.CONSTRAINT_NAME, &information_schema_key_column_usage.TABLE_SCHEMA, &information_schema_key_column_usage.TABLE_NAME, &information_schema_key_column_usage.COLUMN_NAME, &information_schema_key_column_usage.ORDINAL_POSITION, &information_schema_key_column_usage.POSITION_IN_UNIQUE_CONSTRAINT, &information_schema_key_column_usage.REFERENCED_TABLE_SCHEMA, &information_schema_key_column_usage.REFERENCED_TABLE_NAME, &information_schema_key_column_usage.REFERENCED_COLUMN_NAME)
+		if err != nil {
+			return nil, err
 		}
-		rows.Close()
-	}
+		return models.MetricGroupValue{"CONSTRAINT_SCHEMA": information_schema_key_column_usage.CONSTRAINT_SCHEMA, "CONSTRAINT_NAME": information_schema_key_column_usage.CONSTRAINT_NAME, "TABLE_SCHEMA": information_schema_key_column_usage.TABLE_SCHEMA, "TABLE_NAME": information_schema_key_column_usage.TABLE_NAME, "COLUMN_NAME": information_schema_key_column_usage.COLUMN_NAME, "ORDINAL_POSITION": information_schema_key_column_usage.ORDINAL_POSITION, "POSITION_IN_UNIQUE_CONSTRAINT": information_schema_key_column_usage.POSITION_IN_UNIQUE_CONSTRAINT, "REFERENCED_TABLE_SCHEMA": information_schema_key_column_usage.REFERENCED_TABLE_SCHEMA, "REFERENCED_TABLE_NAME": information_schema_key_column_usage.REFERENCED_TABLE_NAME, "REFERENCED_COLUMN_NAME": information_schema_key_column_usage.REFERENCED_COLUMN_NAME}, nil
+	}, &firstErr)
 
 	type information_schema_table_constraints_type struct {
 		CONSTRAINT_SCHEMA string
@@ -439,19 +483,13 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 	}
 	var information_schema_table_constraints information_schema_table_constraints_type
 	rows, err = models.DB.Query(`SELECT IFNULL(CONSTRAINT_SCHEMA, 'NULL') as CONSTRAINT_SCHEMA, IFNULL(CONSTRAINT_NAME, 'NULL') as CONSTRAINT_NAME, IFNULL(TABLE_SCHEMA, 'NULL') as TABLE_SCHEMA, IFNULL(TABLE_NAME, 'NULL') as TABLE_NAME, IFNULL(CONSTRAINT_TYPE, 'NULL') as CONSTRAINT_TYPE FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = ? `, database)
-	if err != nil {
-		logger.Error(err)
-	} else {
-		for rows.Next() {
-			err := rows.Scan(&information_schema_table_constraints.CONSTRAINT_SCHEMA, &information_schema_table_constraints.CONSTRAINT_NAME, &information_schema_table_constraints.TABLE_SCHEMA, &information_schema_table_constraints.TABLE_NAME, &information_schema_table_constraints.CONSTRAINT_TYPE)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["information_schema_table_constraints"] = append(metrics.DB.DatabaseSchema["information_schema_table_constraints"], models.MetricGroupValue{"CONSTRAINT_SCHEMA": information_schema_table_constraints.CONSTRAINT_SCHEMA, "CONSTRAINT_NAME": information_schema_table_constraints.CONSTRAINT_NAME, "TABLE_SCHEMA": information_schema_table_constraints.TABLE_SCHEMA, "TABLE_NAME": information_schema_table_constraints.TABLE_NAME, "CONSTRAINT_TYPE": information_schema_table_constraints.CONSTRAINT_TYPE})
+	appendMysqlSchemaSection(metrics, logger, "information_schema_table_constraints", rows, err, func() (models.MetricGroupValue, error) {
+		err := rows.Scan(&information_schema_table_constraints.CONSTRAINT_SCHEMA, &information_schema_table_constraints.CONSTRAINT_NAME, &information_schema_table_constraints.TABLE_SCHEMA, &information_schema_table_constraints.TABLE_NAME, &information_schema_table_constraints.CONSTRAINT_TYPE)
+		if err != nil {
+			return nil, err
 		}
-		rows.Close()
-	}
+		return models.MetricGroupValue{"CONSTRAINT_SCHEMA": information_schema_table_constraints.CONSTRAINT_SCHEMA, "CONSTRAINT_NAME": information_schema_table_constraints.CONSTRAINT_NAME, "TABLE_SCHEMA": information_schema_table_constraints.TABLE_SCHEMA, "TABLE_NAME": information_schema_table_constraints.TABLE_NAME, "CONSTRAINT_TYPE": information_schema_table_constraints.CONSTRAINT_TYPE}, nil
+	}, &firstErr)
 
 	type information_schema_triggers_type struct {
 		TRIGGER_SCHEMA      string
@@ -462,21 +500,15 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 	}
 	var information_schema_triggers information_schema_triggers_type
 	rows, err = models.DB.Query(`SELECT IFNULL(TRIGGER_SCHEMA, 'NULL') as TRIGGER_SCHEMA, IFNULL(TRIGGER_NAME, 'NULL') as TRIGGER_NAME, IFNULL(EVENT_MANIPULATION, 'NULL') as EVENT_MANIPULATION, IFNULL(EVENT_OBJECT_SCHEMA, 'NULL') as EVENT_OBJECT_SCHEMA, IFNULL(EVENT_OBJECT_TABLE, 'NULL') as EVENT_OBJECT_TABLE FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA = ? `, database)
-	if err != nil {
-		logger.Error(err)
-	} else {
-		for rows.Next() {
-			err := rows.Scan(&information_schema_triggers.TRIGGER_SCHEMA, &information_schema_triggers.TRIGGER_NAME, &information_schema_triggers.EVENT_MANIPULATION, &information_schema_triggers.EVENT_OBJECT_SCHEMA, &information_schema_triggers.EVENT_OBJECT_TABLE)
-			if err != nil {
-				logger.Error(err)
-				return err
-			}
-			metrics.DB.DatabaseSchema["information_schema_triggers"] = append(metrics.DB.DatabaseSchema["information_schema_triggers"], models.MetricGroupValue{"TRIGGER_SCHEMA": information_schema_triggers.TRIGGER_SCHEMA, "TRIGGER_NAME": information_schema_triggers.TRIGGER_NAME, "EVENT_MANIPULATION": information_schema_triggers.EVENT_MANIPULATION, "EVENT_OBJECT_SCHEMA": information_schema_triggers.EVENT_OBJECT_SCHEMA, "EVENT_OBJECT_TABLE": information_schema_triggers.EVENT_OBJECT_TABLE})
+	appendMysqlSchemaSection(metrics, logger, "information_schema_triggers", rows, err, func() (models.MetricGroupValue, error) {
+		err := rows.Scan(&information_schema_triggers.TRIGGER_SCHEMA, &information_schema_triggers.TRIGGER_NAME, &information_schema_triggers.EVENT_MANIPULATION, &information_schema_triggers.EVENT_OBJECT_SCHEMA, &information_schema_triggers.EVENT_OBJECT_TABLE)
+		if err != nil {
+			return nil, err
 		}
-		rows.Close()
-	}
+		return models.MetricGroupValue{"TRIGGER_SCHEMA": information_schema_triggers.TRIGGER_SCHEMA, "TRIGGER_NAME": information_schema_triggers.TRIGGER_NAME, "EVENT_MANIPULATION": information_schema_triggers.EVENT_MANIPULATION, "EVENT_OBJECT_SCHEMA": information_schema_triggers.EVENT_OBJECT_SCHEMA, "EVENT_OBJECT_TABLE": information_schema_triggers.EVENT_OBJECT_TABLE}, nil
+	}, &firstErr)
 
-	return nil
+	return firstErr
 
 }
 

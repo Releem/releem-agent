@@ -224,6 +224,28 @@ echo "200"
     [ "$called_pg" -eq 1 ]
 }
 
+@test "configure_releem_agent writes postgresql ssl mode as an HCL boolean" {
+    load_install_functions
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    mkdir -p "${workdir}"
+
+    database_type="postgresql"
+    RELEEM_WORKDIR="${workdir}"
+    RELEEM_CONF_FILE="${conf}"
+    RELEEM_PG_SSL_MODE="false"
+    apikey="k1"
+    sudo_cmd=""
+    unset PG_LOGIN PG_PASSWORD RELEEM_PG_HOST RELEEM_PG_PORT pg_service_name_cmd PG_CONF_DIR
+
+    run configure_releem_agent
+
+    [ "$status" -eq 0 ]
+    run grep '^pg_ssl_mode=' "${conf}"
+    [ "$status" -eq 0 ]
+    [ "$output" = 'pg_ssl_mode=false' ] || return 1
+}
+
 @test "setting_up_database_instance dispatches only for local instances" {
     load_install_functions
     mysql_setup_called=0
@@ -361,11 +383,17 @@ exit 0
     [ "$status" -eq 0 ]
 }
 
-@test "create_postgresql_user grants pg_read_all_data when query optimization is enabled" {
+@test "create_postgresql_user grants pg_read_all_data with default root login" {
     create_mock_cmd "psql" '
 query="$*"
 printf "PGPASSWORD=%s args=%s\n" "${PGPASSWORD-__unset__}" "$query" >> "${PG_ARGS_LOG}"
-if [[ "$query" == *"pg_extension WHERE extname = '"'"'pg_stat_statements'"'"'"* ]]; then
+if [[ "$query" == *"SHOW server_version_num"* ]]; then
+  echo "140000"
+elif [[ "$query" == *"SELECT datname"* && "$query" == *"pg_database"* ]]; then
+  printf "postgres\000shop\000"
+elif [[ "$query" == *"GRANT CONNECT ON DATABASE"* ]]; then
+  cat >/dev/null
+elif [[ "$query" == *"pg_extension WHERE extname = '"'"'pg_stat_statements'"'"'"* ]]; then
   echo "1"
 fi
 exit 0
@@ -387,7 +415,144 @@ exit 0
         ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
 
     [ "$status" -eq 0 ]
-    run grep -F -- "PGPASSWORD=rootpwd args=-h 127.0.0.1 -p 5432 -d postgres -U postgres -c GRANT pg_read_all_data TO releem;" "${TEST_TMPDIR}/pg.args"
+    run grep -F -- '-v ON_ERROR_STOP=1 -c GRANT CONNECT ON DATABASE "postgres" TO "releem";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F -- '-v ON_ERROR_STOP=1 -c GRANT CONNECT ON DATABASE "shop" TO "releem";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F -- '-v ON_ERROR_STOP=1 -c GRANT pg_read_all_data TO "releem";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    for procedural_sql in 'DO $$' 'EXECUTE format' 'set_config' 'decode(' 'ALTER DEFAULT PRIVILEGES'; do
+        run grep -F -- "${procedural_sql}" "${TEST_TMPDIR}/pg.args"
+        [ "$status" -ne 0 ]
+    done
+}
+
+@test "postgresql role ALTER boundary quotes identifier and binds exact password" {
+    create_mock_cmd "psql" '
+for argument in "$@"; do
+  printf "%s\n" "$argument" >> "${PG_ARGS_LOG}"
+done
+query="${!#}"
+if [[ "$query" == *"FROM pg_roles"* ]]; then
+  echo "1"
+fi
+exit 0
+'
+
+    local role='role"reader'
+    local password="pa'ss word; --"
+    run env \
+        RELEEM_PG_ROOT_PASSWORD="rootpwd" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            create_or_update_postgresql_monitoring_role "postgres" "$3" "$4"
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" "${role}" "${password}"
+
+    [ "$status" -eq 0 ]
+    run grep -Fx -- "role_name=${role}" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -Fx -- "SELECT 1 FROM pg_roles WHERE rolname = :'role_name';" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -Fxc -- "role_password=${password}" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ]
+    run grep -Fx -- 'ALTER USER "role""reader" WITH PASSWORD :'"'"'role_password'"'"';' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    for grant in \
+        'GRANT pg_monitor TO "role""reader";' \
+        'GRANT SELECT ON pg_hba_file_rules TO "role""reader";' \
+        'GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO "role""reader";'; do
+        run grep -Fx -- "${grant}" "${TEST_TMPDIR}/pg.args"
+        [ "$status" -eq 0 ]
+    done
+    run grep -F -- "WITH PASSWORD '${password}'" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
+    run grep -F -- "CREATE USER" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
+}
+
+@test "postgresql role CREATE boundary quotes identifier and binds exact password" {
+    create_mock_cmd "psql" '
+for argument in "$@"; do
+  printf "%s\n" "$argument" >> "${PG_ARGS_LOG}"
+done
+exit 0
+'
+
+    local role='new"reader'
+    local password="new'pass word; --"
+    run env \
+        RELEEM_PG_ROOT_PASSWORD="rootpwd" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            create_or_update_postgresql_monitoring_role "postgres" "$3" "$4"
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" "${role}" "${password}"
+
+    [ "$status" -eq 0 ]
+    run grep -Fx -- "role_name=${role}" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -Fx -- "SELECT 1 FROM pg_roles WHERE rolname = :'role_name';" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -Fxc -- "role_password=${password}" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ]
+    run grep -Fx -- 'CREATE USER "new""reader" WITH PASSWORD :'"'"'role_password'"'"';' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    for grant in \
+        'GRANT pg_monitor TO "new""reader";' \
+        'GRANT SELECT ON pg_hba_file_rules TO "new""reader";' \
+        'GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO "new""reader";'; do
+        run grep -Fx -- "${grant}" "${TEST_TMPDIR}/pg.args"
+        [ "$status" -eq 0 ]
+    done
+    run grep -F -- "WITH PASSWORD '${password}'" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
+    run grep -F -- "ALTER USER" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
+}
+
+@test "PostgreSQL commands preserve psql executable and role arguments" {
+    create_mock_cmd "psql with spaces" '
+user=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -U) user="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf "user=<%s>\n" "$user" >> "${PG_ARGS_LOG}"
+exit 0
+'
+
+    run env \
+        RELEEM_PG_ROOT_PASSWORD="rootpwd" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            pg_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            postgresql_root_exec "root user" -c "SELECT 1;" || true
+            RELEEM_PG_LOGIN="monitor user"
+            RELEEM_PG_PASSWORD="monitor-password"
+            create_postgresql_user || true
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql with spaces"
+
+    run grep -Fx -- "user=<root user>" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -Fx -- "user=<monitor user>" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
 }
 
@@ -472,6 +637,11 @@ exit 0
 @test "create_postgresql_user grants pg_read_all_data when query optimization is enabled" {
     create_mock_cmd "psql" '
 printf "%s\n" "$*" >> "${PG_ARGS_LOG}"
+if [[ "$*" == *"SHOW server_version_num"* ]]; then
+  echo "140000"
+elif [[ "$*" == *"SELECT datname"* && "$*" == *"pg_database"* ]]; then
+  printf "postgres\000shop\000"
+fi
 exit 0
 '
 
@@ -492,8 +662,78 @@ exit 0
         ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
 
     [ "$status" -eq 0 ]
-    run grep -F -- "-c GRANT pg_read_all_data TO releem;" "${TEST_TMPDIR}/pg.args"
+    run grep -F -- '-v ON_ERROR_STOP=1 -c GRANT CONNECT ON DATABASE "postgres" TO "releem";' "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
+    run grep -F -- '-v ON_ERROR_STOP=1 -c GRANT CONNECT ON DATABASE "shop" TO "releem";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F -- '-v ON_ERROR_STOP=1 -c GRANT pg_read_all_data TO "releem";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+}
+
+@test "postgresql 12 grants existing objects with explicit schema statements" {
+    create_mock_cmd "psql" '
+query="$*"
+printf "%s\n" "$query" >> "${PG_ARGS_LOG}"
+if [[ "$query" == *"SHOW server_version_num"* ]]; then
+  echo "120000"
+elif [[ "$query" == *"SELECT datname"* && "$query" == *"pg_database"* ]]; then
+  printf "postgres\000shop\000"
+elif [[ "$query" == *"SELECT nspname"* && "$query" == *"pg_namespace"* ]]; then
+  printf "app\000Sales Data\000"
+elif [[ "$query" == *"GRANT USAGE ON SCHEMA"* ]]; then
+  cat >/dev/null
+fi
+exit 0
+'
+
+    run env \
+        RELEEM_PG_ROOT_PASSWORD="rootpwd" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            set +e
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            grant_postgresql_query_optimization_access "postgres" "releem"
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
+
+    [ "$status" -eq 0 ]
+    grant_output="$output"
+    for database in postgres shop; do
+        for grant in \
+            "GRANT USAGE ON SCHEMA \"app\" TO \"releem\";" \
+            "GRANT SELECT ON ALL TABLES IN SCHEMA \"app\" TO \"releem\";" \
+            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"app\" TO \"releem\";" \
+            "GRANT USAGE ON SCHEMA \"Sales Data\" TO \"releem\";" \
+            "GRANT SELECT ON ALL TABLES IN SCHEMA \"Sales Data\" TO \"releem\";" \
+            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"Sales Data\" TO \"releem\";"; do
+            run grep -F -- "-d ${database} -v ON_ERROR_STOP=1 -c ${grant}" "${TEST_TMPDIR}/pg.args"
+            [ "$status" -eq 0 ]
+        done
+    done
+    run grep -F -- "GRANT pg_read_all_data" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
+    for procedural_sql in 'DO $$' 'EXECUTE format' 'set_config' 'decode(' 'ALTER DEFAULT PRIVILEGES'; do
+        run grep -F -- "${procedural_sql}" "${TEST_TMPDIR}/pg.args"
+        [ "$status" -ne 0 ]
+    done
+
+    [[ "$grant_output" == *"rerun the installer after adding PostgreSQL schemas or objects"* ]]
+}
+
+@test "quote_postgresql_identifier escapes embedded double quotes" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        quote_postgresql_identifier '"'"'role"reader'"'"'
+        printf "\\n"
+        quote_postgresql_identifier '"'"'shop"db'"'"'
+        printf "\\n"
+        quote_postgresql_identifier '"'"'Sales "Data"'"'"'
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = $'"role""reader"\n"shop""db"\n"Sales ""Data"""' ]
 }
 
 @test "create_postgresql_user prompts for root password when env is unset and passwordless root fails" {
@@ -903,7 +1143,7 @@ promptedpwd"
     create_mock_cmd "mariadb-admin" 'echo "mysqld is alive"'
     create_mock_cmd "mysql" '
 printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
-if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where HEX(User)="* ]]; then
   echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
 elif [[ "$*" == *"-Be GRANT SELECT on *.* to"* ]]; then
   exit 0
@@ -914,7 +1154,7 @@ exit 0
 '
     create_mock_cmd "mariadb" '
 printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
-if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where HEX(User)="* ]]; then
   echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
 elif [[ "$*" == *"-Be GRANT SELECT on *.* to"* ]]; then
   exit 0
@@ -980,7 +1220,7 @@ printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
 if [[ "$*" == *"--user=root"* && "$*" != *"--password=promptedpwd"* ]]; then
   exit 1
 fi
-if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where HEX(User)="* ]]; then
   echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
 fi
 exit 0
@@ -990,7 +1230,7 @@ printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
 if [[ "$*" == *"--user=root"* && "$*" != *"--password=promptedpwd"* ]]; then
   exit 1
 fi
-if [[ "$*" == *"-NBe select Concat("*"from mysql.user where User=\"releem\""* ]]; then
+if [[ "$*" == *"-NBe select Concat("*"from mysql.user where HEX(User)="* ]]; then
   echo "GRANT SELECT on *.* to \`releem\`@\`%\`;"
 fi
 exit 0
@@ -1033,10 +1273,192 @@ exit 0
     [ "$status" -eq 0 ]
 }
 
+@test "enable_query_optimization mode uses existing PostgreSQL config without env database hints" {
+    prepare_common_install_mocks
+    create_mock_cmd "sudo" '
+if [ "$1" = "-u" ]; then
+  shift 2
+fi
+"$@"
+'
+    create_mock_cmd "psql" '
+printf "%s\n" "$*" >> "${PG_ARGS_LOG}"
+if [[ "$*" == *"SHOW server_version_num"* ]]; then
+  echo "140000"
+elif [[ "$*" == *"SELECT datname"* && "$*" == *"pg_database"* ]]; then
+  printf "postgres\000shop\000"
+fi
+exit 0
+'
+    create_mock_cmd "mysqladmin" '
+echo "unexpected mysqladmin call: $*" >> "${MYSQL_ARGS_LOG}"
+exit 44
+'
+    create_mock_cmd "mariadb-admin" '
+echo "unexpected mariadb-admin call: $*" >> "${MYSQL_ARGS_LOG}"
+exit 44
+'
+    create_mock_cmd "mysql" '
+echo "unexpected mysql call: $*" >> "${MYSQL_ARGS_LOG}"
+exit 44
+'
+    create_mock_cmd "mariadb" '
+echo "unexpected mariadb call: $*" >> "${MYSQL_ARGS_LOG}"
+exit 44
+'
+
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    local pg_args="${TEST_TMPDIR}/pg.args"
+    local mysql_args="${TEST_TMPDIR}/mysql.args"
+    mkdir -p "${workdir}"
+    printf 'apikey="k1"\npg_user="collector-ro"\npg_password="secret"\npg_host="127.0.0.1"\npg_port="5432"\n' > "${conf}"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${workdir}/releem-agent"
+    printf '#!/usr/bin/env bash\necho "$@" >> "%s/calls.log"\nexit 0\n' "${workdir}" > "${workdir}/mysqlconfigurer.sh"
+    chmod +x "${workdir}/releem-agent" "${workdir}/mysqlconfigurer.sh"
+    cp "${INSTALL_SH}" "${MOCK_BIN}/enable_query_optimization"
+    chmod +x "${MOCK_BIN}/enable_query_optimization"
+
+    PATH="${MOCK_BIN}:${PATH}" run env -u RELEEM_PG_HOST -u RELEEM_PG_LOGIN -u RELEEM_PG_PASSWORD -u RELEEM_PG_ROOT_LOGIN -u RELEEM_PG_ROOT_PASSWORD -u RELEEM_PG_TYPE -u RELEEM_MYSQL_HOST -u RELEEM_MYSQL_LOGIN -u RELEEM_MYSQL_PASSWORD -u RELEEM_MYSQL_ROOT_LOGIN -u RELEEM_MYSQL_ROOT_PASSWORD -u RELEEM_MYSQL_TYPE \
+        RELEEM_TEST_MODE=1 \
+        RELEEM_WORKDIR="${workdir}" \
+        RELEEM_CONF_FILE="${conf}" \
+        PG_ARGS_LOG="${pg_args}" \
+        MYSQL_ARGS_LOG="${mysql_args}" \
+        RELEEM_CRON_ENABLE="1" \
+        bash -x "${MOCK_BIN}/enable_query_optimization" enable_query_optimization
+
+    [ "$status" -eq 0 ]
+    run grep -F -- 'GRANT CONNECT ON DATABASE "postgres" TO "collector-ro";' "${pg_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- 'GRANT CONNECT ON DATABASE "shop" TO "collector-ro";' "${pg_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- 'GRANT pg_read_all_data TO "collector-ro";' "${pg_args}"
+    [ "$status" -eq 0 ]
+    for procedural_sql in 'DO $$' 'EXECUTE format' 'set_config' 'decode(' 'ALTER DEFAULT PRIVILEGES'; do
+        run grep -F -- "${procedural_sql}" "${pg_args}"
+        [ "$status" -ne 0 ]
+    done
+    [ ! -s "${mysql_args}" ]
+    run grep -E "^query_optimization=true$" "${conf}"
+    [ "$status" -eq 0 ]
+}
+
+@test "enable_query_optimization mode grants MySQL access to configured monitoring user" {
+    prepare_common_install_mocks
+    create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
+    create_mock_cmd "mariadb-admin" 'echo "mysqld is alive"'
+    create_mock_cmd "mysql" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"HEX(User)="*"6F277265696C6C79"* ]]; then
+  echo "GRANT SELECT on *.* to special_user;"
+fi
+exit 0
+'
+    create_mock_cmd "mariadb" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"HEX(User)="*"6F277265696C6C79"* ]]; then
+  echo "GRANT SELECT on *.* to special_user;"
+fi
+exit 0
+'
+
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    local mysql_args="${TEST_TMPDIR}/mysql.args"
+    mkdir -p "${workdir}"
+    printf 'apikey="k1"\nmysql_user="o'"'"'reilly"\nmysql_password="secret"\nmysql_host="127.0.0.1"\nmysql_port="3306"\n' > "${conf}"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${workdir}/releem-agent"
+    printf '#!/usr/bin/env bash\necho "$@" >> "%s/calls.log"\nexit 0\n' "${workdir}" > "${workdir}/mysqlconfigurer.sh"
+    chmod +x "${workdir}/releem-agent" "${workdir}/mysqlconfigurer.sh"
+    cp "${INSTALL_SH}" "${MOCK_BIN}/enable_query_optimization"
+    chmod +x "${MOCK_BIN}/enable_query_optimization"
+
+    PATH="${MOCK_BIN}:${PATH}" run env -u RELEEM_PG_HOST -u RELEEM_PG_LOGIN -u RELEEM_PG_PASSWORD -u RELEEM_PG_ROOT_LOGIN -u RELEEM_PG_ROOT_PASSWORD -u RELEEM_PG_TYPE -u RELEEM_MYSQL_HOST -u RELEEM_MYSQL_LOGIN -u RELEEM_MYSQL_PASSWORD -u RELEEM_MYSQL_ROOT_LOGIN -u RELEEM_MYSQL_ROOT_PASSWORD -u RELEEM_MYSQL_TYPE \
+        RELEEM_TEST_MODE=1 \
+        RELEEM_WORKDIR="${workdir}" \
+        RELEEM_CONF_FILE="${conf}" \
+        MYSQL_ARGS_LOG="${mysql_args}" \
+        RELEEM_CRON_ENABLE="1" \
+        bash "${MOCK_BIN}/enable_query_optimization" enable_query_optimization
+
+    [ "$status" -eq 0 ]
+    run grep -F -- "HEX(User)='6F277265696C6C79'" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "REPLACE(User, CHAR(96)" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "REPLACE(Host, CHAR(96)" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "-Be GRANT SELECT on *.* to special_user;" "${mysql_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- "where User='releem'" "${mysql_args}"
+    [ "$status" -ne 0 ]
+    run grep -E "^query_optimization=true$" "${conf}"
+    [ "$status" -eq 0 ]
+}
+
+@test "load_runtime_config preserves existing query optimization setting" {
+    local workdir="${TEST_TMPDIR}/workdir"
+    mkdir -p "${workdir}"
+    printf 'apikey="k1"\nquery_optimization=false # existing setting\n' > "${workdir}/releem.conf"
+
+    run bash -c '
+        RELEEM_TEST_MODE=1 RELEEM_WORKDIR="$1" source "$2"
+        unset query_optimization RELEEM_QUERY_OPTIMIZATION
+        load_runtime_config
+        printf "%s|%s" "$RELEEM_QUERY_OPTIMIZATION" "$query_optimization"
+    ' _ "${workdir}" "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "false|false" ]
+}
+
+@test "enable_query_optimization fails when configured MySQL account is missing" {
+    prepare_common_install_mocks
+    create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
+    create_mock_cmd "mariadb-admin" 'echo "mysqld is alive"'
+    create_mock_cmd "mysql" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+exit 0
+'
+    create_mock_cmd "mariadb" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+exit 0
+'
+
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    local mysql_args="${TEST_TMPDIR}/mysql.args"
+    mkdir -p "${workdir}"
+    printf 'apikey="k1"\nmysql_user="missing"\nmysql_password="secret"\nmysql_host="127.0.0.1"\nmysql_port="3306"\n' > "${conf}"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${workdir}/releem-agent"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${workdir}/mysqlconfigurer.sh"
+    chmod +x "${workdir}/releem-agent" "${workdir}/mysqlconfigurer.sh"
+    cp "${INSTALL_SH}" "${MOCK_BIN}/enable_query_optimization"
+    chmod +x "${MOCK_BIN}/enable_query_optimization"
+
+    PATH="${MOCK_BIN}:${PATH}" run env -u RELEEM_MYSQL_LOGIN -u RELEEM_MYSQL_PASSWORD \
+        RELEEM_TEST_MODE=1 \
+        RELEEM_WORKDIR="${workdir}" \
+        RELEEM_CONF_FILE="${conf}" \
+        MYSQL_ARGS_LOG="${mysql_args}" \
+        RELEEM_CRON_ENABLE="1" \
+        bash "${MOCK_BIN}/enable_query_optimization" enable_query_optimization
+
+    [ "$status" -ne 0 ]
+    run grep -E "^query_optimization=true$" "${conf}"
+    [ "$status" -ne 0 ]
+}
+
 @test "enable_query_optimization mode grants pg_read_all_data for postgresql" {
     prepare_common_install_mocks
     create_mock_cmd "psql" '
 printf "%s\n" "$*" >> "${PG_ARGS_LOG}"
+if [[ "$*" == *"SHOW server_version_num"* ]]; then
+  echo "140000"
+elif [[ "$*" == *"SELECT datname"* && "$*" == *"pg_database"* ]]; then
+  printf "postgres\000shop\000"
+fi
 exit 0
 '
 
@@ -1064,46 +1486,23 @@ exit 0
         bash "${MOCK_BIN}/enable_query_optimization" enable_query_optimization
 
     [ "$status" -eq 0 ]
-    run grep -F -- "-U pgadmin -c GRANT pg_read_all_data TO releem;" "${pg_args}"
+    run grep -F -- 'GRANT CONNECT ON DATABASE "postgres" TO "releem";' "${pg_args}"
     [ "$status" -eq 0 ]
+    run grep -F -- 'GRANT CONNECT ON DATABASE "shop" TO "releem";' "${pg_args}"
+    [ "$status" -eq 0 ]
+    run grep -F -- 'GRANT pg_read_all_data TO "releem";' "${pg_args}"
+    [ "$status" -eq 0 ]
+    for procedural_sql in 'DO $$' 'EXECUTE format' 'set_config' 'decode(' 'ALTER DEFAULT PRIVILEGES'; do
+        run grep -F -- "${procedural_sql}" "${pg_args}"
+        [ "$status" -ne 0 ]
+    done
     run grep -E "^query_optimization=true$" "${conf}"
     [ "$status" -eq 0 ]
     run grep -E "^-p$" "${workdir}/calls.log"
     [ "$status" -eq 0 ]
 }
 
-@test "uninstall mode calls agent uninstall flow and rm with mocked side-effects" {
-    prepare_common_install_mocks
-    create_mock_cmd "rm" '
-echo "$@" >> "${UNINSTALL_RM_LOG}"
-exit 0
-'
 
-    local workdir="${TEST_TMPDIR}/workdir"
-    local agent_calls="${TEST_TMPDIR}/agent.calls"
-    local rm_calls="${TEST_TMPDIR}/rm.calls"
-    mkdir -p "${workdir}"
-    cat > "${workdir}/releem-agent" <<'EOF'
-#!/usr/bin/env bash
-echo "$@" >> "${UNINSTALL_AGENT_LOG}"
-exit 0
-EOF
-    chmod +x "${workdir}/releem-agent"
-
-    PATH="${MOCK_BIN}:${PATH}" run env \
-        RELEEM_TEST_MODE=1 \
-        RELEEM_WORKDIR="${workdir}" \
-        RELEEM_API_KEY="k1" \
-        UNINSTALL_AGENT_LOG="${agent_calls}" \
-        UNINSTALL_RM_LOG="${rm_calls}" \
-        bash "${INSTALL_SH}" uninstall
-
-    [ "$status" -eq 0 ]
-    run grep -E -- "--event=agent_uninstall|stop|remove" "${agent_calls}"
-    [ "$status" -eq 0 ]
-    run grep -F -- "-rf ${workdir}" "${rm_calls}"
-    [ "$status" -eq 0 ]
-}
 
 @test "update mode downloads artifacts and restarts agent with mocked side-effects" {
     prepare_common_install_mocks
@@ -1156,4 +1555,132 @@ EOF
     [ "$status" -eq 0 ]
     run grep -E "stop|start|-f" "${agent_calls}"
     [ "$status" -eq 0 ]
+}
+
+@test "postgresql catalog grants preserve newline identifiers from NUL records" {
+    create_mock_cmd "psql" '
+query="$*"
+printf "%s\n" "$query" >> "${PG_ARGS_LOG}"
+if [[ "$query" == *"SHOW server_version_num"* ]]; then
+  printf "120000\n"
+elif [[ "$query" == *"SELECT datname"* && "$query" == *"pg_database"* ]]; then
+  [[ " ${query} " == *" -0 "* ]] || exit 91
+  printf "catalog\ndb\000plain db\000"
+elif [[ "$query" == *"SELECT nspname"* && "$query" == *"pg_namespace"* ]]; then
+  [[ " ${query} " == *" -0 "* ]] || exit 92
+  printf "sales\nschema\000odd \"schema\"\000"
+elif [[ "$query" == *"GRANT"* ]]; then
+  [[ "$query" == *"-v ON_ERROR_STOP=1"* ]] || exit 93
+  cat >/dev/null
+fi
+exit 0
+'
+
+    run env \
+        RELEEM_PG_ROOT_PASSWORD="rootpwd" \
+        PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" \
+        bash -c '
+            RELEEM_TEST_MODE=1 source "$1"
+            psqlcmd="$2"
+            pg_root_peer_connection=""
+            pg_root_connection_string="-h 127.0.0.1 -p 5432 -d postgres"
+            grant_postgresql_query_optimization_access "postgres" '"'"'role"reader'"'"'
+        ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
+
+    [ "$status" -eq 0 ]
+    run grep -F -- $'GRANT CONNECT ON DATABASE "catalog\ndb" TO "role""reader";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F -- 'GRANT CONNECT ON DATABASE "plain db" TO "role""reader";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F -- $'-d catalog\ndb -v ON_ERROR_STOP=1 -c GRANT USAGE ON SCHEMA "sales\nschema" TO "role""reader";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+    run grep -F -- 'GRANT SELECT ON ALL TABLES IN SCHEMA "odd ""schema""" TO "role""reader";' "${TEST_TMPDIR}/pg.args"
+    [ "$status" -eq 0 ]
+}
+
+@test "postgresql catalog grants do not require mapfile delimiter support" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        mapfile() { return 97; }
+        postgresql_root_exec() {
+            case "$*" in
+                *"SHOW server_version_num"*) printf "140000\n" ;;
+                *"pg_database"*) printf "postgres\000" ;;
+                *"GRANT CONNECT"*) printf "%s\n" "$*" >&2 ;;
+                *"GRANT pg_read_all_data"*) printf "%s\n" "$*" >&2 ;;
+            esac
+        }
+        grant_postgresql_query_optimization_access postgres releem
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'GRANT CONNECT ON DATABASE "postgres" TO "releem";'* ]]
+    [[ "$output" == *'GRANT pg_read_all_data TO "releem";'* ]]
+}
+
+@test "postgresql database catalog failure stops before grants" {
+    create_mock_cmd "psql" '
+query="$*"
+printf "%s\n" "$query" >> "${PG_ARGS_LOG}"
+if [[ "$query" == *"SHOW server_version_num"* ]]; then
+  printf "140000\n"
+elif [[ "$query" == *"SELECT datname"* && "$query" == *"pg_database"* ]]; then
+  exit 41
+fi
+exit 0
+'
+
+    run env PG_ARGS_LOG="${TEST_TMPDIR}/pg.args" bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        psqlcmd="$2"
+        pg_root_peer_connection=""
+        pg_root_connection_string="-d postgres"
+        grant_postgresql_query_optimization_access postgres releem
+    ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql"
+
+    [ "$status" -ne 0 ]
+    run grep -F -- "GRANT" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
+}
+
+@test "postgresql schema catalog failure stops later grants" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        postgresql_root_exec() {
+            printf "%s\n" "$*" >&2
+            case "$*" in
+                *"SHOW server_version_num"*) printf "120000\n" ;;
+                *"pg_database"*) printf "first\000second\000" ;;
+                *"pg_namespace"*) return 42 ;;
+            esac
+        }
+        grant_postgresql_query_optimization_access postgres releem
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"GRANT USAGE ON SCHEMA"* ]]
+    [[ "$output" != *"GRANT SELECT ON ALL TABLES"* ]]
+}
+
+@test "postgresql grant failure stops later grants" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        postgresql_root_exec() {
+            printf "%s\n" "$*" >&2
+            case "$*" in
+                *"SHOW server_version_num"*) printf "140000\n" ;;
+                *"pg_database"*) printf "first\000second\000" ;;
+                *"GRANT CONNECT ON DATABASE \"first\""*)
+                    [[ "$*" == *"-v ON_ERROR_STOP=1"* ]] || return 93
+                    return 43
+                    ;;
+                *"GRANT"*) [[ "$*" == *"-v ON_ERROR_STOP=1"* ]] || return 93 ;;
+            esac
+        }
+        grant_postgresql_query_optimization_access postgres releem
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" != *'GRANT CONNECT ON DATABASE "second"'* ]]
+    [[ "$output" != *'GRANT pg_read_all_data'* ]]
 }

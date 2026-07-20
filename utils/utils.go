@@ -128,32 +128,41 @@ func ConnectionMySQL(configuration *config.Config, logger logging.Logger, DBname
 }
 
 func ConnectionPostgreSQL(configuration *config.Config, logger logging.Logger, DBname string) *sql.DB {
-	var db *sql.DB
-	var err error
-	var sslmode string
-
-	if configuration.PgSslMode {
-		sslmode = "require"
-	} else {
-		sslmode = "disable"
-	}
-	// Build PostgreSQL connection string
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		configuration.PgHost, configuration.PgPort, configuration.PgUser,
-		configuration.PgPassword, DBname, sslmode)
-
-	db, err = sql.Open("postgres", connStr)
+	db, err := sql.Open("postgres", postgresqlConnectionString(configuration, DBname))
 	if err != nil {
 		logger.Error("PostgreSQL connection opening failed ", err)
+		return nil
 	}
 
-	err = db.Ping()
-	if err != nil {
+	if err = db.Ping(); err != nil {
 		logger.Info("PostgreSQL connection failed to DB ", DBname, " via tcp ", configuration.PgHost, ":", configuration.PgPort)
-	} else {
-		logger.Info("PostgreSQL connection successful to DB ", DBname, " via tcp ", configuration.PgHost, ":", configuration.PgPort)
+		_ = db.Close()
+		return nil
 	}
+	logger.Info("PostgreSQL connection successful to DB ", DBname, " via tcp ", configuration.PgHost, ":", configuration.PgPort)
 	return db
+}
+
+func postgresqlConnectionString(configuration *config.Config, database string) string {
+	sslmode := "disable"
+	if configuration.PgSslMode {
+		sslmode = "require"
+	}
+	return fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		quotePostgresqlDSNValue(configuration.PgHost),
+		quotePostgresqlDSNValue(configuration.PgPort),
+		quotePostgresqlDSNValue(configuration.PgUser),
+		quotePostgresqlDSNValue(configuration.PgPassword),
+		quotePostgresqlDSNValue(database),
+		quotePostgresqlDSNValue(sslmode),
+	)
+}
+
+func quotePostgresqlDSNValue(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `'`, `\'`)
+	return `'` + value + `'`
 }
 
 func EnableEventsStatementsConsumers(configuration *config.Config, logger logging.Logger, uptime_str string) {

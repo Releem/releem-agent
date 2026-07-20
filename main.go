@@ -227,6 +227,9 @@ func (programm *Programm) Run() {
 	// Initialize database connection based on database type
 	dbType := configuration.GetDatabaseType()
 	models.DB = utils.ConnectionDatabase(configuration, logger, "")
+	if models.DB == nil {
+		exitRunWithError("Failed to connect to the configured database")
+	}
 	defer models.DB.Close()
 
 	//Init repeaters
@@ -246,18 +249,19 @@ func (programm *Programm) Run() {
 	//Init gatherers based on database type
 	switch dbType {
 	case "postgresql":
+		postgresCapabilities := postgresql.NewPostgresCapabilities(logger)
 		gatherers["default"] = append(gatherers["default"],
 			postgresql.NewDBConfGatherer(logger, configuration),
 			postgresql.NewDBInfoBaseGatherer(logger, configuration),
 			postgresql.NewDBInfoGatherer(logger, configuration),
-			postgresql.NewDBMetricsBaseGatherer(logger, configuration),
+			postgresql.NewDBMetricsBaseGatherer(logger, configuration, postgresCapabilities),
 			metrics.NewAgentMetricsGatherer(logger, configuration))
 
 		gatherers["metrics"] = []models.MetricsGatherer{}
 
 		gatherers["configuration"] = append(gatherers["configuration"], postgresql.NewDBMetricsConfigGatherer(logger, configuration))
 
-		gatherers["query_optimization"] = append(gatherers["query_optimization"], postgresql.NewDBCollectQueriesOptimization(logger, configuration))
+		gatherers["query_optimization"] = append(gatherers["query_optimization"], postgresql.NewDBCollectQueriesOptimization(logger, configuration, postgresCapabilities))
 
 		gatherers["sample_queries"] = []models.MetricsGatherer{}
 
