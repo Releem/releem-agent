@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	ReleemAgentVersion = "1.23.7"
+	ReleemAgentVersion = "1.24.0"
 )
 
 type Config struct {
@@ -54,6 +54,15 @@ type Config struct {
 	QueryOptimization           bool          `hcl:"query_optimization"`
 	DatabasesQueryOptimization  string        `hcl:"databases_query_optimization"`
 	ReleemRegion                string        `hcl:"releem_region"`
+	// Task automator configuration
+	EnableExecDDL       bool    `hcl:"enable_exec_ddl"`
+	BackupDir           string  `hcl:"backup_dir"`
+	PTOSCPath           string  `hcl:"ptosc_path"`
+	MysqldumpPath       string  `hcl:"mysqldump_path"`
+	XtrabackupPath      string  `hcl:"xtrabackup_path"`
+	BackupSpaceBuffer   float64 `hcl:"backup_space_buffer"`
+	OnlineDDLTestSchema string  `hcl:"online_ddl_test_schema"`
+	DisableSpaceChecks  bool    `hcl:"disable_space_checks"`
 }
 
 func LoadConfig(filename string, logger logging.Logger) (*Config, error) {
@@ -103,6 +112,25 @@ func LoadConfigFromString(data string, logger logging.Logger) (*Config, error) {
 	}
 	if config.InstanceType == "" {
 		config.InstanceType = "local"
+	}
+	// Set defaults for task-automator config fields
+	if config.BackupDir == "" {
+		config.BackupDir = "/tmp/backups"
+	}
+	if config.PTOSCPath == "" {
+		config.PTOSCPath = "pt-online-schema-change"
+	}
+	if config.MysqldumpPath == "" {
+		config.MysqldumpPath = "mysqldump"
+	}
+	if config.XtrabackupPath == "" {
+		config.XtrabackupPath = "xtrabackup"
+	}
+	if config.BackupSpaceBuffer == 0 {
+		config.BackupSpaceBuffer = 20.0 // Default 20% buffer
+	}
+	if config.OnlineDDLTestSchema == "" {
+		config.OnlineDDLTestSchema = "releem_online_ddl_test"
 	}
 	return config, nil
 }

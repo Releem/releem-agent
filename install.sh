@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh - Version 1.23.7
+# install.sh - Version 1.24.0
 # (C) Releem, Inc 2022
 # All rights reserved
 
@@ -10,7 +10,7 @@ set -e -E
 # using the package manager.
 
 # Set defaults.
-install_script_version=1.23.7
+install_script_version=1.24.0
 logfile="/var/log/releem-install.log"
 npipe=""
 
@@ -1283,6 +1283,9 @@ function first_run_releem_agent() {
         printf "\033[37m\n * Executing Releem Agent for the first time.\033[0m\n"
         printf "\033[37m This may take up to 15 minutes on servers with many databases.\033[0m\n\n"
         $sudo_cmd $RELEEM_WORKDIR/releem-agent -f
+        # Wait for 10 seconds to ensure the agent is started
+        printf "\033[37m\n * Waiting for 30 seconds to ensure the server is added to the Releem platform.\033[0m\n"
+        sleep 30        
         $sudo_cmd timeout --preserve-status 10 $RELEEM_WORKDIR/releem-agent
     fi
     trap on_error ERR

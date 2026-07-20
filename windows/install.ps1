@@ -60,6 +60,28 @@ function Write-Log {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: Invoke-Icacls
+# Resolves the built-in utility without relying on PATH or PATHEXT and fails
+# with an actionable error when the utility is missing or rejects the ACL.
+# ---------------------------------------------------------------------------
+
+function Invoke-Icacls {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $windowsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+    $icaclsExe = Join-Path $windowsDirectory 'System32\icacls.exe'
+
+    if (-not (Test-Path -LiteralPath $icaclsExe -PathType Leaf)) {
+        throw "Required Windows utility not found: $icaclsExe"
+    }
+
+    & $icaclsExe @Arguments | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls.exe failed with exit code $LASTEXITCODE while processing '$($Arguments[0])'."
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Helper: Find-MyIniPath
 # Searches standard locations for my.ini; returns full path or $null.
 # ---------------------------------------------------------------------------
@@ -391,7 +413,7 @@ if ($Uninstall) {
     $dataDir = 'C:\ProgramData\ReleemAgent'
     if (Test-Path $dataDir) {
         # Reset ACLs on all files before removal (releem.conf has restricted permissions)
-        & icacls $dataDir /reset /T /Q | Out-Null
+        Invoke-Icacls -Arguments @($dataDir, '/reset', '/T', '/Q')
         Remove-Item -Path $dataDir -Recurse -Force
         Write-Host "Removed: $dataDir"
     } else {
@@ -637,7 +659,12 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 Write-Log "Created releem.conf: $ConfigFilePath"
 
 # Restrict ACL: readable only by SYSTEM and Administrators
-& icacls $ConfigFilePath /inheritance:r '/grant:r' 'SYSTEM:(R)' '/grant:r' 'Administrators:(M)' | Out-Null
+Invoke-Icacls -Arguments @(
+    $ConfigFilePath,
+    '/inheritance:r',
+    '/grant:r', '*S-1-5-18:(R)',
+    '/grant:r', '*S-1-5-32-544:(M)'
+)
 Write-Log 'releem.conf permissions restricted to SYSTEM and Administrators.'
 
 # ---------------------------------------------------------------------------
@@ -718,7 +745,11 @@ try {
 if ($InstanceType -eq 'local') {
     if (Test-Path $ConfigurerScriptPath) {
         Write-Log 'Enabling query monitoring for local instance...'
-        & powershell.exe -NonInteractive -File $ConfigurerScriptPath -Configure
+        $powerShellExe = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+            throw "Required Windows PowerShell executable not found: $powerShellExe"
+        }
+        & $powerShellExe -NonInteractive -File $ConfigurerScriptPath -Configure
         Write-Log "mysqlconfigurer.ps1 -Configure exited with code: $LASTEXITCODE"
     } else {
         Write-Log 'WARNING: mysqlconfigurer.ps1 not found; skipping -Configure.'
