@@ -91,6 +91,8 @@ type PostgresIndexKey struct {
 	Expression         string `json:"expression"`
 	Collation          string `json:"collation"`
 	Opclass            string `json:"opclass"`
+	CollationSchema    string `json:"collation_schema"`
+	OpclassSchema      string `json:"opclass_schema"`
 	CollationIsDefault bool   `json:"collation_is_default"`
 	OpclassIsDefault   bool   `json:"opclass_is_default"`
 	Descending         bool   `json:"descending"`
@@ -105,6 +107,8 @@ func (key PostgresIndexKey) metricGroupValue() models.MetricGroupValue {
 		"expression":           nullableNonEmptyString(key.Expression),
 		"collation":            nullableNonEmptyString(key.Collation),
 		"opclass":              nullableNonEmptyString(key.Opclass),
+		"collation_schema":     nullableNonEmptyString(key.CollationSchema),
+		"opclass_schema":       nullableNonEmptyString(key.OpclassSchema),
 		"collation_is_default": key.CollationIsDefault,
 		"opclass_is_default":   key.OpclassIsDefault,
 		"descending":           key.Descending,
@@ -232,6 +236,8 @@ type postgresSchemaCollectionError struct {
 	sections []string
 }
 
+const postgresDatabaseConnectionFailureSection = "__database_connection__"
+
 func (err *postgresSchemaCollectionError) Error() string {
 	return fmt.Sprintf("PostgreSQL schema sections failed: %v", err.sections)
 }
@@ -241,7 +247,9 @@ func (err *postgresSchemaCollectionError) Error() string {
 func CollectDbSchema(configuration *config.Config, logger logging.Logger, database string, knownServerVersion int, metrics *models.Metrics) error {
 	db := u.ConnectionDatabase(configuration, logger, database)
 	if db == nil {
-		return fmt.Errorf("failed to connect to database %s", database)
+		return &postgresSchemaCollectionError{
+			sections: []string{postgresDatabaseConnectionFailureSection},
+		}
 	}
 	defer db.Close()
 	if db == nil {
@@ -274,9 +282,6 @@ func collectPostgresSchemaSections(ctx context.Context, db *sql.DB, database str
 		if err != nil {
 			logger.Error("Unable to collect PostgreSQL schema section ", collector.name, " for database ", database, ": ", err)
 			failedSections = append(failedSections, collector.name)
-			continue
-		}
-		if len(rows) == 0 {
 			continue
 		}
 		if _, exists := metrics.DB.DatabaseSchema[collector.name]; !exists {
@@ -382,8 +387,10 @@ SELECT namespace.nspname, table_class.relname, index_class.relname, access_metho
 			'position', key_info.position,
 			'column_name', CASE WHEN key_info.attnum = 0 THEN NULL ELSE attribute.attname END,
 			'expression', CASE WHEN key_info.attnum = 0 THEN pg_get_indexdef(idx.indexrelid, key_info.position::integer, true) ELSE NULL END,
-			'collation', collation_meta.collname,
-			'opclass', opclass_meta.opcname,
+				'collation', collation_meta.collname,
+				'opclass', opclass_meta.opcname,
+				'collation_schema', collation_namespace.nspname,
+				'opclass_schema', opclass_namespace.nspname,
 			'collation_is_default', CASE
 				WHEN COALESCE(collation_info.oid, 0) = 0 THEN true
 				WHEN key_info.attnum <> 0 THEN collation_info.oid = attribute.attcollation
@@ -398,8 +405,10 @@ SELECT namespace.nspname, table_class.relname, index_class.relname, access_metho
 		LEFT JOIN pg_attribute attribute ON attribute.attrelid = idx.indrelid AND attribute.attnum = key_info.attnum
 		LEFT JOIN unnest(idx.indcollation) WITH ORDINALITY AS collation_info(oid, position) ON collation_info.position = key_info.position
 		LEFT JOIN pg_collation collation_meta ON collation_meta.oid = collation_info.oid
+		LEFT JOIN pg_namespace collation_namespace ON collation_namespace.oid = collation_meta.collnamespace
 		LEFT JOIN unnest(idx.indclass) WITH ORDINALITY AS opclass_info(oid, position) ON opclass_info.position = key_info.position
 		LEFT JOIN pg_opclass opclass_meta ON opclass_meta.oid = opclass_info.oid
+		LEFT JOIN pg_namespace opclass_namespace ON opclass_namespace.oid = opclass_meta.opcnamespace
 		LEFT JOIN unnest(idx.indoption) WITH ORDINALITY AS option_info(option, position) ON option_info.position = key_info.position
 		WHERE key_info.position <= idx.indnkeyatts
 	), '[]'::jsonb)::text,

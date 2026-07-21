@@ -90,6 +90,7 @@ SELECT
 	%s AS rows
 FROM %s s
 LEFT JOIN pg_database d ON d.oid = s.dbid
+WHERE s.queryid IS NOT NULL
 GROUP BY d.datname, s.queryid`, queryColumn, capabilities.TimingColumn, capabilities.TimingColumn, rowsExpression, capabilities.PgStatStatementsRelation)
 }
 

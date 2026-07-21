@@ -327,8 +327,8 @@ func TestCollectDbSchemaDoesNotPublishPartialFailedSection(t *testing.T) {
 	if err := CollectDbSchema("app", logger, metrics); err == nil {
 		t.Fatal("CollectDbSchema should report the row stream failure")
 	}
-	if len(metrics.DB.DatabaseSchema["information_schema_tables"]) != 0 {
-		t.Fatalf("partial rows from a failed section must not be published: %#v", metrics.DB.DatabaseSchema["information_schema_tables"])
+	if rows, exists := metrics.DB.DatabaseSchema["information_schema_tables"]; exists {
+		t.Fatalf("partial/failed section must not be added to DatabaseSchema: %#v", rows)
 	}
 	if !queriedColumns {
 		t.Fatal("columns section should still be attempted after the table row stream fails")
@@ -390,7 +390,7 @@ func TestCollectDbSchemaPreservesSuccessfulDatabasesWhenSectionFails(t *testing.
 	}
 }
 
-func TestCollectDbSchemaOmitsSuccessfulEmptySections(t *testing.T) {
+func TestCollectDbSchemaPublishesSuccessfulEmptySections(t *testing.T) {
 	setMysqlSchemaTestDB(t, func(string) (driver.Rows, error) {
 		return mysqlEmptySchemaRows(), nil
 	})
@@ -411,8 +411,9 @@ func TestCollectDbSchemaOmitsSuccessfulEmptySections(t *testing.T) {
 		"information_schema_table_constraints",
 		"information_schema_triggers",
 	} {
-		if _, exists := metrics.DB.DatabaseSchema[section]; exists {
-			t.Fatalf("successful empty section %q must be absent, got %#v", section, metrics.DB.DatabaseSchema[section])
+		rows, exists := metrics.DB.DatabaseSchema[section]
+		if !exists || len(rows) != 0 {
+			t.Fatalf("successful empty section %q must be published as empty, got exists=%v rows=%#v", section, exists, rows)
 		}
 	}
 }
@@ -475,15 +476,15 @@ func TestCollectIndexUsageSchemaDoesNotPublishPartialFailedSection(t *testing.T)
 		t.Fatal("CollectIndexUsageSchema should return the row stream failure")
 	}
 	section := "performance_schema_table_io_waits_summary_by_index_usage"
-	if len(metrics.DB.DatabaseSchema[section]) != 0 {
-		t.Fatalf("partial rows from a failed section must not be published: %#v", metrics.DB.DatabaseSchema[section])
+	if rows, exists := metrics.DB.DatabaseSchema[section]; exists {
+		t.Fatalf("partial/failed section must not be added to DatabaseSchema: %#v", rows)
 	}
 	if got, want := metrics.DB.FailedDatabaseSchema, []string{section}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("failed schema sections = %#v, want %#v", got, want)
 	}
 }
 
-func TestCollectIndexUsageSchemaOmitsSuccessfulEmptySection(t *testing.T) {
+func TestCollectIndexUsageSchemaPublishesSuccessfulEmptySection(t *testing.T) {
 	setMysqlSchemaTestDB(t, func(string) (driver.Rows, error) {
 		return mysqlEmptySchemaRows(), nil
 	})
@@ -496,8 +497,9 @@ func TestCollectIndexUsageSchemaOmitsSuccessfulEmptySection(t *testing.T) {
 		t.Fatalf("CollectIndexUsageSchema returned an error: %v", err)
 	}
 	section := "performance_schema_table_io_waits_summary_by_index_usage"
-	if _, exists := metrics.DB.DatabaseSchema[section]; exists {
-		t.Fatalf("successful empty section must be absent, got %#v", metrics.DB.DatabaseSchema[section])
+	rows, exists := metrics.DB.DatabaseSchema[section]
+	if !exists || len(rows) != 0 {
+		t.Fatalf("successful empty section must be published as empty, got exists=%v rows=%#v", exists, rows)
 	}
 }
 

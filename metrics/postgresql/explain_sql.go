@@ -29,11 +29,6 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 			if isExplainPermissionError(err) {
 				return explain, errors.New("need_grant_permission")
 			}
-			if isUndefinedRelationError(err) {
-				return retryPgExplainForCandidateSchemas(db, err, func(schema string) (string, error) {
-					return executePreparedExplainInSchema(db, queryId, queryText, schema)
-				}, logger)
-			}
 		}
 		return explain, err
 	}
@@ -47,97 +42,17 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 	if isExplainPermissionError(err) {
 		return explain, errors.New("need_grant_permission")
 	}
-	if isUndefinedRelationError(err) {
-		return retryPgExplainForCandidateSchemas(db, err, func(schema string) (string, error) {
-			return executeDirectExplainInSchema(db, queryText, schema)
-		}, logger)
-	}
 	return explain, err
-}
-
-const pgExplainAmbiguousSchemaError = "ambiguous PostgreSQL schema for EXPLAIN"
-const pgExplainBaselineSchema = "pg_catalog"
-
-func retryPgExplainForCandidateSchemas(db *sql.DB, originalErr error, attempt func(string) (string, error), logger logging.Logger) (string, error) {
-	schemas, err := fetchPgUserSchemas(db)
-	if err != nil {
-		logger.Error("Error collecting PostgreSQL schemas for EXPLAIN retry: ", err)
-		return "", originalErr
-	}
-	return resolvePgExplainCandidateSchemas(schemas, attempt)
-}
-
-func fetchPgUserSchemas(db *sql.DB) ([]string, error) {
-	query := fmt.Sprintf("SELECT nspname FROM pg_namespace WHERE %s ORDER BY nspname", pgUserSchemaPredicate("nspname"))
-	rows, err := db.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var schemas []string
-	for rows.Next() {
-		var schema string
-		if err := rows.Scan(&schema); err != nil {
-			return nil, err
-		}
-		schemas = append(schemas, schema)
-	}
-	return schemas, rows.Err()
-}
-
-func resolvePgExplainCandidateSchemas(schemas []string, attempt func(string) (string, error)) (string, error) {
-	var successfulExplain string
-	var successfulSchemas int
-	var lastErr error
-	for _, schema := range schemas {
-		if strings.TrimSpace(schema) == "" {
-			continue
-		}
-		explain, err := attempt(schema)
-		if err == nil && explain != "" {
-			successfulExplain = explain
-			successfulSchemas++
-			continue
-		}
-		if isExplainPermissionError(err) {
-			return "", errors.New("need_grant_permission")
-		}
-		if err != nil {
-			lastErr = err
-		}
-	}
-	if successfulSchemas > 1 {
-		return "", errors.New(pgExplainAmbiguousSchemaError)
-	}
-	if successfulSchemas == 1 {
-		return successfulExplain, nil
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no PostgreSQL schema resolved for EXPLAIN")
-	}
-	return "", lastErr
 }
 
 func executeDirectExplain(db *sql.DB, queryText string, explain *string) error {
-	resolvedExplain, err := executeDirectExplainInSchema(db, queryText, pgExplainBaselineSchema)
-	*explain = resolvedExplain
-	return err
-}
-
-func executeDirectExplainInSchema(db *sql.DB, queryText string, schema string) (string, error) {
 	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, "SET LOCAL search_path = "+quotePgIdentifier(schema)); err != nil {
-		return "", err
-	}
-	var explain string
-	err = tx.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+queryText).Scan(&explain)
-	return explain, err
+	return tx.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+queryText).Scan(explain)
 }
 
 func isUndefinedRelationError(err error) bool {
@@ -153,7 +68,7 @@ func isUndefinedRelationError(err error) bool {
 
 func isPgExplainableStatement(queryText string) bool {
 	switch pgLeadingCommand(queryText) {
-	case "select", "table", "delete", "insert", "update", "merge", "with":
+	case "select", "with":
 		return true
 	default:
 		return false

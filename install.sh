@@ -258,9 +258,20 @@ function postgresql_root_exec() {
     shift
 
     if [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
-        PGPASSWORD="${RELEEM_PG_ROOT_PASSWORD}" ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@"
+        PGPASSWORD="${RELEEM_PG_ROOT_PASSWORD}" ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@" < /dev/null
     else
         ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@" < /dev/null
+    fi
+}
+
+function postgresql_root_exec_stdin() {
+    local pg_superuser="$1"
+    shift
+
+    if [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+        PGPASSWORD="${RELEEM_PG_ROOT_PASSWORD}" ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@"
+    else
+        ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@"
     fi
 }
 
@@ -506,6 +517,32 @@ function read_postgresql_root_catalog() {
     rm -f "${output_file}"
 }
 
+function postgresql_user_schema_search_path() {
+    local quoted_schemas=("$@")
+    local search_path='"$user", public'
+    local quoted_schema
+    for quoted_schema in "${quoted_schemas[@]}"; do
+        [ -z "${quoted_schema}" ] && continue
+        if [ "${quoted_schema}" = '"public"' ]; then
+            continue
+        fi
+        search_path="${search_path}, ${quoted_schema}"
+    done
+    printf '%s' "${search_path}"
+}
+
+function set_postgresql_monitoring_role_search_path() {
+    local pg_superuser="$1"
+    local quoted_monitoring_role="$2"
+    local database="$3"
+    shift 3
+    local quoted_schemas=("$@")
+    local quoted_database search_path
+    quoted_database=$(quote_postgresql_identifier "${database}")
+    search_path=$(postgresql_user_schema_search_path "${quoted_schemas[@]}")
+    postgresql_root_exec "${pg_superuser}" -v ON_ERROR_STOP=1 -c "ALTER ROLE ${quoted_monitoring_role} IN DATABASE ${quoted_database} SET search_path TO ${search_path};"
+}
+
 function grant_postgresql_query_optimization_access() {
     local pg_superuser="$1"
     local monitoring_role="$2"
@@ -515,6 +552,7 @@ function grant_postgresql_query_optimization_access() {
     local database
     local quoted_database
     local -a schemas
+    local -a quoted_schemas
     local schema
     local quoted_schema
     local catalog_status
@@ -554,8 +592,9 @@ ORDER BY datname;"; then
     done
 
     if (( server_version_num >= 140000 )); then
-        postgresql_root_exec "${pg_superuser}" -v ON_ERROR_STOP=1 -c "GRANT pg_read_all_data TO ${quoted_monitoring_role};"
-        return $?
+        if ! postgresql_root_exec "${pg_superuser}" -v ON_ERROR_STOP=1 -c "GRANT pg_read_all_data TO ${quoted_monitoring_role};"; then
+            return 1
+        fi
     fi
 
     for database in "${databases[@]}"; do
@@ -572,22 +611,29 @@ ORDER BY nspname;"; then
             return "${catalog_status}"
         fi
 
+        quoted_schemas=()
         for schema in "${schemas[@]}"; do
             [ -z "${schema}" ] && continue
             quoted_schema=$(quote_postgresql_identifier "${schema}")
-            if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
-                return 1
-            fi
-            if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
-                return 1
-            fi
-            if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
-                return 1
+            quoted_schemas+=("${quoted_schema}")
+            if (( server_version_num < 140000 )); then
+                if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
+                    return 1
+                fi
+                if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
+                    return 1
+                fi
+                if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
+                    return 1
+                fi
             fi
         done
+        if ! set_postgresql_monitoring_role_search_path "${pg_superuser}" "${quoted_monitoring_role}" "${database}" "${quoted_schemas[@]}"; then
+            return 1
+        fi
     done
 
-    printf "\033[33m PostgreSQL 12/13: rerun the installer after adding PostgreSQL schemas or objects.\033[0m\n"
+    printf "\033[33m Rerun the installer after adding PostgreSQL schemas or objects so grants and search_path stay current.\033[0m\n"
 }
 
 function create_mysql_user() {
@@ -688,10 +734,14 @@ function create_or_update_postgresql_monitoring_role() {
     quoted_monitoring_role=$(quote_postgresql_identifier "${monitoring_role}")
 
     if postgresql_root_exec "${pg_superuser}" -v role_name="${monitoring_role}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = :'role_name';" 2>/dev/null | grep -q "1"; then
-        postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -c "ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';" 2>/dev/null
+        postgresql_root_exec_stdin "${pg_superuser}" -v role_password="${monitoring_password}" <<EOF
+ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';
+EOF
         printf "\033[32m   Updated password for existing PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     else
-        postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -c "CREATE USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';" 2>/dev/null
+        postgresql_root_exec_stdin "${pg_superuser}" -v role_password="${monitoring_password}" <<EOF
+CREATE USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';
+EOF
         printf "\033[32m   Created new PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     fi
 

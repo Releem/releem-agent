@@ -106,8 +106,8 @@ func appendMysqlSchemaSection(metrics *models.Metrics, logger logging.Logger, se
 		recordSchemaCollectionError(logger, metrics, section, err, firstErr)
 		return
 	}
-	if len(sectionMetrics) == 0 {
-		return
+	if _, exists := metrics.DB.DatabaseSchema[section]; !exists {
+		metrics.DB.DatabaseSchema[section] = []models.MetricGroupValue{}
 	}
 	metrics.DB.DatabaseSchema[section] = append(metrics.DB.DatabaseSchema[section], sectionMetrics...)
 }
@@ -187,8 +187,12 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 	}
 
 	if DBCollectQueriesOptimization.configuration.QueryOptimization {
-		CollectExplain(output_digest, "sum_time_us", DBCollectQueriesOptimization.logger, DBCollectQueriesOptimization.configuration)
-		CollectExplain(output_digest, "avg_time_us", DBCollectQueriesOptimization.logger, DBCollectQueriesOptimization.configuration)
+		func() {
+			explainState := u.NewExplainCollectionState()
+			defer explainState.Close()
+			CollectExplain(output_digest, "sum_time_us", DBCollectQueriesOptimization.logger, DBCollectQueriesOptimization.configuration, explainState)
+			CollectExplain(output_digest, "avg_time_us", DBCollectQueriesOptimization.logger, DBCollectQueriesOptimization.configuration, explainState)
+		}()
 	}
 	if len(output_digest) != 0 {
 		for _, value := range output_digest {
@@ -512,10 +516,13 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 
 }
 
-func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting string, logger logging.Logger, configuration *config.Config) {
-	var schema_name_conn string
+func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting string, logger logging.Logger, configuration *config.Config, state *u.ExplainCollectionState) {
 	var i int
-	var db *sql.DB
+
+	if state == nil {
+		state = u.NewExplainCollectionState()
+		defer state.Close()
+	}
 
 	pairs := make([][2]interface{}, 0, len(digests))
 	for k, v := range digests {
@@ -530,13 +537,14 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 
 	for _, p := range pairs {
 		k := p[0].(string)
-		if i > 100 {
+		if i >= 100 {
 			break
 		}
 		if digests[k]["query_text"].(string) == "" {
 			continue
 		}
-		if u.IsSchemaNameExclude(digests[k]["schema_name"].(string), configuration.DatabasesQueryOptimization) {
+		schemaName := digests[k]["schema_name"].(string)
+		if u.IsSchemaNameExclude(schemaName, configuration.DatabasesQueryOptimization) {
 			continue
 		}
 		if (strings.Contains(digests[k]["query_text"].(string), "SELECT") || strings.Contains(digests[k]["query_text"].(string), "select")) &&
@@ -547,10 +555,10 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 		if strings.Contains(digests[k]["query_text"].(string), "EXPLAIN FORMAT=JSON") {
 			continue
 		}
-		if digests[k]["schema_name"].(string) == "mysql" || digests[k]["schema_name"].(string) == "information_schema" ||
-			digests[k]["schema_name"].(string) == "performance_schema" || digests[k]["schema_name"].(string) == "NULL" ||
-			!(strings.Contains(digests[k]["query_text"].(string), "SELECT ") || strings.Contains(digests[k]["query_text"].(string), "select ")) ||
-			digests[k]["explain"] != nil {
+		if schemaName == "mysql" || schemaName == "information_schema" ||
+			schemaName == "performance_schema" || schemaName == "NULL" ||
+			!isMySQLExplainableStatement(digests[k]["query_text"].(string)) ||
+			digests[k]["explain"] != nil || digests[k]["explain_error"] != nil {
 			continue
 		}
 		if strings.HasSuffix(digests[k]["query_text"].(string), "...") {
@@ -560,13 +568,21 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 		if digests[k]["LAST_SEEN"].(float64) < float64(now-7*24*60*60) {
 			continue
 		}
-		if schema_name_conn != digests[k]["schema_name"].(string) {
-			if db != nil {
-				db.Close()
-			}
-			db = u.ConnectionDatabase(configuration, logger, digests[k]["schema_name"].(string))
-			defer db.Close()
-			schema_name_conn = digests[k]["schema_name"].(string)
+		if state.DatabaseFailed(schemaName) {
+			digests[k]["explain_error"] = u.ConnectionFailedExplainError(state.FailedReason(schemaName))
+			continue
+		}
+		if !state.TryBeginAttempt(k) {
+			continue
+		}
+
+		db, err := state.Connection(schemaName, func() (*sql.DB, error) {
+			return state.Connect(configuration, logger, schemaName)
+		})
+		if db == nil {
+			logger.Error("Connection to database failed: ", schemaName, " ", err)
+			digests[k]["explain_error"] = u.ConnectionFailedExplainError(state.FailedReason(schemaName))
+			continue
 		}
 		query_explain, err := ExecuteExplain(db, digests[k]["query_text"].(string), logger)
 		if err != nil {

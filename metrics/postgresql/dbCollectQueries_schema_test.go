@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
+	u "github.com/Releem/mysqlconfigurer/utils"
 	logging "github.com/google/logger"
 	"github.com/lib/pq"
 )
@@ -59,12 +59,14 @@ func TestPostgresqlExplainableStatementsMatchPostgresqlCommands(t *testing.T) {
 		"SELECT * FROM orders":                             true,
 		"  with recent AS (SELECT 1) SELECT * FROM recent": true,
 		"/* app=checkout */ SELECT * FROM orders":          true,
-		"-- trace\nUPDATE orders SET status = 'done'":      true,
+		"-- trace\nSELECT 1":                               true,
+		"-- trace\nUPDATE orders SET status = 'done'":      false,
 		"/* SELECT */ VACUUM orders":                       false,
-		"TABLE orders":                                     true,
-		"DELETE FROM orders WHERE id = 1":                  true,
-		"INSERT INTO orders(id) VALUES (1)":                true,
-		"UPDATE orders SET status = 'done'":                true,
+		"TABLE orders":                                     false,
+		"DELETE FROM orders WHERE id = 1":                  false,
+		"INSERT INTO orders(id) VALUES (1)":                false,
+		"UPDATE orders SET status = 'done'":                false,
+		"COPY orders TO STDOUT":                            false,
 		"EXPLAIN SELECT * FROM orders":                     false,
 		"PREPARE q AS SELECT * FROM orders":                false,
 		"VACUUM orders":                                    false,
@@ -99,9 +101,13 @@ func TestPostgresqlExplainCollectsIndependentSuccessfulQuotas(t *testing.T) {
 	details := make(map[string]PostgresQueryDetail, 205)
 	for i := 0; i < 205; i++ {
 		queryID := fmt.Sprintf("%03d", i)
+		query := "SELECT 1"
+		if i < 5 {
+			query = "SELECT 1 /*fail*/"
+		}
 		detail := PostgresQueryDetail{
 			PostgresQueryStats: PostgresQueryStats{Datname: "app", QueryID: queryID},
-			Query:              "SELECT 1",
+			Query:              query,
 		}
 		if i < 105 {
 			detail.TotalExecTimeUS = float64(205 - i)
@@ -111,21 +117,25 @@ func TestPostgresqlExplainCollectsIndependentSuccessfulQuotas(t *testing.T) {
 		details[pgDigestKey("app", queryID)] = detail
 	}
 
-	recorder := &pgExplainRecordingDriver{}
+	recorder := &pgExplainRecordingDriver{
+		explainHandler: func(query string) (driver.Rows, error) {
+			if strings.Contains(query, "/*fail*/") {
+				return nil, errors.New("expected explain failure")
+			}
+			return &pgExplainRows{
+				columns: []string{"QUERY PLAN"},
+				rows:    [][]driver.Value{{"{}"}},
+			}, nil
+		},
+	}
 	sql.Register("releem_pg_explain_success_quota_test", recorder)
 	db, err := sql.Open("releem_pg_explain_success_quota_test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := newPgExplainCollectionState()
-	defer state.close()
-	state.connect = func(*config.Config, logging.Logger, string) *sql.DB { return db }
-	state.executeExplain = func(_ *sql.DB, queryID, _ string, _ bool, _ logging.Logger) (string, error) {
-		if queryID < "005" {
-			return "", errors.New("expected explain failure")
-		}
-		return "{}", nil
-	}
+	state := u.NewExplainCollectionState()
+	defer state.Close()
+	state.Connect = func(*config.Config, logging.Logger, string) (*sql.DB, error) { return db, nil }
 
 	totalSuccesses := collectExplainDetails(details, "total_exec_time_us", true, logger, &config.Config{}, state)
 	meanSuccesses := collectExplainDetails(details, "mean_exec_time_us", true, logger, &config.Config{}, state)
@@ -145,15 +155,15 @@ func TestPostgresqlExplainCollectsIndependentSuccessfulQuotas(t *testing.T) {
 }
 
 func TestPostgresqlExplainAttemptsAreDeduplicatedOnlyWithinCollection(t *testing.T) {
-	first := newPgExplainCollectionState()
-	if !first.tryBeginAttempt("app\x0042") {
+	first := u.NewExplainCollectionState()
+	if !first.TryBeginAttempt("app\x0042") {
 		t.Fatalf("first EXPLAIN attempt should be allowed")
 	}
-	if first.tryBeginAttempt("app\x0042") {
+	if first.TryBeginAttempt("app\x0042") {
 		t.Fatalf("same query should not be attempted twice within one collection")
 	}
-	second := newPgExplainCollectionState()
-	if !second.tryBeginAttempt("app\x0042") {
+	second := u.NewExplainCollectionState()
+	if !second.TryBeginAttempt("app\x0042") {
 		t.Fatalf("a new payload collection must retry the query")
 	}
 }
@@ -176,45 +186,48 @@ func TestPostgresqlExplainCollectionStateKeepsOnlyCurrentDatabaseConnection(t *t
 		t.Fatal(err)
 	}
 
-	state := newPgExplainCollectionState()
+	state := u.NewExplainCollectionState()
 	opens := 0
 	dbs := map[string]*sql.DB{"db_a": dbA, "db_b": dbB}
-	connect := func() *sql.DB {
+	connect := func() (*sql.DB, error) {
 		opens++
-		return dbs[map[int]string{1: "db_a", 2: "db_b"}[opens]]
+		return dbs[map[int]string{1: "db_a", 2: "db_b"}[opens]], nil
 	}
 
-	state.connection("db_a", connect)
-	state.connection("db_b", connect)
+	state.Connection("db_a", connect)
+	state.Connection("db_b", connect)
 	if opens != 2 {
 		t.Fatalf("database switch should open the second handle, got %d opens", opens)
 	}
 	if err := dbA.Ping(); err == nil {
 		t.Fatalf("previous database handle must be closed when switching databases")
 	}
-	state.close()
+	state.Close()
 	if err := dbB.Ping(); err == nil {
 		t.Fatalf("current database handle must be closed with collection state")
 	}
 }
 
 func TestPostgresqlExplainCollectionStateCachesFailedDatabaseForCurrentCollection(t *testing.T) {
-	state := newPgExplainCollectionState()
+	state := u.NewExplainCollectionState()
 	attempts := 0
 
-	connect := func() *sql.DB {
+	connect := func() (*sql.DB, error) {
 		attempts++
-		return nil
+		return nil, errors.New("dial tcp: connection refused")
 	}
 
-	if db := state.connection("app", connect); db != nil {
-		t.Fatalf("failed connection should return nil")
+	if db, err := state.Connection("app", connect); db != nil || err == nil {
+		t.Fatalf("failed connection should return nil db and error")
 	}
-	if db := state.connection("app", connect); db != nil {
-		t.Fatalf("repeated failed connection should return nil")
+	if db, err := state.Connection("app", connect); db != nil || err == nil {
+		t.Fatalf("repeated failed connection should return nil db and error")
 	}
 	if attempts != 1 {
 		t.Fatalf("failed database should be attempted once per collection, got %d attempts", attempts)
+	}
+	if got := state.FailedReason("app"); got != "dial tcp: connection refused" {
+		t.Fatalf("FailedReason = %q, want dial error", got)
 	}
 }
 
@@ -238,8 +251,8 @@ func TestPostgresqlExplainPreservesOriginalQuotedIdentifiers(t *testing.T) {
 	if explains[0] != "EXPLAIN (FORMAT JSON) "+query {
 		t.Fatalf("EXPLAIN must preserve PostgreSQL quoted identifiers, got %q", explains[0])
 	}
-	if !recordedQueryContains(recorder.queries, `SET LOCAL search_path = "pg_catalog"`) {
-		t.Fatalf("direct EXPLAIN must use a catalog-only baseline search_path: %#v", recorder.queries)
+	if recordedQueryContains(recorder.queries, "search_path") {
+		t.Fatalf("direct EXPLAIN must not override search_path: %#v", recorder.queries)
 	}
 }
 
@@ -326,25 +339,25 @@ func TestPostgresqlParameterizedExplainCleansUpSessionAfterExplainError(t *testi
 	}
 }
 
-func TestPostgresqlParameterizedExplainLooksUpCandidateSchemas(t *testing.T) {
+func TestPostgresqlParameterizedExplainDoesNotRetryCandidateSchemas(t *testing.T) {
 	recorder := &pgExplainRecordingDriver{prepareError: fmt.Errorf(`pq: relation "orders" does not exist`)}
-	sql.Register("releem_pg_explain_prepared_no_search_path_test", recorder)
-	db, err := sql.Open("releem_pg_explain_prepared_no_search_path_test", "")
+	sql.Register("releem_pg_explain_prepared_no_schema_retry_test", recorder)
+	db, err := sql.Open("releem_pg_explain_prepared_no_schema_retry_test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	logger := *logging.Init("postgresql-explain-prepared-no-search-path-test", false, false, io.Discard)
+	logger := *logging.Init("postgresql-explain-prepared-no-schema-retry-test", false, false, io.Discard)
 	_, err = ExecuteExplain(db, "42", "SELECT * FROM orders WHERE id = $1", true, logger)
 	if err == nil || !strings.Contains(err.Error(), `relation "orders" does not exist`) {
 		t.Fatalf("original undefined relation error should be returned, got %v", err)
 	}
-	if !recordedQueryContains(recorder.queries, "FROM pg_namespace") {
-		t.Fatalf("undefined relations should trigger candidate schema lookup: %#v", recorder.queries)
+	if recordedQueryContains(recorder.queries, "FROM pg_namespace") {
+		t.Fatalf("undefined relations must not trigger candidate schema lookup: %#v", recorder.queries)
 	}
-	if !recordedQueryContains(recorder.queries, `SET search_path = "pg_catalog"`) {
-		t.Fatalf("prepared EXPLAIN must use a catalog-only baseline search_path: %#v", recorder.queries)
+	if recordedQueryContains(recorder.queries, "search_path") {
+		t.Fatalf("prepared EXPLAIN must not override search_path: %#v", recorder.queries)
 	}
 }
 
@@ -360,27 +373,25 @@ func TestPostgresqlExplainErrorClassificationUsesSQLState(t *testing.T) {
 	}
 }
 
-func TestPostgresqlExplainLooksUpCandidateSchemas(t *testing.T) {
+func TestPostgresqlExplainDoesNotRetryCandidateSchemas(t *testing.T) {
 	recorder := &pgExplainRecordingDriver{queryError: fmt.Errorf(`pq: relation "orders" does not exist`)}
-	sql.Register("releem_pg_explain_no_search_path_test", recorder)
-	db, err := sql.Open("releem_pg_explain_no_search_path_test", "")
+	sql.Register("releem_pg_explain_no_schema_retry_test", recorder)
+	db, err := sql.Open("releem_pg_explain_no_schema_retry_test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	logger := *logging.Init("postgresql-explain-no-search-path-test", false, false, io.Discard)
-	query := `SELECT "OrderID" FROM orders`
-	_, err = ExecuteExplain(db, "42", query, true, logger)
+	logger := *logging.Init("postgresql-explain-no-schema-retry-test", false, false, io.Discard)
+	_, err = ExecuteExplain(db, "42", `SELECT "OrderID" FROM orders`, true, logger)
 	if err == nil || !strings.Contains(err.Error(), `relation "orders" does not exist`) {
 		t.Fatalf("original undefined relation error should be returned, got %v", err)
 	}
-	explains := recorder.queriesWithPrefix("EXPLAIN (FORMAT JSON)")
-	if len(explains) != 1 || explains[0] != "EXPLAIN (FORMAT JSON) "+query {
-		t.Fatalf("EXPLAIN must execute the original statement exactly once: %#v", explains)
+	if recordedQueryContains(recorder.queries, "FROM pg_namespace") {
+		t.Fatalf("undefined relations must not trigger candidate schema lookup: %#v", recorder.queries)
 	}
-	if !recordedQueryContains(recorder.queries, "FROM pg_namespace") {
-		t.Fatalf("undefined relations should trigger candidate schema lookup: %#v", recorder.queries)
+	if recordedQueryContains(recorder.queries, "search_path") {
+		t.Fatalf("EXPLAIN must not override search_path: %#v", recorder.queries)
 	}
 }
 
@@ -393,43 +404,20 @@ func recordedQueryContains(queries []string, fragment string) bool {
 	return false
 }
 
-func TestPostgresqlExplainCandidateSchemasRequireUniqueSuccess(t *testing.T) {
-	attempted := []string{}
-	explain, err := resolvePgExplainCandidateSchemas([]string{"app", "archive"}, func(schema string) (string, error) {
-		attempted = append(attempted, schema)
-		if schema == "app" {
-			return `[{"Plan":{"Node Type":"Seq Scan"}}]`, nil
-		}
-		return "", fmt.Errorf(`pq: relation "orders" does not exist`)
-	})
-	if err != nil || explain == "" {
-		t.Fatalf("one successful schema should return its plan, got explain=%q err=%v", explain, err)
-	}
-	if !reflect.DeepEqual([]string{"app", "archive"}, attempted) {
-		t.Fatalf("all candidates must be checked for ambiguity, got %#v", attempted)
-	}
-
-	_, err = resolvePgExplainCandidateSchemas([]string{"app", "archive"}, func(string) (string, error) {
-		return `[{"Plan":{"Node Type":"Seq Scan"}}]`, nil
-	})
-	if err == nil || err.Error() != pgExplainAmbiguousSchemaError {
-		t.Fatalf("multiple successful schemas must fail deterministically, got %v", err)
-	}
-}
-
-func TestPostgresqlExplainSupportsMerge(t *testing.T) {
-	if !isPgExplainableStatement("MERGE INTO target USING source ON false WHEN NOT MATCHED THEN INSERT DEFAULT VALUES") {
-		t.Fatalf("PostgreSQL 15+ MERGE statements should be eligible for EXPLAIN")
+func TestPostgresqlExplainRejectsMerge(t *testing.T) {
+	if isPgExplainableStatement("MERGE INTO target USING source ON false WHEN NOT MATCHED THEN INSERT DEFAULT VALUES") {
+		t.Fatalf("MERGE must not be eligible for EXPLAIN")
 	}
 }
 
 type pgExplainRecordingDriver struct {
-	queries      []string
-	failPrepare  bool
-	prepareError error
-	queryError   error
-	queryRows    driver.Rows
-	closes       int
+	queries        []string
+	failPrepare    bool
+	prepareError   error
+	queryError     error
+	queryRows      driver.Rows
+	explainHandler func(query string) (driver.Rows, error)
+	closes         int
 }
 
 func (d *pgExplainRecordingDriver) Open(string) (driver.Conn, error) {
@@ -492,6 +480,11 @@ func (c *pgExplainRecordingConn) QueryContext(_ context.Context, query string, _
 			columns: []string{"coalesce"},
 			rows:    [][]driver.Value{{int64(1)}},
 		}, nil
+	}
+	if strings.HasPrefix(query, "EXPLAIN") {
+		if c.driver.explainHandler != nil {
+			return c.driver.explainHandler(query)
+		}
 	}
 	if c.driver.queryError != nil {
 		return nil, c.driver.queryError

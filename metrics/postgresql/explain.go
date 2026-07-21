@@ -9,7 +9,7 @@ import (
 	logging "github.com/google/logger"
 )
 
-func collectExplainDetails(details map[string]PostgresQueryDetail, fieldSorting string, supportsParameterizedExplain bool, logger logging.Logger, configuration *config.Config, state *pgExplainCollectionState) int {
+func collectExplainDetails(details map[string]PostgresQueryDetail, fieldSorting string, supportsParameterizedExplain bool, logger logging.Logger, configuration *config.Config, state *u.ExplainCollectionState) int {
 	keys := make([]string, 0, len(details))
 	for key := range details {
 		keys = append(keys, key)
@@ -32,25 +32,25 @@ func collectExplainDetails(details map[string]PostgresQueryDetail, fieldSorting 
 		if u.IsSchemaNameExclude(database, configuration.DatabasesQueryOptimization) {
 			continue
 		}
-		if state.databaseFailed(database) {
-			detail.ExplainError = "connection_failed"
+		if state.DatabaseFailed(database) {
+			detail.ExplainError = u.ConnectionFailedExplainError(state.FailedReason(database))
 			details[key] = detail
 			continue
 		}
-		if !state.tryBeginAttempt(pgDigestKey(database, detail.QueryID)) {
+		if !state.TryBeginAttempt(pgDigestKey(database, detail.QueryID)) {
 			continue
 		}
 
-		db := state.connection(database, func() *sql.DB {
-			return state.connect(configuration, logger, database)
+		db, err := state.Connection(database, func() (*sql.DB, error) {
+			return state.Connect(configuration, logger, database)
 		})
 		if db == nil {
-			logger.Error("Connection to database failed: ", database)
-			detail.ExplainError = "connection_failed"
+			logger.Error("Connection to database failed: ", database, " ", err)
+			detail.ExplainError = u.ConnectionFailedExplainError(state.FailedReason(database))
 			details[key] = detail
 			continue
 		}
-		explain, err := state.executeExplain(db, detail.QueryID, detail.Query, supportsParameterizedExplain, logger)
+		explain, err := ExecuteExplain(db, detail.QueryID, detail.Query, supportsParameterizedExplain, logger)
 		if err != nil {
 			detail.ExplainError = err.Error()
 		}
@@ -73,65 +73,3 @@ func postgresQueryDetailSortValue(detail PostgresQueryDetail, field string) floa
 }
 
 const maxPgExplainSuccessesPerRanking = 100
-
-type pgExplainCollectionState struct {
-	attempted       map[string]struct{}
-	database        string
-	db              *sql.DB
-	failedDatabases map[string]struct{}
-	connect         func(*config.Config, logging.Logger, string) *sql.DB
-	executeExplain  func(*sql.DB, string, string, bool, logging.Logger) (string, error)
-}
-
-func newPgExplainCollectionState() *pgExplainCollectionState {
-	return &pgExplainCollectionState{
-		attempted:      make(map[string]struct{}),
-		connect:        u.ConnectionDatabase,
-		executeExplain: ExecuteExplain,
-	}
-}
-
-func (state *pgExplainCollectionState) close() {
-	if state.db != nil {
-		_ = state.db.Close()
-	}
-	state.database = ""
-	state.db = nil
-}
-
-func (state *pgExplainCollectionState) tryBeginAttempt(cacheKey string) bool {
-	if cacheKey == "" {
-		return false
-	}
-	if _, exists := state.attempted[cacheKey]; exists {
-		return false
-	}
-	state.attempted[cacheKey] = struct{}{}
-	return true
-}
-
-func (state *pgExplainCollectionState) databaseFailed(database string) bool {
-	_, failed := state.failedDatabases[database]
-	return failed
-}
-
-func (state *pgExplainCollectionState) connection(database string, connect func() *sql.DB) *sql.DB {
-	if state.databaseFailed(database) {
-		return nil
-	}
-	if state.database == database && state.db != nil {
-		return state.db
-	}
-	state.close()
-	db := connect()
-	if db == nil {
-		if state.failedDatabases == nil {
-			state.failedDatabases = make(map[string]struct{})
-		}
-		state.failedDatabases[database] = struct{}{}
-		return nil
-	}
-	state.database = database
-	state.db = db
-	return state.db
-}

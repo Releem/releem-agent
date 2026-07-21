@@ -47,8 +47,8 @@ func (DBCollectQueriesOptimization *DBCollectQueriesOptimization) GetMetrics(met
 			outputDigest := postgresQueryDetailMap(statementRows)
 			if DBCollectQueriesOptimization.configuration.QueryOptimization {
 				func() {
-					explainState := newPgExplainCollectionState()
-					defer explainState.close()
+					explainState := u.NewExplainCollectionState()
+					defer explainState.Close()
 					collectExplainDetails(outputDigest, "total_exec_time_us", capabilitySnapshot.SupportsPlanCacheMode, DBCollectQueriesOptimization.logger, DBCollectQueriesOptimization.configuration, explainState)
 					collectExplainDetails(outputDigest, "mean_exec_time_us", capabilitySnapshot.SupportsPlanCacheMode, DBCollectQueriesOptimization.logger, DBCollectQueriesOptimization.configuration, explainState)
 				}()

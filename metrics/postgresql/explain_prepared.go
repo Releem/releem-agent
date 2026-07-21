@@ -8,10 +8,6 @@ import (
 )
 
 func executePreparedExplain(db *sql.DB, queryId string, queryText string) (explain string, returnErr error) {
-	return executePreparedExplainInSchema(db, queryId, queryText, pgExplainBaselineSchema)
-}
-
-func executePreparedExplainInSchema(db *sql.DB, queryId string, queryText string, schema string) (explain string, returnErr error) {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -29,16 +25,7 @@ func executePreparedExplainInSchema(db *sql.DB, queryId string, queryText string
 			returnErr = fmt.Errorf("reset plan_cache_mode: %w", err)
 		}
 	}()
-	if schema != "" {
-		if _, err = conn.ExecContext(ctx, "SET search_path = "+quotePgIdentifier(schema)); err != nil {
-			return "", err
-		}
-		defer func() {
-			if _, err := conn.ExecContext(ctx, "RESET search_path"); err != nil && returnErr == nil {
-				returnErr = fmt.Errorf("reset search_path: %w", err)
-			}
-		}()
-	}
+
 	query := fmt.Sprintf("PREPARE %s AS %s", stmtName, normalizePgStatStatementsTypedParameters(queryText))
 	if _, err = conn.ExecContext(ctx, query); err != nil {
 		return "", err
@@ -59,7 +46,6 @@ func executePreparedExplainInSchema(db *sql.DB, queryId string, queryText string
 		nullParams := strings.TrimRight(strings.Repeat("NULL,", paramsCount), ",")
 		executeQuery += "(" + nullParams + ")"
 	}
-
 	if err = conn.QueryRowContext(ctx, executeQuery).Scan(&explain); err != nil {
 		return "", err
 	}

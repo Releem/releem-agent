@@ -16,7 +16,7 @@ For PostgreSQL 12 and 13, the installer connects to each database, queries its u
 - `GRANT SELECT ON ALL TABLES IN SCHEMA`
 - `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA`
 
-The PostgreSQL 12/13 path grants access only to objects that exist when the installer runs. It does not configure default privileges for future objects. The existing warning to rerun the installer after adding schemas or objects remains.
+The PostgreSQL 12/13 path grants access only to objects that exist when the installer runs. It does not configure default privileges for future objects. After grants complete on all supported versions, the installer warns to rerun after adding schemas or objects so grants and search_path stay current.
 
 ## Safety
 
@@ -38,3 +38,11 @@ Bats tests verify that:
 - failures propagate from the function.
 
 Live tests use PostgreSQL 12 and 14 containers to verify effective privileges for the monitoring role.
+
+## search_path
+
+After grants, the installer sets per-database role defaults:
+
+`ALTER ROLE "<role>" IN DATABASE "<db>" SET search_path TO "$user", public, <user schemas…>;`
+
+This lets EXPLAIN resolve unqualified names without runtime schema retries. Rerun the installer after adding schemas.

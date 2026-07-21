@@ -12,6 +12,7 @@ import (
 
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
+	u "github.com/Releem/mysqlconfigurer/utils"
 	logging "github.com/google/logger"
 )
 
@@ -471,8 +472,8 @@ func TestPostgresSchemaSectionsKeepSuccessfulSectionsAroundFailure(t *testing.T)
 	if len(metrics.DB.DatabaseSchema["information_schema_tables"]) != 1 {
 		t.Fatalf("a successful section before a failure must remain available: %#v", metrics.DB.DatabaseSchema)
 	}
-	if _, ok := metrics.DB.DatabaseSchema["information_schema_indexes"]; ok {
-		t.Fatalf("rows from a failed section must not be published: %#v", metrics.DB.DatabaseSchema)
+	if rows, ok := metrics.DB.DatabaseSchema["information_schema_indexes"]; ok {
+		t.Fatalf("a failed section must not be added to DatabaseSchema (including partial rows): %#v", rows)
 	}
 	if len(metrics.DB.DatabaseSchema["information_schema_columns"]) != 1 {
 		t.Fatalf("a successful section after a failure must remain available: %#v", metrics.DB.DatabaseSchema)
@@ -510,7 +511,7 @@ func TestPostgresSchemaSectionsAppendRowsAcrossDatabases(t *testing.T) {
 	}
 }
 
-func TestPostgresSchemaSectionsOmitSuccessfulEmptySection(t *testing.T) {
+func TestPostgresSchemaSectionsPublishSuccessfulEmptySection(t *testing.T) {
 	logger := *logging.Init("postgres-schema-empty-section-test", false, false, io.Discard)
 	defer logger.Close()
 	metrics := &models.Metrics{}
@@ -524,8 +525,8 @@ func TestPostgresSchemaSectionsOmitSuccessfulEmptySection(t *testing.T) {
 	}
 
 	collectPostgresSchemaSections(context.Background(), nil, "app", 140000, logger, metrics, collectors)
-	if _, ok := metrics.DB.DatabaseSchema["information_schema_indexes"]; ok {
-		t.Fatalf("a successful empty section must be omitted: %#v", metrics.DB.DatabaseSchema)
+	if rows, ok := metrics.DB.DatabaseSchema["information_schema_indexes"]; !ok || len(rows) != 0 {
+		t.Fatalf("a successful empty section must be published explicitly: %#v", metrics.DB.DatabaseSchema)
 	}
 }
 
@@ -551,8 +552,8 @@ func TestCollectExplainDetailsUsesTypedQueryText(t *testing.T) {
 			Query:              "VACUUM orders",
 		},
 	}
-	state := newPgExplainCollectionState()
-	defer state.close()
+	state := u.NewExplainCollectionState()
+	defer state.Close()
 
 	collectExplainDetails(details, "total_exec_time_us", true, logger, &config.Config{}, state)
 	if got := details[pgDigestKey("app", "42")]; got.Query != "VACUUM orders" || got.Explain != "" || got.ExplainError != "" {
@@ -569,6 +570,8 @@ func TestStructuredIndexQueryAggregatesKeysAndIncludeColumns(t *testing.T) {
 		"'expression'",
 		"'opclass'",
 		"'collation'",
+		"'opclass_schema'",
+		"'collation_schema'",
 		"'opclass_is_default'",
 		"'collation_is_default'",
 		"'descending'",
