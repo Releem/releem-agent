@@ -26,7 +26,7 @@ func collectExplainDetails(details map[string]PostgresQueryDetail, fieldSorting 
 		detail := details[key]
 		database := detail.Datname
 		if database == "template0" || database == "template1" || database == "NULL" ||
-			!isPgExplainableStatement(detail.Query) || detail.Explain != "" || detail.ExplainError != "" {
+			!isPgExplainableStatement(detail.Query) {
 			continue
 		}
 		if u.IsSchemaNameExclude(database, configuration.DatabasesQueryOptimization) {

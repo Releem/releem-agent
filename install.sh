@@ -519,11 +519,13 @@ function read_postgresql_root_catalog() {
 
 function postgresql_user_schema_search_path() {
     local quoted_schemas=("$@")
-    local search_path='"$user", public'
-    local quoted_schema
+    local quoted_user_placeholder quoted_public search_path quoted_schema
+    quoted_user_placeholder=$(quote_postgresql_identifier '$user')
+    quoted_public=$(quote_postgresql_identifier public)
+    search_path="${quoted_user_placeholder}, ${quoted_public}"
     for quoted_schema in "${quoted_schemas[@]}"; do
         [ -z "${quoted_schema}" ] && continue
-        if [ "${quoted_schema}" = '"public"' ]; then
+        if [ "${quoted_schema}" = "${quoted_public}" ]; then
             continue
         fi
         search_path="${search_path}, ${quoted_schema}"
@@ -730,22 +732,43 @@ function create_or_update_postgresql_monitoring_role() {
     local monitoring_role="$2"
     local monitoring_password="$3"
     local quoted_monitoring_role
+    local hba_file
+    local hba_auth_method
+    local password_encryption
     local safe_monitoring_password
     local quoted_monitoring_password
 
     quoted_monitoring_role=$(quote_postgresql_identifier "${monitoring_role}")
     safe_monitoring_password=$(printf "%s" "${monitoring_password}" | sed "s/'/''/g")
     quoted_monitoring_password="'${safe_monitoring_password}'"
+    hba_file="$(postgresql_root_exec "${pg_superuser}" -tAc "SHOW hba_file;" | tr -d '\r\n')"
+    if [ -n "${hba_file}" ] && [ -r "${hba_file}" ]; then
+        hba_auth_method=$(awk '$1=="host" && $2=="all" && $3=="all" && $4=="127.0.0.1/32" {print $5; exit}' "${hba_file}" 2>/dev/null || true)
+    else
+        hba_auth_method=''
+    fi
+    case "${hba_auth_method}" in
+        scram-*)
+            password_encryption='scram-sha-256'
+            ;;
+        *)
+            password_encryption=''
+            ;;
+    esac
 
-    if postgresql_root_exec "${pg_superuser}" -v role_name="${monitoring_role}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = :'role_name';" 2>/dev/null | grep -q "1"; then
-        postgresql_root_exec_stdin "${pg_superuser}" -v role_password="${monitoring_password}" <<EOF
-ALTER USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};
-EOF
+    if postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = ${quoted_monitoring_role};" 2>/dev/null | grep -q "1"; then
+        if [ -n "${password_encryption:-}" ]; then
+            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+        else
+            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+        fi
         printf "\033[32m   Updated password for existing PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     else
-        postgresql_root_exec_stdin "${pg_superuser}" -v role_password="${monitoring_password}" <<EOF
-CREATE USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};
-EOF
+        if [ -n "${password_encryption:-}" ]; then
+            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; CREATE USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+        else
+            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "CREATE USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+        fi
         printf "\033[32m   Created new PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     fi
 

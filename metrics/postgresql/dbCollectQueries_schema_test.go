@@ -153,6 +153,89 @@ func TestPostgresqlExplainCollectsIndependentSuccessfulQuotas(t *testing.T) {
 	}
 }
 
+func TestPostgresqlExplainCollectsPerRankingSuccessLimitForOverlappingQueries(t *testing.T) {
+	logger := *logging.Init("postgresql-explain-overlapping-quota-test", false, false, io.Discard)
+	defer logger.Close()
+
+	base := make(map[string]PostgresQueryDetail, 180)
+	for i := 0; i < 180; i++ {
+		queryID := fmt.Sprintf("%03d", i)
+		detail := PostgresQueryDetail{
+			PostgresQueryStats: PostgresQueryStats{Datname: "app", QueryID: queryID, TotalExecTimeUS: float64(1000 - i), MeanExecTimeUS: float64(2000 - i)},
+			Query:              "SELECT 1",
+		}
+		base[pgDigestKey("app", queryID)] = detail
+	}
+
+	copyDetailMap := func(src map[string]PostgresQueryDetail) map[string]PostgresQueryDetail {
+		copied := make(map[string]PostgresQueryDetail, len(src))
+		for k, v := range src {
+			copied[k] = v
+		}
+		return copied
+	}
+
+	firstPassDetails := copyDetailMap(base)
+	secondPassDetails := copyDetailMap(base)
+
+	recorder := &pgExplainRecordingDriver{
+		explainHandler: func(query string) (driver.Rows, error) {
+			return &pgExplainRows{columns: []string{"QUERY PLAN"}, rows: [][]driver.Value{{"{}"}}}, nil
+		},
+	}
+	sql.Register("releem_pg_explain_overlapping_quota_test", recorder)
+	db, err := sql.Open("releem_pg_explain_overlapping_quota_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	state := u.NewExplainCollectionState()
+	defer state.Close()
+	state.Connect = func(*config.Config, logging.Logger, string) (*sql.DB, error) { return db, nil }
+
+	totalSuccesses := collectExplainDetails(firstPassDetails, "total_exec_time_us", true, logger, &config.Config{}, state)
+	if totalSuccesses != 100 {
+		t.Fatalf("expected 100 total successes, got %d", totalSuccesses)
+	}
+	meanSuccesses := collectExplainDetails(firstPassDetails, "mean_exec_time_us", true, logger, &config.Config{}, state)
+	if meanSuccesses != 80 {
+		t.Fatalf("expected 80 mean successes with overlapping attempts in a single state, got %d", meanSuccesses)
+	}
+
+	explainCount := 0
+	for _, query := range recorder.queries {
+		if strings.HasPrefix(query, "EXPLAIN") {
+			explainCount++
+		}
+	}
+	if explainCount != 180 {
+		t.Fatalf("expected 180 explain attempts with overlap in a single state, got %d", explainCount)
+	}
+
+	perRankingStateTotal := u.NewExplainCollectionState()
+	perRankingStateMean := u.NewExplainCollectionState()
+	perRankingStateTotal.Connect = func(*config.Config, logging.Logger, string) (*sql.DB, error) { return db, nil }
+	perRankingStateMean.Connect = func(*config.Config, logging.Logger, string) (*sql.DB, error) { return db, nil }
+	stateTotals := copyDetailMap(secondPassDetails)
+	stateMeans := copyDetailMap(secondPassDetails)
+
+	recorder.queries = nil
+	perTotal := collectExplainDetails(stateTotals, "total_exec_time_us", true, logger, &config.Config{}, perRankingStateTotal)
+	perMean := collectExplainDetails(stateMeans, "mean_exec_time_us", true, logger, &config.Config{}, perRankingStateMean)
+	if perTotal != 100 || perMean != 100 {
+		t.Fatalf("expected per-ranking limits: total=%d mean=%d", perTotal, perMean)
+	}
+	perExplainCount := 0
+	for _, query := range recorder.queries {
+		if strings.HasPrefix(query, "EXPLAIN") {
+			perExplainCount++
+		}
+	}
+	if perExplainCount < 180 {
+		t.Fatalf("expected at least 180 explain statements for separate per-ranking states, got %d", perExplainCount)
+	}
+}
+
 func TestPostgresqlExplainAttemptsAreDeduplicatedOnlyWithinCollection(t *testing.T) {
 	first := u.NewExplainCollectionState()
 	if !first.TryBeginAttempt("app\x0042") {
@@ -271,6 +354,44 @@ func TestPostgresqlParameterizedExplainDoesNotFallBackToDirectExplain(t *testing
 	}
 	if explains := recorder.queriesWithPrefix("EXPLAIN (FORMAT JSON) SELECT"); len(explains) != 0 {
 		t.Fatalf("parameterized query must not fall back to direct EXPLAIN: %#v", explains)
+	}
+}
+
+func TestPostgresqlParameterizedExplainFallsBackForIndeterminateParameterType(t *testing.T) {
+	recorder := &pgExplainRecordingDriver{
+		prepareError: errors.New("pq: could not determine data type of parameter $1"),
+		explainHandler: func(query string) (driver.Rows, error) {
+			if strings.HasPrefix(query, "EXPLAIN") {
+				return &pgExplainRows{
+					columns: []string{"QUERY PLAN"},
+					rows:    [][]driver.Value{{"{}"}},
+				}, nil
+			}
+			return nil, errors.New("unexpected explain query")
+		},
+	}
+	sql.Register("releem_pg_explain_prepared_type_error_test", recorder)
+	db, err := sql.Open("releem_pg_explain_prepared_type_error_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	logger := *logging.Init("postgresql-explain-prepared-fallback-test", false, false, io.Discard)
+	explain, err := ExecuteExplain(db, "42", "SELECT * FROM orders WHERE id = $1", true, logger)
+	if err != nil {
+		t.Fatalf("expected successful fallback EXPLAIN, got %v", err)
+	}
+	if explain == "" {
+		t.Fatalf("expected non-empty explain from fallback")
+	}
+
+	explains := recorder.queriesWithPrefix("EXPLAIN (FORMAT JSON) SELECT")
+	if len(explains) != 1 {
+		t.Fatalf("expected one fallback EXPLAIN query, got %#v", explains)
+	}
+	if !strings.Contains(explains[0], "WHERE id = NULL") {
+		t.Fatalf("expected parameter placeholder replaced with NULL, got %q", explains[0])
 	}
 }
 

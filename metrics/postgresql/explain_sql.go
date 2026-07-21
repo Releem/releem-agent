@@ -12,6 +12,9 @@ import (
 )
 
 func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParameterizedExplain bool, logger logging.Logger) (string, error) {
+	var explain string
+	var err error
+
 	if db == nil {
 		return "", fmt.Errorf("database connection is nil")
 	}
@@ -23,22 +26,35 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 		if !supportsParameterizedExplain {
 			return "", fmt.Errorf("parameterized EXPLAIN requires PostgreSQL 12 or newer")
 		}
-		explain, err := executePreparedExplain(db, queryId, queryText)
-		if err != nil {
-			logger.Error("Explain prepared statement error: ", err)
+		explain, err = executePreparedExplain(db, queryId, queryText)
+		if err == nil {
+			return explain, nil
+		}
+
+		logger.Error("Explain prepared statement error: ", err)
+		if isExplainPermissionError(err) {
+			return explain, errors.New("need_grant_permission")
+		}
+		if shouldRetryExplainWithoutPrepare(err) {
+			logger.Info("Retrying explain without prepare")
+			explain, err = executeDirectExplainWithFallbackParameters(db, queryText)
+			if err == nil {
+				return explain, nil
+			}
+			logger.Error("Fallback direct EXPLAIN for parameterized query failed: ", err)
 			if isExplainPermissionError(err) {
 				return explain, errors.New("need_grant_permission")
 			}
 		}
 		return explain, err
 	}
+	logger.Info("Execute direct explain")
 
-	var explain string
-	err := executeDirectExplain(db, queryText, &explain)
+	err = executeDirectExplain(db, queryText, &explain)
 	if err == nil {
 		return explain, nil
 	}
-	logger.Error("Explain Error: ", err)
+	logger.Error("Direct explain error: ", err)
 	if isExplainPermissionError(err) {
 		return explain, errors.New("need_grant_permission")
 	}

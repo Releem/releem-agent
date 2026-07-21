@@ -485,9 +485,7 @@ exit 0
         ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" "${role}" "${password}"
 
     [ "$status" -eq 0 ]
-    run grep -F -- "arg=role_name=${role}" "${TEST_TMPDIR}/pg.args"
-    [ "$status" -eq 0 ]
-    run grep -F -- "arg=SELECT 1 FROM pg_roles WHERE rolname = :'role_name';" "${TEST_TMPDIR}/pg.args"
+    run grep -F -- 'arg=SELECT 1 FROM pg_roles WHERE rolname = "role""reader";' "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
     run grep -F -- "arg=role_password=${password}" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
@@ -535,9 +533,7 @@ exit 0
         ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" "${role}" "${password}"
 
     [ "$status" -eq 0 ]
-    run grep -F -- "arg=role_name=${role}" "${TEST_TMPDIR}/pg.args"
-    [ "$status" -eq 0 ]
-    run grep -F -- "arg=SELECT 1 FROM pg_roles WHERE rolname = :'role_name';" "${TEST_TMPDIR}/pg.args"
+    run grep -F -- 'arg=SELECT 1 FROM pg_roles WHERE rolname = "new""reader";' "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
     run grep -F -- "arg=role_password=${password}" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
@@ -752,7 +748,7 @@ exit 0
         'GRANT USAGE ON SCHEMA "Sales Data" TO "releem";' \
         'GRANT SELECT ON ALL TABLES IN SCHEMA "Sales Data" TO "releem";' \
         'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "Sales Data" TO "releem";' \
-        'ALTER ROLE "releem" IN DATABASE "postgres" SET search_path TO "$user", public, "app", "Sales Data";' \
+        'ALTER ROLE "releem" IN DATABASE "postgres" SET search_path TO "$user", "public", "app", "Sales Data";' \
         "${schema_catalog_sql}" \
         'GRANT USAGE ON SCHEMA "app" TO "releem";' \
         'GRANT SELECT ON ALL TABLES IN SCHEMA "app" TO "releem";' \
@@ -760,7 +756,7 @@ exit 0
         'GRANT USAGE ON SCHEMA "Sales Data" TO "releem";' \
         'GRANT SELECT ON ALL TABLES IN SCHEMA "Sales Data" TO "releem";' \
         'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "Sales Data" TO "releem";' \
-        'ALTER ROLE "releem" IN DATABASE "shop" SET search_path TO "$user", public, "app", "Sales Data";'
+        'ALTER ROLE "releem" IN DATABASE "shop" SET search_path TO "$user", "public", "app", "Sales Data";'
     [ "$status" -eq 0 ]
 
     [[ "$grant_output" == *"Rerun the installer after adding PostgreSQL schemas or objects so grants and search_path stay current"* ]]
@@ -778,6 +774,16 @@ exit 0
 
     [ "$status" -eq 0 ]
     [ "$output" = $'"role""reader"\n"shop""db"\n"Sales ""Data"""' ]
+}
+
+@test "postgresql_user_schema_search_path quotes user placeholder and public via quote_postgresql_identifier" {
+    run bash -c '
+        RELEEM_TEST_MODE=1 source "$1"
+        postgresql_user_schema_search_path "$(quote_postgresql_identifier public)" "$(quote_postgresql_identifier app)" "$(quote_postgresql_identifier '"'"'Sales Data'"'"')"
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = '"$user", "public", "app", "Sales Data"' ]
 }
 
 @test "create_postgresql_user prompts for root password when env is unset and passwordless root fails" {
@@ -1412,9 +1418,9 @@ exit 44
         'GRANT CONNECT ON DATABASE "shop" TO "collector-ro";' \
         'GRANT pg_read_all_data TO "collector-ro";' \
         "${schema_catalog_sql}" \
-        'ALTER ROLE "collector-ro" IN DATABASE "postgres" SET search_path TO "$user", public;' \
+        'ALTER ROLE "collector-ro" IN DATABASE "postgres" SET search_path TO "$user", "public";' \
         "${schema_catalog_sql}" \
-        'ALTER ROLE "collector-ro" IN DATABASE "shop" SET search_path TO "$user", public;'
+        'ALTER ROLE "collector-ro" IN DATABASE "shop" SET search_path TO "$user", "public";'
     [ "$status" -eq 0 ]
     [ ! -s "${mysql_args}" ]
     run grep -E "^query_optimization=true$" "${conf}"
@@ -1731,7 +1737,7 @@ exit 0
     [ "$status" -eq 0 ]
     [[ "$output" == *'GRANT CONNECT ON DATABASE "postgres" TO "releem";'* ]]
     [[ "$output" == *'GRANT pg_read_all_data TO "releem";'* ]]
-    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "postgres" SET search_path TO "$user", public, "app";'* ]]
+    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "postgres" SET search_path TO "$user", "public", "app";'* ]]
 }
 
 @test "postgresql query optimization sets per-database search_path for pg14" {
@@ -1751,7 +1757,7 @@ exit 0
 
     [ "$status" -eq 0 ]
     [[ "$output" == *'GRANT pg_read_all_data TO "releem";'* ]]
-    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "appdb" SET search_path TO "$user", public, "app", "analytics";'* ]]
+    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "appdb" SET search_path TO "$user", "public", "app", "analytics";'* ]]
 }
 
 @test "postgresql query optimization sets search_path with only defaults when no user schemas" {
@@ -1770,7 +1776,7 @@ exit 0
     ' _ "${INSTALL_SH}"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "postgres" SET search_path TO "$user", public;'* ]]
+    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "postgres" SET search_path TO "$user", "public";'* ]]
 }
 
 @test "postgresql query optimization sets search_path for pg12 after schema grants" {
@@ -1790,7 +1796,7 @@ exit 0
 
     [ "$status" -eq 0 ]
     [[ "$output" == *'GRANT USAGE ON SCHEMA "sales" TO "releem";'* ]]
-    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "shop" SET search_path TO "$user", public, "sales";'* ]]
+    [[ "$output" == *'ALTER ROLE "releem" IN DATABASE "shop" SET search_path TO "$user", "public", "sales";'* ]]
 }
 
 @test "postgresql database catalog failure stops before grants" {
