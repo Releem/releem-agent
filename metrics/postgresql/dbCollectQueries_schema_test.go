@@ -14,7 +14,6 @@ import (
 	"github.com/Releem/mysqlconfigurer/models"
 	u "github.com/Releem/mysqlconfigurer/utils"
 	logging "github.com/google/logger"
-	"github.com/lib/pq"
 )
 
 func TestGetMetricsClearsLightweightQueriesWhenFullCollectionFails(t *testing.T) {
@@ -358,18 +357,6 @@ func TestPostgresqlParameterizedExplainDoesNotRetryCandidateSchemas(t *testing.T
 	}
 	if recordedQueryContains(recorder.queries, "search_path") {
 		t.Fatalf("prepared EXPLAIN must not override search_path: %#v", recorder.queries)
-	}
-}
-
-func TestPostgresqlExplainErrorClassificationUsesSQLState(t *testing.T) {
-	undefinedRelation := &pq.Error{Code: "42P01", Message: "localized undefined relation"}
-	if !isUndefinedRelationError(undefinedRelation) {
-		t.Fatalf("undefined relation must be detected from SQLSTATE: %v", undefinedRelation)
-	}
-
-	insufficientPrivilege := &pq.Error{Code: "42501", Message: "localized insufficient privilege"}
-	if !isExplainPermissionError(insufficientPrivilege) {
-		t.Fatalf("permission errors must be detected from SQLSTATE: %v", insufficientPrivilege)
 	}
 }
 

@@ -730,17 +730,21 @@ function create_or_update_postgresql_monitoring_role() {
     local monitoring_role="$2"
     local monitoring_password="$3"
     local quoted_monitoring_role
+    local safe_monitoring_password
+    local quoted_monitoring_password
 
     quoted_monitoring_role=$(quote_postgresql_identifier "${monitoring_role}")
+    safe_monitoring_password=$(printf "%s" "${monitoring_password}" | sed "s/'/''/g")
+    quoted_monitoring_password="'${safe_monitoring_password}'"
 
     if postgresql_root_exec "${pg_superuser}" -v role_name="${monitoring_role}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = :'role_name';" 2>/dev/null | grep -q "1"; then
         postgresql_root_exec_stdin "${pg_superuser}" -v role_password="${monitoring_password}" <<EOF
-ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';
+ALTER USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};
 EOF
         printf "\033[32m   Updated password for existing PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     else
         postgresql_root_exec_stdin "${pg_superuser}" -v role_password="${monitoring_password}" <<EOF
-CREATE USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';
+CREATE USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};
 EOF
         printf "\033[32m   Created new PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     fi

@@ -252,9 +252,6 @@ func CollectDbSchema(configuration *config.Config, logger logging.Logger, databa
 		}
 	}
 	defer db.Close()
-	if db == nil {
-		return fmt.Errorf("database connection is nil for %s", database)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	serverVersionNum := 120000

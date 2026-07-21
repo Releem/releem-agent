@@ -55,17 +55,6 @@ func executeDirectExplain(db *sql.DB, queryText string, explain *string) error {
 	return tx.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+queryText).Scan(explain)
 }
 
-func isUndefinedRelationError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if hasPgErrorCode(err, "42P01") {
-		return true
-	}
-	errText := strings.ToLower(err.Error())
-	return strings.Contains(errText, "relation") && strings.Contains(errText, "does not exist")
-}
-
 func isPgExplainableStatement(queryText string) bool {
 	switch pgLeadingCommand(queryText) {
 	case "select", "with":
