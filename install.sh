@@ -764,18 +764,18 @@ function create_or_update_postgresql_monitoring_role() {
             ;;
     esac
 
-    if postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = ${quoted_monitoring_role_literal};" 2>/dev/null | grep -q "1"; then
+    if postgresql_root_exec "${pg_superuser}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = ${quoted_monitoring_role_literal};" 2>/dev/null | grep -q "1"; then
         if [ -n "${password_encryption:-}" ]; then
-            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; ALTER USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
         else
-            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "ALTER USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
         fi
         printf "\033[32m   Updated password for existing PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     else
         if [ -n "${password_encryption:-}" ]; then
-            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; CREATE USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; CREATE USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
         else
-            postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "CREATE USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "CREATE USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
         fi
         printf "\033[32m   Created new PostgreSQL user \`${monitoring_role}\`\033[0m\n"
     fi

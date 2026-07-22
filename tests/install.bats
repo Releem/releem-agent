@@ -487,10 +487,11 @@ exit 0
     [ "$status" -eq 0 ]
     run grep -F -- "arg=SELECT 1 FROM pg_roles WHERE rolname = 'role\"reader';" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
-    run grep -F -- "arg=role_password=${password}" "${TEST_TMPDIR}/pg.args"
+    expected_escaped_password="$(printf "%s" "${password}" | sed "s/'/''/g")"
+    run grep -F -- "sql=ALTER USER \"role\"\"reader\" WITH PASSWORD " "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
-    run grep -F -- 'sql=ALTER USER "role""reader" WITH PASSWORD :'"'"'role_password'"'"';' "${TEST_TMPDIR}/pg.args"
-    [ "$status" -eq 0 ]
+    run grep -F -- "sql=CREATE USER \"role\"\"reader\" WITH PASSWORD '${expected_escaped_password}';" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
     for grant in \
         'GRANT pg_monitor TO "role""reader";' \
         'GRANT SELECT ON pg_hba_file_rules TO "role""reader";' \
@@ -498,10 +499,6 @@ exit 0
         run grep -F -- "arg=${grant}" "${TEST_TMPDIR}/pg.args"
         [ "$status" -eq 0 ]
     done
-    run grep -F -- "WITH PASSWORD '${password}'" "${TEST_TMPDIR}/pg.args"
-    [ "$status" -ne 0 ]
-    run grep -F -- "CREATE USER" "${TEST_TMPDIR}/pg.args"
-    [ "$status" -ne 0 ]
 }
 
 @test "postgresql role CREATE boundary quotes identifier and binds exact password" {
@@ -535,10 +532,13 @@ exit 0
     [ "$status" -eq 0 ]
     run grep -F -- "arg=SELECT 1 FROM pg_roles WHERE rolname = 'new\"reader';" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
-    run grep -F -- "arg=role_password=${password}" "${TEST_TMPDIR}/pg.args"
+    expected_escaped_password="$(printf "%s" "${password}" | sed "s/'/''/g")"
+    run grep -F -- "sql=CREATE USER \"new\"\"reader\" WITH PASSWORD " "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
-    run grep -F -- 'sql=CREATE USER "new""reader" WITH PASSWORD :'"'"'role_password'"'"';' "${TEST_TMPDIR}/pg.args"
+    run grep -F -- "sql=CREATE USER \"new\"\"reader\" WITH PASSWORD '${expected_escaped_password}';" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
+    run grep -F -- "sql=ALTER USER \"new\"\"reader\" WITH PASSWORD '${expected_escaped_password}';" "${TEST_TMPDIR}/pg.args"
+    [ "$status" -ne 0 ]
     for grant in \
         'GRANT pg_monitor TO "new""reader";' \
         'GRANT SELECT ON pg_hba_file_rules TO "new""reader";' \
@@ -546,8 +546,6 @@ exit 0
         run grep -F -- "arg=${grant}" "${TEST_TMPDIR}/pg.args"
         [ "$status" -eq 0 ]
     done
-    run grep -F -- "WITH PASSWORD '${password}'" "${TEST_TMPDIR}/pg.args"
-    [ "$status" -ne 0 ]
     run grep -F -- "ALTER USER" "${TEST_TMPDIR}/pg.args"
     [ "$status" -ne 0 ]
 }
