@@ -56,7 +56,7 @@ func collectExplainDetails(details map[string]PostgresQueryDetail, fieldSorting 
 		}
 		if explain != "" {
 			detail.Explain = explain
-			logger.Info(successful, " OK")
+			logger.V(5).Info(successful, " OK")
 			successful++
 		}
 		details[key] = detail

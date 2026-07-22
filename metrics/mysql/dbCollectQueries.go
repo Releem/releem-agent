@@ -517,7 +517,7 @@ func CollectDbSchema(database string, logger logging.Logger, metrics *models.Met
 }
 
 func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting string, logger logging.Logger, configuration *config.Config, state *u.ExplainCollectionState) {
-	var i int
+	var successful int
 
 	if state == nil {
 		state = u.NewExplainCollectionState()
@@ -537,7 +537,7 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 
 	for _, p := range pairs {
 		k := p[0].(string)
-		if i >= 100 {
+		if successful >= 100 {
 			break
 		}
 		if digests[k]["query_text"].(string) == "" {
@@ -589,9 +589,9 @@ func CollectExplain(digests map[string]models.MetricGroupValue, field_sorting st
 			digests[k]["explain_error"] = err.Error()
 		}
 		if query_explain != "" {
-			logger.V(5).Info(i, " OK")
+			logger.V(5).Info(successful, " OK")
 			digests[k]["explain"] = query_explain
-			i = i + 1
+			successful = successful + 1
 		}
 	}
 }
