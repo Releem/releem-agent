@@ -485,7 +485,7 @@ exit 0
         ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" "${role}" "${password}"
 
     [ "$status" -eq 0 ]
-    run grep -F -- 'arg=SELECT 1 FROM pg_roles WHERE rolname = "role""reader";' "${TEST_TMPDIR}/pg.args"
+    run grep -F -- "arg=SELECT 1 FROM pg_roles WHERE rolname = 'role\"reader';" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
     run grep -F -- "arg=role_password=${password}" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
@@ -533,7 +533,7 @@ exit 0
         ' _ "${INSTALL_SH}" "${MOCK_BIN}/psql" "${role}" "${password}"
 
     [ "$status" -eq 0 ]
-    run grep -F -- 'arg=SELECT 1 FROM pg_roles WHERE rolname = "new""reader";' "${TEST_TMPDIR}/pg.args"
+    run grep -F -- "arg=SELECT 1 FROM pg_roles WHERE rolname = 'new\"reader';" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]
     run grep -F -- "arg=role_password=${password}" "${TEST_TMPDIR}/pg.args"
     [ "$status" -eq 0 ]

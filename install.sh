@@ -489,6 +489,12 @@ function quote_postgresql_identifier() {
     printf '"%s"' "${identifier}"
 }
 
+function quote_postgresql_literal() {
+    local value="$1"
+    value=$(printf "%s" "${value}" | sed "s/'/''/g")
+    printf "'%s'" "${value}"
+}
+
 function read_postgresql_root_catalog() {
     local pg_superuser="$1"
     local output_file
@@ -732,6 +738,7 @@ function create_or_update_postgresql_monitoring_role() {
     local monitoring_role="$2"
     local monitoring_password="$3"
     local quoted_monitoring_role
+    local quoted_monitoring_role_literal
     local hba_file
     local hba_auth_method
     local password_encryption
@@ -739,6 +746,7 @@ function create_or_update_postgresql_monitoring_role() {
     local quoted_monitoring_password
 
     quoted_monitoring_role=$(quote_postgresql_identifier "${monitoring_role}")
+    quoted_monitoring_role_literal=$(quote_postgresql_literal "${monitoring_role}")
     safe_monitoring_password=$(printf "%s" "${monitoring_password}" | sed "s/'/''/g")
     quoted_monitoring_password="'${safe_monitoring_password}'"
     hba_file="$(postgresql_root_exec "${pg_superuser}" -tAc "SHOW hba_file;" | tr -d '\r\n')"
@@ -756,7 +764,7 @@ function create_or_update_postgresql_monitoring_role() {
             ;;
     esac
 
-    if postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = ${quoted_monitoring_role};" 2>/dev/null | grep -q "1"; then
+    if postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = ${quoted_monitoring_role_literal};" 2>/dev/null | grep -q "1"; then
         if [ -n "${password_encryption:-}" ]; then
             postgresql_root_exec "${pg_superuser}" -v role_password="${monitoring_password}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; ALTER USER ${quoted_monitoring_role} WITH PASSWORD :'role_password';"
         else
