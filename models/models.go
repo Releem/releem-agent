@@ -44,7 +44,7 @@ type Metrics struct {
 		Info                 MetricGroupValue
 		Queries              []MetricGroupValue
 		DatabaseSchema       map[string][]MetricGroupValue
-		FailedDatabaseSchema []string
+		FailedDatabaseSchema []string `json:"FailedDatabaseSchema,omitempty"`
 	}
 	ReleemAgent struct {
 		Info  MetricGroupValue

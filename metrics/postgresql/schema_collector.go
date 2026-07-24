@@ -328,15 +328,8 @@ ORDER BY t.table_schema, t.table_name`, pgTableRelkindPredicate("c.relkind"), pg
 	return schemaMetricValues(rows), err
 }
 
-func collectPostgresColumns(ctx context.Context, db *sql.DB, database string, _ int) ([]postgresSchemaMetric, error) {
-	query := fmt.Sprintf(`
-SELECT table_schema, table_name, column_name, ordinal_position,
-	COALESCE(column_default, ''), is_nullable = 'YES', data_type,
-	character_maximum_length, numeric_precision::bigint, numeric_scale::bigint,
-	is_identity = 'YES', is_generated <> 'NEVER', COALESCE(generation_expression, '')
-FROM information_schema.columns
-WHERE table_catalog = $1 AND %s
-ORDER BY table_schema, table_name, ordinal_position`, pgUserSchemaPredicate("table_schema"))
+func collectPostgresColumns(ctx context.Context, db *sql.DB, database string, serverVersionNum int) ([]postgresSchemaMetric, error) {
+	query := postgresColumnsQuery(serverVersionNum)
 	rows, err := queryContextRows(ctx, db, query, []interface{}{database}, func(rows *sql.Rows) (PostgresColumn, error) {
 		result := PostgresColumn{Database: database}
 		var maxLength, precision, scale sql.NullInt64
@@ -349,6 +342,34 @@ ORDER BY table_schema, table_name, ordinal_position`, pgUserSchemaPredicate("tab
 		return result, err
 	})
 	return schemaMetricValues(rows), err
+}
+
+func postgresColumnsQuery(serverVersionNum int) string {
+	// Identity columns are supported from PostgreSQL 10 and generated columns from PostgreSQL 12.
+	isIdentity := "false AS is_identity"
+	if serverVersionNum >= 100000 {
+		isIdentity = "is_identity = 'YES'"
+	}
+	isGenerated := "false AS is_generated"
+	generationExpression := "'' AS generation_expression"
+	if serverVersionNum >= 120000 {
+		isGenerated = "is_generated <> 'NEVER'"
+		generationExpression = "COALESCE(generation_expression, '')"
+	}
+
+	return fmt.Sprintf(`
+SELECT table_schema, table_name, column_name, ordinal_position,
+	COALESCE(column_default, ''), is_nullable = 'YES', data_type,
+	character_maximum_length, numeric_precision::bigint, numeric_scale::bigint,
+	%s, %s, %s
+FROM information_schema.columns
+WHERE table_catalog = $1 AND %s
+ORDER BY table_schema, table_name, ordinal_position`,
+		isIdentity,
+		isGenerated,
+		generationExpression,
+		pgUserSchemaPredicate("table_schema"),
+	)
 }
 
 func collectPostgresIndexes(ctx context.Context, db *sql.DB, database string, serverVersionNum int) ([]postgresSchemaMetric, error) {
@@ -369,6 +390,11 @@ func collectPostgresIndexes(ctx context.Context, db *sql.DB, database string, se
 }
 
 func postgresStructuredIndexQuery(serverVersionNum int) string {
+	// PostgreSQL 11 introduced INCLUDE indexes and split key attributes into indnkeyatts.
+	keyAttributeCount := "idx.indnatts"
+	if serverVersionNum >= 110000 {
+		keyAttributeCount = "idx.indnkeyatts"
+	}
 	nullsNotDistinct := "false"
 	if serverVersionNum >= 150000 {
 		nullsNotDistinct = "idx.indnullsnotdistinct"
@@ -407,13 +433,13 @@ SELECT namespace.nspname, table_class.relname, index_class.relname, access_metho
 		LEFT JOIN pg_opclass opclass_meta ON opclass_meta.oid = opclass_info.oid
 		LEFT JOIN pg_namespace opclass_namespace ON opclass_namespace.oid = opclass_meta.opcnamespace
 		LEFT JOIN unnest(idx.indoption) WITH ORDINALITY AS option_info(option, position) ON option_info.position = key_info.position
-		WHERE key_info.position <= idx.indnkeyatts
+		WHERE key_info.position <= %s
 	), '[]'::jsonb)::text,
 	ARRAY(
 		SELECT attribute.attname
 		FROM unnest(idx.indkey) WITH ORDINALITY AS key_info(attnum, position)
 		JOIN pg_attribute attribute ON attribute.attrelid = idx.indrelid AND attribute.attnum = key_info.attnum
-		WHERE key_info.position > idx.indnkeyatts
+		WHERE key_info.position > %s
 		ORDER BY key_info.position
 	),
 	COALESCE(pg_get_expr(idx.indpred, idx.indrelid, true), ''), pg_get_indexdef(idx.indexrelid),
@@ -431,7 +457,13 @@ JOIN pg_am access_method ON access_method.oid = index_class.relam
 LEFT JOIN pg_stat_user_indexes stats ON stats.indexrelid = idx.indexrelid
 LEFT JOIN pg_stat_database database_stats ON database_stats.datname = current_database()
 WHERE %s
-ORDER BY namespace.nspname, table_class.relname, index_class.relname`, nullsNotDistinct, lastIdxScan, pgUserSchemaPredicate("namespace.nspname"))
+ORDER BY namespace.nspname, table_class.relname, index_class.relname`,
+		keyAttributeCount,
+		keyAttributeCount,
+		nullsNotDistinct,
+		lastIdxScan,
+		pgUserSchemaPredicate("namespace.nspname"),
+	)
 }
 
 func collectPostgresReferentialConstraints(ctx context.Context, db *sql.DB, database string, _ int) ([]postgresSchemaMetric, error) {

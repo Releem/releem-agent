@@ -102,7 +102,7 @@ func normalizePgStatStatementsTypedParameters(query string) string {
 			i++
 		}
 		dataType := strings.ToLower(query[wordStart:i])
-		if dataType != "date" && dataType != "timestamp" {
+		if dataType != "date" && dataType != "timestamp" && dataType != "interval" {
 			continue
 		}
 

@@ -426,6 +426,14 @@ func TestNormalizePgStatStatementsTypedParametersSkipsQuotedTextAndComments(t *t
 	}
 }
 
+func TestNormalizePgStatStatementsTypedParametersNormalizesInterval(t *testing.T) {
+	query := "SELECT now() - interval $1"
+	want := "SELECT now() - $1::interval"
+	if got := normalizePgStatStatementsTypedParameters(query); got != want {
+		t.Fatalf("normalizePgStatStatementsTypedParameters() = %q, want %q", got, want)
+	}
+}
+
 func TestPostgresqlParameterizedExplainCleansUpSessionAfterExplainError(t *testing.T) {
 	recorder := &pgExplainRecordingDriver{queryError: fmt.Errorf("explain failed")}
 	sql.Register("releem_pg_explain_cleanup_test", recorder)

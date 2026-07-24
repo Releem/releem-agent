@@ -594,3 +594,49 @@ func TestStructuredIndexQueryAggregatesKeysAndIncludeColumns(t *testing.T) {
 		t.Fatal("PG16+ index query should collect last_idx_scan")
 	}
 }
+
+func TestPostgresColumnsQueryMatchesServerVersion(t *testing.T) {
+	tests := []struct {
+		version int
+		want    []string
+		omit    []string
+	}{
+		{
+			version: 90500,
+			want:    []string{"false AS is_identity", "false AS is_generated", "'' AS generation_expression"},
+			omit:    []string{"is_identity = 'YES'", "is_generated <> 'NEVER'", "COALESCE(generation_expression, '')"},
+		},
+		{
+			version: 100000,
+			want:    []string{"is_identity = 'YES'", "false AS is_generated", "'' AS generation_expression"},
+			omit:    []string{"is_generated <> 'NEVER'", "COALESCE(generation_expression, '')"},
+		},
+		{
+			version: 120000,
+			want:    []string{"is_identity = 'YES'", "is_generated <> 'NEVER'", "COALESCE(generation_expression, '')"},
+		},
+	}
+
+	for _, test := range tests {
+		query := postgresColumnsQuery(test.version)
+		for _, fragment := range test.want {
+			if !strings.Contains(query, fragment) {
+				t.Errorf("PG %d columns query must contain %q: %s", test.version, fragment, query)
+			}
+		}
+		for _, fragment := range test.omit {
+			if strings.Contains(query, fragment) {
+				t.Errorf("PG %d columns query must omit %q: %s", test.version, fragment, query)
+			}
+		}
+	}
+}
+
+func TestStructuredIndexQueryUsesVersionSpecificKeyCount(t *testing.T) {
+	if query := postgresStructuredIndexQuery(100000); strings.Contains(query, "indnkeyatts") || !strings.Contains(query, "idx.indnatts") {
+		t.Fatalf("PG10 query must use indnatts: %s", query)
+	}
+	if query := postgresStructuredIndexQuery(110000); !strings.Contains(query, "idx.indnkeyatts") {
+		t.Fatalf("PG11 query must use indnkeyatts: %s", query)
+	}
+}
