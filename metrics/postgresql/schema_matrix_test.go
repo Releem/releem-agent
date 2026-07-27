@@ -143,10 +143,10 @@ func TestCollectDbSchemaConnectionFailureIsTypedAndContextual(t *testing.T) {
 	if !errors.As(err, &collectionError) {
 		t.Fatalf("database connection failure must use postgresSchemaCollectionError, got %T: %v", err, err)
 	}
-	if !reflect.DeepEqual(collectionError.sections, []string{"__database_connection__"}) {
+	if !reflect.DeepEqual(collectionError.sections, []string{"app:__database_connection__"}) {
 		t.Fatalf("database connection failure context: %#v", collectionError)
 	}
-	if !strings.Contains(err.Error(), "__database_connection__") {
+	if !strings.Contains(err.Error(), "app:__database_connection__") {
 		t.Fatalf("database connection failure message must retain context: %v", err)
 	}
 }
@@ -173,9 +173,12 @@ func TestPostgresGetMetricsCollectsScopedSchemaFailuresPerExecution(t *testing.T
 		t.Fatalf("GetMetrics returned an error: %v", err)
 	}
 
-	wantFailures := []string{"__database_connection__"}
+	wantFailures := []string{
+		"app:__database_connection__",
+		"analytics:__database_connection__",
+	}
 	if !reflect.DeepEqual(metrics.DB.FailedDatabaseSchema, wantFailures) {
-		t.Fatalf("unscoped schema failures: got %#v want %#v", metrics.DB.FailedDatabaseSchema, wantFailures)
+		t.Fatalf("scoped schema failures: got %#v want %#v", metrics.DB.FailedDatabaseSchema, wantFailures)
 	}
 }
 

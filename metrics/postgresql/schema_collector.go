@@ -248,7 +248,7 @@ func CollectDbSchema(configuration *config.Config, logger logging.Logger, databa
 	db := u.ConnectionDatabase(configuration, logger, database)
 	if db == nil {
 		return &postgresSchemaCollectionError{
-			sections: []string{postgresDatabaseConnectionFailureSection},
+			sections: []string{database + ":" + postgresDatabaseConnectionFailureSection},
 		}
 	}
 	defer db.Close()
