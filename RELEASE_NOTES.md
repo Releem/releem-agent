@@ -200,3 +200,15 @@
 - Fixed Windows installer exit handling and added custom root login tests
 - Added startup delay to ensure the server is registered before follow-up operations
 - Bumped agent, installer, configurer, and Windows script versions to 1.24.0
+
+## 1.25.0
+- Added PostgreSQL query optimization collection with `pg_stat_statements` capability detection and support for PostgreSQL 12 and newer
+- Added PostgreSQL EXPLAIN collection with query deduplication, collection quotas, prepared-statement parameter handling, and `search_path` support
+- Added PostgreSQL schema collection for tables, partitions, columns, indexes, constraints, foreign keys, sequences, relation sizes, and planner statistics
+- Added PostgreSQL metadata for expression, partial, covering, and partitioned indexes
+- Improved query and schema collection resilience when individual databases, schema sections, or EXPLAIN operations fail
+- Aligned MySQL and PostgreSQL schema publishing, failure reporting, and EXPLAIN collection behavior
+- Added PostgreSQL query optimization grants and hardened installer quoting and credential escaping
+- Fixed PostgreSQL process and query collection compatibility across server versions
+- Fixed Windows installer system utility resolution
+- Expanded automated coverage for PostgreSQL query optimization, schema collection, installer behavior, and cross-database compatibility
