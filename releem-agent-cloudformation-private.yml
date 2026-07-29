@@ -70,7 +70,12 @@ Parameters:
     Type: String
     Default: ""
     Description: "A list of database names for SQL query optimization. Leave empty to optimize queries across all databases."
-    
+  IntervalCollectAllMetrics:
+    Description: Interval in seconds for collecting all metrics. In most cases, leave the default value unchanged.
+    Type: Number
+    MinValue: 1
+    Default: 43200
+
 Conditions:
   CreateCluster: !Equals
     - !Ref ClusterName
@@ -165,6 +170,8 @@ Resources:
                   Value: !Ref DBParameterGroup
                 - Name: RELEEM_DATABASES_QUERY_OPTIMIZATION
                   Value: !Ref DBQueryOptimization
+                - Name: RELEEM_INTERVAL_COLLECT_ALL_METRICS
+                  Value: !Ref IntervalCollectAllMetrics                  
               Essential: true
               LogConfiguration:
                 LogDriver: awslogs
@@ -314,3 +321,4 @@ Metadata:
         - DBQueryOptimization
         - DBParameterGroup
         - DBSSLMode
+        - IntervalCollectAllMetrics
