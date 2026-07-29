@@ -272,6 +272,45 @@ assert_exact_sql_payloads() {
     [ "$output" = 'pg_ssl_mode=false' ] || return 1
 }
 
+@test "configure_releem_agent escapes postgresql credentials as HCL strings" {
+    load_install_functions
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    mkdir -p "${workdir}"
+
+    database_type="postgresql"
+    RELEEM_WORKDIR="${workdir}"
+    RELEEM_CONF_FILE="${conf}"
+    PG_LOGIN='role"reader'
+    PG_PASSWORD=$'line1\\line2"\nline3\tend'
+    apikey="k1"
+    sudo_cmd=""
+    unset RELEEM_PG_HOST RELEEM_PG_PORT RELEEM_PG_SSL_MODE pg_service_name_cmd PG_CONF_DIR
+
+    run configure_releem_agent
+
+    [ "$status" -eq 0 ]
+    run grep '^pg_user=' "${conf}"
+    [ "$status" -eq 0 ]
+    [ "$output" = 'pg_user="role\"reader"' ] || return 1
+    run grep '^pg_password=' "${conf}"
+    [ "$status" -eq 0 ]
+    [ "$output" = 'pg_password="line1\\line2\"\nline3\tend"' ] || return 1
+}
+
+@test "quote_hcl_string escapes quotes backslashes and control characters" {
+    run bash -c '
+        load_install() { RELEEM_TEST_MODE=1 source "$1"; }
+        load_install "$1"
+        declare -F quote_hcl_string >/dev/null || exit 99
+        input=$(printf '"'"'line1\\line2"\nline3\tend\r'"'"')
+        quote_hcl_string "${input}"
+    ' _ "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = '"line1\\line2\"\nline3\tend\r"' ]
+}
+
 @test "setting_up_database_instance dispatches only for local instances" {
     load_install_functions
     mysql_setup_called=0
@@ -374,6 +413,17 @@ if [[ "$query" == *"SELECT VERSION()"* ]]; then
   exit 0
 elif [[ "$query" == *"pg_extension WHERE extname = '"'"'pg_stat_statements'"'"'"* ]]; then
   echo "1"
+  exit 0
+elif [[ "$query" == *"pg_has_role"* ]]; then
+  echo "t"
+  exit 0
+elif [[ "$query" == *"SELECT datname"* && "$query" == *"pg_database"* ]]; then
+  printf "postgres\000"
+  exit 0
+elif [[ "$query" == *"missing_privilege_count"* ]]; then
+  echo "0"
+  exit 0
+elif [[ "$query" == *"FROM pg_stat_statements LIMIT 0"* ]]; then
   exit 0
 elif [[ "$query" == *"pg_extension LIMIT 1"* ]]; then
   exit 0

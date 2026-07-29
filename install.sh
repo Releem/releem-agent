@@ -495,6 +495,16 @@ function quote_postgresql_literal() {
     printf "'%s'" "${value}"
 }
 
+function quote_hcl_string() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "${value}"
+}
+
 function read_postgresql_root_catalog() {
     local pg_superuser="$1"
     local output_file
@@ -1096,8 +1106,8 @@ function configure_releem_agent() {
         # PostgreSQL configuration
         if [ -n "$PG_LOGIN" ] && [ -n "$PG_PASSWORD" ]; then
             printf "\033[37m - Adding PostgreSQL user and password to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
-            echo "pg_user=\"$PG_LOGIN\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
-            echo "pg_password=\"$PG_PASSWORD\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
+            printf 'pg_user=%s\n' "$(quote_hcl_string "${PG_LOGIN}")" | $sudo_cmd tee -a "$RELEEM_CONF_FILE" >/dev/null
+            printf 'pg_password=%s\n' "$(quote_hcl_string "${PG_PASSWORD}")" | $sudo_cmd tee -a "$RELEEM_CONF_FILE" >/dev/null
         fi
         if [ -n "$RELEEM_PG_HOST" ]; then
             printf "\033[37m - Adding PostgreSQL host to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
