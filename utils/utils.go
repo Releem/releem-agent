@@ -69,6 +69,11 @@ func IsPath(path string, logger logging.Logger) bool {
 }
 
 func ConnectionDatabase(configuration *config.Config, logger logging.Logger, DBname string) *sql.DB {
+	db, _ := ConnectionDatabaseErr(configuration, logger, DBname)
+	return db
+}
+
+func ConnectionDatabaseErr(configuration *config.Config, logger logging.Logger, DBname string) (*sql.DB, error) {
 	dbType := configuration.GetDatabaseType()
 
 	switch dbType {
@@ -76,18 +81,23 @@ func ConnectionDatabase(configuration *config.Config, logger logging.Logger, DBn
 		if DBname == "" {
 			DBname = "postgres"
 		}
-		return ConnectionPostgreSQL(configuration, logger, DBname)
+		return ConnectionPostgreSQLErr(configuration, logger, DBname)
 	case "mysql":
 		fallthrough
 	default:
 		if DBname == "" {
 			DBname = "mysql"
 		}
-		return ConnectionMySQL(configuration, logger, DBname)
+		return ConnectionMySQLErr(configuration, logger, DBname)
 	}
 }
 
 func ConnectionMySQL(configuration *config.Config, logger logging.Logger, DBname string) *sql.DB {
+	db, _ := ConnectionMySQLErr(configuration, logger, DBname)
+	return db
+}
+
+func ConnectionMySQLErr(configuration *config.Config, logger logging.Logger, DBname string) (*sql.DB, error) {
 	var db *sql.DB
 	var err error
 	var TypeConnection string
@@ -106,16 +116,19 @@ func ConnectionMySQL(configuration *config.Config, logger logging.Logger, DBname
 	}
 	if err != nil {
 		logger.Error("Connection opening to failed ", err)
+		return nil, err
 	}
 
 	err = db.Ping()
 	if err != nil {
 		switch TypeConnection {
 		case "unix":
-			logger.Info("Connection failed to DB ", DBname, " via unix socket ", configuration.MysqlHost)
+			logger.Error("Connection failed to DB ", DBname, " via unix socket ", configuration.MysqlHost, ", error: ", err.Error())
 		case "tcp":
-			logger.Info("Connection failed to DB ", DBname, " via tcp ", configuration.MysqlHost)
+			logger.Error("Connection failed to DB ", DBname, " via tcp ", configuration.MysqlHost, ", error: ", err.Error())
 		}
+		_ = db.Close()
+		return nil, err
 	} else {
 		switch TypeConnection {
 		case "unix":
@@ -124,36 +137,50 @@ func ConnectionMySQL(configuration *config.Config, logger logging.Logger, DBname
 			logger.Info("Connection successful to DB ", DBname, " via tcp ", configuration.MysqlHost)
 		}
 	}
-	return db
+	return db, nil
 }
 
 func ConnectionPostgreSQL(configuration *config.Config, logger logging.Logger, DBname string) *sql.DB {
-	var db *sql.DB
-	var err error
-	var sslmode string
+	db, _ := ConnectionPostgreSQLErr(configuration, logger, DBname)
+	return db
+}
 
-	if configuration.PgSslMode {
-		sslmode = "require"
-	} else {
-		sslmode = "disable"
-	}
-	// Build PostgreSQL connection string
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		configuration.PgHost, configuration.PgPort, configuration.PgUser,
-		configuration.PgPassword, DBname, sslmode)
-
-	db, err = sql.Open("postgres", connStr)
+func ConnectionPostgreSQLErr(configuration *config.Config, logger logging.Logger, DBname string) (*sql.DB, error) {
+	db, err := sql.Open("postgres", postgresqlConnectionString(configuration, DBname))
 	if err != nil {
 		logger.Error("PostgreSQL connection opening failed ", err)
+		return nil, err
 	}
 
-	err = db.Ping()
-	if err != nil {
-		logger.Info("PostgreSQL connection failed to DB ", DBname, " via tcp ", configuration.PgHost, ":", configuration.PgPort)
-	} else {
-		logger.Info("PostgreSQL connection successful to DB ", DBname, " via tcp ", configuration.PgHost, ":", configuration.PgPort)
+	if err = db.Ping(); err != nil {
+		logger.Error("PostgreSQL connection failed to DB ", DBname, " via tcp ", configuration.PgHost, ":", configuration.PgPort, ", error: ", err.Error())
+		_ = db.Close()
+		return nil, err
 	}
-	return db
+	logger.Info("PostgreSQL connection successful to DB ", DBname, " via tcp ", configuration.PgHost, ":", configuration.PgPort)
+	return db, nil
+}
+
+func postgresqlConnectionString(configuration *config.Config, database string) string {
+	sslmode := "disable"
+	if configuration.PgSslMode {
+		sslmode = "require"
+	}
+	return fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		quotePostgresqlDSNValue(configuration.PgHost),
+		quotePostgresqlDSNValue(configuration.PgPort),
+		quotePostgresqlDSNValue(configuration.PgUser),
+		quotePostgresqlDSNValue(configuration.PgPassword),
+		quotePostgresqlDSNValue(database),
+		quotePostgresqlDSNValue(sslmode),
+	)
+}
+
+func quotePostgresqlDSNValue(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `'`, `\'`)
+	return `'` + value + `'`
 }
 
 func EnableEventsStatementsConsumers(configuration *config.Config, logger logging.Logger, uptime_str string) {
