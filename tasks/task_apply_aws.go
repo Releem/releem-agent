@@ -148,6 +148,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 	}
 
 	groupValidation := validateAWSGroups(logger, metadata, configuration)
+	recordAWSGroupMismatchDiagnostics(&result, groupValidation, metadata, configuration)
 
 	instanceParameters := map[string]awsrds.ParameterInfo{}
 	instanceLookupGroup := configuration.AwsRDSParameterGroup
@@ -155,10 +156,11 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 	instanceMembershipUnknown := false
 	switch {
 	case isDefaultAWSParameterGroup(configuration.AwsRDSParameterGroup):
-		// Default groups cannot be modified. Do not call AWS for them and
-		// conservatively reserve instance priority for every recommendation.
-		instanceLookupGroup = ""
-		instanceMembershipUnknown = true
+		// Default groups cannot be modified, but their attached live membership
+		// remains authoritative for instance priority over a custom cluster group.
+		instanceLookupGroup = metadata.DBParameterGroup
+		instanceClassificationOnly = true
+		instanceMembershipUnknown = instanceLookupGroup == ""
 	case configuration.AwsRDSParameterGroup == "":
 		// An attached group can still classify instance membership when old or
 		// incomplete Agent configuration omits the mutation target.
@@ -240,10 +242,11 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		InstanceParameters:      instanceParameters,
 		ClusterParameters:       clusterParameters,
 		Recommendations:         recommendations,
-		CurrentValues:           metrics.DB.Conf.Variables,
+		CurrentValues:           awsCurrentParameterValues(metrics.DB.Conf.Variables),
 		PendingRebootOnly:       mode == AWSApplyPendingRebootOnly,
 	})
 	result = plannedResult
+	recordAWSGroupMismatchDiagnostics(&result, groupValidation, metadata, configuration)
 
 	waitRequest, applyErr := applyAWSPlan(ctx, client, plan, &result)
 	waitRequest.Metadata = metadata
@@ -295,6 +298,31 @@ func validateAWSGroups(logger logging.Logger, metadata awsrds.Metadata, configur
 	return validation
 }
 
+func recordAWSGroupMismatchDiagnostics(result *awsrds.ApplyResult, validation awsGroupValidation, metadata awsrds.Metadata, configuration *config.Config) {
+	if result == nil || configuration == nil {
+		return
+	}
+	if validation.InstanceMismatch {
+		appendAWSGroupMismatchDiagnostic(&result.Instance, configuration.AwsRDSParameterGroup, metadata.DBParameterGroup)
+	}
+	if validation.ClusterMismatch {
+		appendAWSGroupMismatchDiagnostic(&result.Cluster, configuration.AwsRDSClusterParameterGroup, metadata.DBClusterParameterGroup)
+	}
+}
+
+func appendAWSGroupMismatchDiagnostic(result *awsrds.ScopeResult, expected, actual string) {
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Reason == awsrds.SkipGroupMismatch && diagnostic.ExpectedGroup == expected && diagnostic.ActualGroup == actual {
+			return
+		}
+	}
+	result.Diagnostics = append(result.Diagnostics, awsrds.ScopeDiagnostic{
+		Reason:        awsrds.SkipGroupMismatch,
+		ExpectedGroup: expected,
+		ActualGroup:   actual,
+	})
+}
+
 func isDefaultAWSParameterGroup(group string) bool {
 	return strings.HasPrefix(strings.ToLower(group), "default.")
 }
@@ -314,6 +342,24 @@ func reserveUnknownInstanceMembership(parameters map[string]awsrds.ParameterInfo
 			Scope:        awsrds.ScopeInstance,
 		}
 	}
+}
+
+func awsCurrentParameterValues(values models.MetricGroupValue) map[string]interface{} {
+	current := make(map[string]interface{}, len(values))
+	for name, value := range values {
+		switch nested := value.(type) {
+		case models.MetricGroupValue:
+			if setting, exists := nested["setting"]; exists {
+				value = setting
+			}
+		case map[string]interface{}:
+			if setting, exists := nested["setting"]; exists {
+				value = setting
+			}
+		}
+		current[name] = value
+	}
+	return current
 }
 
 func applyAWSPlan(ctx context.Context, client awsrds.Client, plan awsrds.ApplyPlan, result *awsrds.ApplyResult) (awsApplyWaitRequest, error) {
@@ -419,11 +465,15 @@ func recordAWSApplyFailure(result *awsrds.ApplyResult, scope awsrds.Scope, param
 }
 
 type awsApplyWaitError struct {
-	Scope awsrds.Scope
-	Err   error
+	Scope      awsrds.Scope
+	Unresolved awsApplyModifiedScopes
+	Err        error
 }
 
 func (err *awsApplyWaitError) Error() string {
+	if err.Unresolved.Instance && err.Unresolved.Cluster {
+		return fmt.Sprintf("wait for instance and cluster parameter apply: %v", err.Err)
+	}
 	return fmt.Sprintf("wait for %s parameter apply: %v", err.Scope, err.Err)
 }
 
@@ -432,12 +482,21 @@ func (err *awsApplyWaitError) Unwrap() error {
 }
 
 func newAWSApplyTimeoutError(scope awsrds.Scope) error {
-	return &awsApplyWaitError{Scope: scope, Err: errAWSApplyWaitTimeout}
+	unresolved := awsApplyModifiedScopes{Instance: scope == awsrds.ScopeInstance, Cluster: scope == awsrds.ScopeCluster}
+	return newAWSApplyTimeoutErrorForScopes(unresolved)
 }
 
-func newAWSApplyPollingError(scope awsrds.Scope, err error) error {
+func newAWSApplyTimeoutErrorForScopes(unresolved awsApplyModifiedScopes) error {
+	scope := awsrds.ScopeInstance
+	if !unresolved.Instance && unresolved.Cluster {
+		scope = awsrds.ScopeCluster
+	}
+	return &awsApplyWaitError{Scope: scope, Unresolved: unresolved, Err: errAWSApplyWaitTimeout}
+}
+
+func newAWSApplyPollingError(scope awsrds.Scope, unresolved awsApplyModifiedScopes, err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return newAWSApplyTimeoutError(scope)
+		return newAWSApplyTimeoutErrorForScopes(unresolved)
 	}
 	return &awsApplyWaitError{Scope: scope, Err: err}
 }
@@ -446,6 +505,15 @@ func recordAWSWaitFailure(result *awsrds.ApplyResult, request awsApplyWaitReques
 	scope := awsrds.ScopeInstance
 	var scopedError *awsApplyWaitError
 	if errors.As(err, &scopedError) {
+		if scopedError.Unresolved.Instance || scopedError.Unresolved.Cluster {
+			if scopedError.Unresolved.Instance {
+				recordAWSApplyFailure(result, awsrds.ScopeInstance, awsParameterNames(request.Instance.Parameters), err)
+			}
+			if scopedError.Unresolved.Cluster {
+				recordAWSApplyFailure(result, awsrds.ScopeCluster, awsParameterNames(request.Cluster.Parameters), err)
+			}
+			return
+		}
 		scope = scopedError.Scope
 	} else if len(request.Instance.Parameters) == 0 {
 		scope = awsrds.ScopeCluster
@@ -533,14 +601,20 @@ func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request a
 		if !instanceReady {
 			ready, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeInstance, request.Instance)
 			if err != nil {
-				return newAWSApplyPollingError(awsrds.ScopeInstance, err)
+				return newAWSApplyPollingError(awsrds.ScopeInstance, awsApplyModifiedScopes{
+					Instance: scopes.Instance && !instanceReady,
+					Cluster:  scopes.Cluster && !clusterReady,
+				}, err)
 			}
 			instanceReady = ready
 		}
 		if !clusterReady {
 			ready, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeCluster, request.Cluster)
 			if err != nil {
-				return newAWSApplyPollingError(awsrds.ScopeCluster, err)
+				return newAWSApplyPollingError(awsrds.ScopeCluster, awsApplyModifiedScopes{
+					Instance: scopes.Instance && !instanceReady,
+					Cluster:  scopes.Cluster && !clusterReady,
+				}, err)
 			}
 			clusterReady = ready
 		}
@@ -552,11 +626,10 @@ func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request a
 		select {
 		case <-waitContext.Done():
 			timer.Stop()
-			scope := awsrds.ScopeInstance
-			if instanceReady {
-				scope = awsrds.ScopeCluster
-			}
-			return newAWSApplyTimeoutError(scope)
+			return newAWSApplyTimeoutErrorForScopes(awsApplyModifiedScopes{
+				Instance: scopes.Instance && !instanceReady,
+				Cluster:  scopes.Cluster && !clusterReady,
+			})
 		case <-timer.C:
 		}
 	}

@@ -2,7 +2,9 @@ package system
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -144,6 +146,103 @@ func TestAWSRDSEnhancedMetricsGathererPublishesRDSMetadata(t *testing.T) {
 				t.Fatalf("CloudWatch log stream = %q, want DB instance resource ID %q", got, tt.metadata.DBInstanceResourceID)
 			}
 		})
+	}
+}
+
+func TestAWSRDSEnhancedMetricsGathererRefreshesMetadataForEveryReport(t *testing.T) {
+	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_writer.json")
+	if err != nil {
+		t.Fatalf("read enhanced-monitoring fixture: %v", err)
+	}
+
+	client, requestedStream := testCloudWatchLogsClient(t, fixture)
+	logger := *logging.Init("aws-rds-enhanced-metrics-refresh-test", false, false, io.Discard)
+	configuration := &config.Config{MysqlHost: "startup.example"}
+	reports := []awsrds.Metadata{
+		{
+			DBInstanceIdentifier:    "orders-1",
+			DBInstanceResourceID:    "db-resource-orders-1",
+			DBInstanceClass:         "db.r7g.large",
+			Endpoint:                "orders-writer.example",
+			Engine:                  "aurora-mysql",
+			EngineMode:              "provisioned",
+			DBParameterGroup:        "orders-instance-pg",
+			DBClusterIdentifier:     "orders-cluster",
+			DBClusterParameterGroup: "orders-cluster-pg",
+			IsClusterWriter:         true,
+		},
+		{
+			DBInstanceIdentifier:    "orders-1",
+			DBInstanceResourceID:    "db-resource-orders-1",
+			DBInstanceClass:         "db.r7g.large",
+			Endpoint:                "orders-reader.example",
+			Engine:                  "aurora-mysql",
+			EngineMode:              "provisioned",
+			DBParameterGroup:        "orders-instance-pg",
+			DBClusterIdentifier:     "orders-cluster",
+			DBClusterParameterGroup: "orders-cluster-pg",
+			IsClusterWriter:         false,
+		},
+	}
+	discoveryCalls := 0
+	discover := func(context.Context) (awsrds.Metadata, error) {
+		discoveryCalls++
+		if discoveryCalls > len(reports) {
+			return awsrds.Metadata{}, errors.New("discovery unavailable")
+		}
+		return reports[discoveryCalls-1], nil
+	}
+	gatherer := NewAWSRDSEnhancedMetricsGatherer(
+		logger,
+		awsrds.Metadata{IsClusterWriter: false},
+		client,
+		configuration,
+		discover,
+	)
+
+	first := &models.Metrics{}
+	if err := gatherer.GetMetrics(first); err != nil {
+		t.Fatalf("first GetMetrics() error = %v", err)
+	}
+	firstHost := first.System.Info["Host"].(models.MetricGroupValue)
+	if firstHost["IsClusterWriter"] != true {
+		t.Fatalf("first IsClusterWriter = %#v, want true", firstHost["IsClusterWriter"])
+	}
+	if configuration.MysqlHost != "orders-writer.example" {
+		t.Fatalf("first MySQL host = %q, want refreshed writer endpoint", configuration.MysqlHost)
+	}
+	if got := <-requestedStream; got != "db-resource-orders-1" {
+		t.Fatalf("first CloudWatch stream = %q, want refreshed resource ID", got)
+	}
+
+	second := &models.Metrics{}
+	if err := gatherer.GetMetrics(second); err != nil {
+		t.Fatalf("second GetMetrics() error = %v", err)
+	}
+	secondHost := second.System.Info["Host"].(models.MetricGroupValue)
+	if secondHost["IsClusterWriter"] != false {
+		t.Fatalf("second IsClusterWriter = %#v, want false after failover", secondHost["IsClusterWriter"])
+	}
+	if configuration.MysqlHost != "orders-reader.example" {
+		t.Fatalf("second MySQL host = %q, want refreshed reader endpoint", configuration.MysqlHost)
+	}
+	if got := <-requestedStream; got != "db-resource-orders-1" {
+		t.Fatalf("second CloudWatch stream = %q, want one consistent refreshed resource ID", got)
+	}
+
+	failed := &models.Metrics{}
+	failed.System.Info = models.MetricGroupValue{"sentinel": "unchanged"}
+	if err := gatherer.GetMetrics(failed); err == nil {
+		t.Fatal("third GetMetrics() error = nil, want discovery failure")
+	}
+	if failed.System.Info["sentinel"] != "unchanged" || len(failed.System.Info) != 1 {
+		t.Fatalf("failed report metadata = %#v, want untouched sentinel", failed.System.Info)
+	}
+	if configuration.MysqlHost != "orders-reader.example" {
+		t.Fatalf("host after failed discovery = %q, want last complete endpoint", configuration.MysqlHost)
+	}
+	if discoveryCalls != 3 {
+		t.Fatalf("discovery calls = %d, want one per report", discoveryCalls)
 	}
 }
 

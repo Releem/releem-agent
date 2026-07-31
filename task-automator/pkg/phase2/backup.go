@@ -78,10 +78,11 @@ func (e *Executor) backupWithMysqldump(options ExecuteOptions) (string, error) {
 		return "", fmt.Errorf("config is required for backup")
 	}
 
-	host := options.Config.MysqlHost
-	port := options.Config.MysqlPort
-	user := options.Config.MysqlUser
-	password := options.Config.MysqlPassword
+	configuration := options.Config.Snapshot()
+	host := configuration.MysqlHost
+	port := configuration.MysqlPort
+	user := configuration.MysqlUser
+	password := configuration.MysqlPassword
 	if host == "" {
 		return "", fmt.Errorf("mysql_host is required for backup")
 	}
@@ -92,14 +93,14 @@ func (e *Executor) backupWithMysqldump(options ExecuteOptions) (string, error) {
 	}
 
 	// Use config values
-	mysqldump := options.Config.MysqldumpPath
+	mysqldump := configuration.MysqldumpPath
 	if mysqldump == "" {
 		mysqldump = "mysqldump"
 	}
 
 	// Generate timestamp prefix in YYMMDDHHMMSS format
 	timestamp := time.Now().Format("060102150405")
-	backupPath := fmt.Sprintf("%s/%s_%s_%s.sql", options.Config.BackupDir, timestamp, tableInfo.Database, tableInfo.Table)
+	backupPath := fmt.Sprintf("%s/%s_%s_%s.sql", configuration.BackupDir, timestamp, tableInfo.Database, tableInfo.Table)
 
 	args := buildMysqldumpConnectionArgs(host, port, user, password)
 	args = append(args,
@@ -153,10 +154,11 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 		return "", fmt.Errorf("config is required for backup")
 	}
 
-	host := options.Config.MysqlHost
-	port := options.Config.MysqlPort
-	user := options.Config.MysqlUser
-	password := options.Config.MysqlPassword
+	configuration := options.Config.Snapshot()
+	host := configuration.MysqlHost
+	port := configuration.MysqlPort
+	user := configuration.MysqlUser
+	password := configuration.MysqlPassword
 	if host == "" {
 		return "", fmt.Errorf("mysql_host is required for backup")
 	}
@@ -167,7 +169,7 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 	}
 
 	// Use config values
-	xtrabackup := options.Config.XtrabackupPath
+	xtrabackup := configuration.XtrabackupPath
 	if xtrabackup == "" {
 		xtrabackup = "xtrabackup"
 	}
@@ -175,7 +177,7 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 	// Generate timestamp prefix in YYMMDDHHMMSS format
 	timestamp := time.Now().Format("060102150405")
 	// Create a unique backup directory for this table
-	backupDir := fmt.Sprintf("%s/%s_xtrabackup_%s_%s", options.Config.BackupDir, timestamp, tableInfo.Database, tableInfo.Table)
+	backupDir := fmt.Sprintf("%s/%s_xtrabackup_%s_%s", configuration.BackupDir, timestamp, tableInfo.Database, tableInfo.Table)
 
 	// Step 1: Take backup of the table using --tables option.
 	// xtrabackup treats --tables as a regex, so escape metacharacters and anchor

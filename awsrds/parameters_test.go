@@ -508,7 +508,6 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			}},
 			wantClusterSkipped: []SkippedVariable{{
 				Name: "binlog_format", Reason: SkipGroupMismatch,
-				ExpectedGroup: "orders-cluster-custom", ActualGroup: "attached-cluster-custom",
 			}},
 		},
 		{
@@ -528,7 +527,6 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			}(),
 			wantInstanceSkipped: []SkippedVariable{{
 				Name: "max_connections", Reason: SkipGroupMismatch,
-				ExpectedGroup: "orders-instance-custom", ActualGroup: "attached-instance-custom",
 			}},
 		},
 		{

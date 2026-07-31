@@ -124,7 +124,15 @@ func (programm *Programm) Run() {
 
 		configuration.Hostname = configuration.AwsRDSDB
 		metadata.ApplyEndpoint(configuration)
-		gatherers["default"] = append(gatherers["default"], system.NewAWSRDSEnhancedMetricsGatherer(logger, metadata, cwlogsclient, configuration))
+		gatherers["default"] = append(gatherers["default"], system.NewAWSRDSEnhancedMetricsGatherer(
+			logger,
+			metadata,
+			cwlogsclient,
+			configuration,
+			func(ctx context.Context) (awsrds.Metadata, error) {
+				return awsrds.DiscoverInstance(ctx, rdsclient, configuration.AwsRDSDB)
+			},
+		))
 		logger.Info("AWS RDS DB instance found: ", configuration.AwsRDSDB)
 	case "gcp/cloudsql":
 		logger.Info("InstanceType is gcp/cloudsql")

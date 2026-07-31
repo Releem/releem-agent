@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
@@ -20,11 +22,13 @@ import (
 const rdsMetricsLogGroupName = "RDSOSMetrics"
 
 type AWSRDSEnhancedMetricsGatherer struct {
-	logger        logging.Logger
-	debug         bool
-	metadata      awsrds.Metadata
-	cwlogsclient  *cloudwatchlogs.Client
-	configuration *config.Config
+	logger           logging.Logger
+	debug            bool
+	metadata         awsrds.Metadata
+	cwlogsclient     *cloudwatchlogs.Client
+	configuration    *config.Config
+	discoverMetadata func(context.Context) (awsrds.Metadata, error)
+	refreshMu        sync.Mutex
 }
 
 type osMetrics struct {
@@ -184,18 +188,37 @@ func parseOSMetrics(b []byte, disallowUnknownFields bool) (*osMetrics, error) {
 	return &m, nil
 }
 
-func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, metadata awsrds.Metadata, cwlogsclient *cloudwatchlogs.Client, configuration *config.Config) *AWSRDSEnhancedMetricsGatherer {
-	return &AWSRDSEnhancedMetricsGatherer{
+func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, metadata awsrds.Metadata, cwlogsclient *cloudwatchlogs.Client,
+	configuration *config.Config, discoverMetadata ...func(context.Context) (awsrds.Metadata, error)) *AWSRDSEnhancedMetricsGatherer {
+	gatherer := &AWSRDSEnhancedMetricsGatherer{
 		logger:        logger,
 		debug:         configuration.Debug,
 		cwlogsclient:  cwlogsclient,
 		metadata:      metadata,
 		configuration: configuration,
 	}
+	if len(discoverMetadata) > 0 {
+		gatherer.discoverMetadata = discoverMetadata[0]
+	}
+	return gatherer
 }
 
 func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *models.Metrics) error {
 	defer utils.HandlePanic(awsrdsenhancedmetrics.configuration, awsrdsenhancedmetrics.logger)
+	awsrdsenhancedmetrics.refreshMu.Lock()
+	defer awsrdsenhancedmetrics.refreshMu.Unlock()
+
+	ctx := context.Background()
+	metadata := awsrdsenhancedmetrics.metadata
+	if awsrdsenhancedmetrics.discoverMetadata != nil {
+		refreshed, err := awsrdsenhancedmetrics.discoverMetadata(ctx)
+		if err != nil {
+			awsrdsenhancedmetrics.logger.Errorf("Failed to refresh AWS RDS metadata: %v", err)
+			return fmt.Errorf("refresh AWS RDS metadata: %w", err)
+		}
+		metadata = refreshed
+		metadata.ApplyEndpoint(awsrdsenhancedmetrics.configuration)
+	}
 
 	info := make(models.MetricGroupValue)
 	metricsMap := make(models.MetricGroupValue)
@@ -204,13 +227,13 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 		Limit:         aws.Int32(1),
 		StartFromHead: aws.Bool(false),
 		LogGroupName:  aws.String(rdsMetricsLogGroupName),
-		LogStreamName: aws.String(awsrdsenhancedmetrics.metadata.DBInstanceResourceID),
+		LogStreamName: aws.String(metadata.DBInstanceResourceID),
 	}
 
-	result, err := awsrdsenhancedmetrics.cwlogsclient.GetLogEvents(context.TODO(), &input)
+	result, err := awsrdsenhancedmetrics.cwlogsclient.GetLogEvents(ctx, &input)
 
 	if err != nil {
-		awsrdsenhancedmetrics.logger.Fatalf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, awsrdsenhancedmetrics.metadata.DBInstanceResourceID, err)
+		awsrdsenhancedmetrics.logger.Fatalf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, metadata.DBInstanceResourceID, err)
 		return err
 	}
 
@@ -262,7 +285,6 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 	metricsMap["CPU"] = osMetrics.LoadAverageMinute //StructToMap(Avg.String())
 	awsrdsenhancedmetrics.logger.V(5).Info("CPU ", osMetrics.LoadAverageMinute)
 
-	metadata := awsrdsenhancedmetrics.metadata
 	info["Host"] = models.MetricGroupValue{
 		"InstanceType":               "aws/rds",
 		"platform":                   "aws",

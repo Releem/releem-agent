@@ -30,6 +30,8 @@ type ParameterInfo struct {
 	IsModifiable         bool
 	SupportedEngineModes []string
 	Scope                Scope
+	ParameterValue       string
+	HasParameterValue    bool
 }
 
 // ClusterParameterGroupLookup selects the group that may be described for
@@ -92,12 +94,21 @@ type FailedBatch struct {
 	Error      string   `json:"error"`
 }
 
+// ScopeDiagnostic records one scope-wide safety condition without repeating
+// it for every recommendation rejected within that scope.
+type ScopeDiagnostic struct {
+	Reason        SkipReason `json:"reason"`
+	ExpectedGroup string     `json:"expected_group,omitempty"`
+	ActualGroup   string     `json:"actual_group,omitempty"`
+}
+
 // ScopeResult is the deterministic task-output state for one parameter scope.
 type ScopeResult struct {
-	Group   string            `json:"group,omitempty"`
-	Applied []string          `json:"applied"`
-	Skipped []SkippedVariable `json:"skipped"`
-	Failed  []FailedBatch     `json:"failed"`
+	Group       string            `json:"group,omitempty"`
+	Applied     []string          `json:"applied"`
+	Skipped     []SkippedVariable `json:"skipped"`
+	Failed      []FailedBatch     `json:"failed"`
+	Diagnostics []ScopeDiagnostic `json:"diagnostics,omitempty"`
 }
 
 // ApplyResult is the JSON-serializable result shared with the apply service.
@@ -202,13 +213,18 @@ func ListParameters(ctx context.Context, client ParameterReader, group string, s
 			if name == "" {
 				continue
 			}
-			parameters[name] = ParameterInfo{
+			info := ParameterInfo{
 				Name:                 name,
 				ApplyType:            aws.ToString(parameter.ApplyType),
 				IsModifiable:         aws.ToBool(parameter.IsModifiable),
 				SupportedEngineModes: append([]string(nil), parameter.SupportedEngineModes...),
 				Scope:                scope,
 			}
+			if parameter.ParameterValue != nil {
+				info.ParameterValue = aws.ToString(parameter.ParameterValue)
+				info.HasParameterValue = true
+			}
+			parameters[name] = info
 		}
 
 		nextMarker := aws.ToString(currentPage.marker)
@@ -287,7 +303,12 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})
 		return
 	}
-	if current, exists := input.CurrentValues[name]; exists {
+	current, currentExists := input.CurrentValues[name]
+	if parameter.HasParameterValue {
+		current = parameter.ParameterValue
+		currentExists = true
+	}
+	if currentExists {
 		if currentValue, currentErr := normalizeParameterValue(name, current); currentErr == nil && currentValue == value {
 			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnchanged})
 			return
@@ -336,10 +357,8 @@ func groupSkip(input BuildApplyPlanInput, name string, scope Scope) (SkippedVari
 	}
 	if configured != attached {
 		return SkippedVariable{
-			Name:          name,
-			Reason:        SkipGroupMismatch,
-			ExpectedGroup: configured,
-			ActualGroup:   attached,
+			Name:   name,
+			Reason: SkipGroupMismatch,
 		}, true
 	}
 
@@ -486,5 +505,15 @@ func sortScopeResult(result *ScopeResult) {
 			return left < right
 		}
 		return result.Failed[i].Error < result.Failed[j].Error
+	})
+	sort.Slice(result.Diagnostics, func(i, j int) bool {
+		left, right := result.Diagnostics[i], result.Diagnostics[j]
+		if left.Reason != right.Reason {
+			return left.Reason < right.Reason
+		}
+		if left.ExpectedGroup != right.ExpectedGroup {
+			return left.ExpectedGroup < right.ExpectedGroup
+		}
+		return left.ActualGroup < right.ActualGroup
 	})
 }

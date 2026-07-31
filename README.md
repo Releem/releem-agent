@@ -69,6 +69,13 @@ separate cluster parameter group to auto-apply. Run the Agent that targets the
 writer instance with `rds:ModifyDBClusterParameterGroup` permission so cluster
 parameters can be auto-applied.
 
+`DatabaseType` defaults to `mysql`, preserving existing RDS and Aurora MySQL
+stacks. Select `postgresql` for Aurora PostgreSQL. The same `DBUser`,
+`DBPassword`/`DBPasswordArn`, and `DBSSLMode` inputs are then exposed to the
+container as PostgreSQL (`PG_*`) settings so the Agent starts its PostgreSQL
+collector; the default `mysql` selection continues exposing the existing
+MySQL (`DB_*`) settings.
+
 ## Security
 
 Releem does not collect any user data.
