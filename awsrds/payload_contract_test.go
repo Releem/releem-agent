@@ -2,6 +2,7 @@ package awsrds_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -162,7 +163,9 @@ func emitContractFields(t *testing.T, tc contractCase) (map[string]any, map[stri
 	logger := *logging.Init("aurora-payload-contract-test", false, false, io.Discard)
 	metrics := &models.Metrics{}
 	client := contractCloudWatchClient(t, tc.capacity)
-	if err := system.NewAWSRDSEnhancedMetricsGatherer(logger, tc.metadata, client, &tc.config).GetMetrics(metrics); err != nil {
+	if err := system.NewAWSRDSEnhancedMetricsGatherer(logger, client, &tc.config, func(context.Context) (awsrds.Metadata, error) {
+		return tc.metadata, nil
+	}).GetMetrics(metrics); err != nil {
 		t.Fatalf("emit Host metrics: %v", err)
 	}
 	if err := metricspkg.NewAgentMetricsGatherer(logger, &tc.config).GetMetrics(metrics); err != nil {

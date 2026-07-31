@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"runtime"
-	"sync"
 	"time"
 
 	logging "github.com/google/logger"
@@ -13,8 +12,6 @@ import (
 const (
 	ReleemAgentVersion = "1.25.0"
 )
-
-var configEndpointLocks sync.Map
 
 type Config struct {
 	Debug                       bool          `hcl:"debug"`
@@ -67,41 +64,6 @@ type Config struct {
 	BackupSpaceBuffer   float64 `hcl:"backup_space_buffer"`
 	OnlineDDLTestSchema string  `hcl:"online_ddl_test_schema"`
 	DisableSpaceChecks  bool    `hcl:"disable_space_checks"`
-}
-
-func (config *Config) endpointLock() *sync.RWMutex {
-	lock, _ := configEndpointLocks.LoadOrStore(config, &sync.RWMutex{})
-	return lock.(*sync.RWMutex)
-}
-
-// SetDatabaseEndpoint updates the discovered runtime endpoint while
-// serializing readers that take a configuration snapshot.
-func (config *Config) SetDatabaseEndpoint(databaseType, endpoint string) {
-	if config == nil {
-		return
-	}
-	lock := config.endpointLock()
-	lock.Lock()
-	defer lock.Unlock()
-
-	switch databaseType {
-	case "mysql":
-		config.MysqlHost = endpoint
-	case "postgresql":
-		config.PgHost = endpoint
-	}
-}
-
-// Snapshot returns one internally consistent copy for code that may run while
-// periodic RDS discovery updates the active endpoint.
-func (config *Config) Snapshot() Config {
-	if config == nil {
-		return Config{}
-	}
-	lock := config.endpointLock()
-	lock.RLock()
-	defer lock.RUnlock()
-	return *config
 }
 
 func LoadConfig(filename string, logger logging.Logger) (*Config, error) {

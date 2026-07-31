@@ -98,8 +98,6 @@ func ConnectionMySQL(configuration *config.Config, logger logging.Logger, DBname
 }
 
 func ConnectionMySQLErr(configuration *config.Config, logger logging.Logger, DBname string) (*sql.DB, error) {
-	configurationSnapshot := configuration.Snapshot()
-	configuration = &configurationSnapshot
 	var db *sql.DB
 	var err error
 	var TypeConnection string
@@ -148,8 +146,6 @@ func ConnectionPostgreSQL(configuration *config.Config, logger logging.Logger, D
 }
 
 func ConnectionPostgreSQLErr(configuration *config.Config, logger logging.Logger, DBname string) (*sql.DB, error) {
-	configurationSnapshot := configuration.Snapshot()
-	configuration = &configurationSnapshot
 	db, err := sql.Open("postgres", postgresqlConnectionString(configuration, DBname))
 	if err != nil {
 		logger.Error("PostgreSQL connection opening failed ", err)

@@ -126,7 +126,6 @@ func (programm *Programm) Run() {
 		metadata.ApplyEndpoint(configuration)
 		gatherers["default"] = append(gatherers["default"], system.NewAWSRDSEnhancedMetricsGatherer(
 			logger,
-			metadata,
 			cwlogsclient,
 			configuration,
 			func(ctx context.Context) (awsrds.Metadata, error) {

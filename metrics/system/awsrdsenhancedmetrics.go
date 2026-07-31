@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
@@ -21,14 +20,14 @@ import (
 
 const rdsMetricsLogGroupName = "RDSOSMetrics"
 
+type RDSMetadataDiscoverer func(context.Context) (awsrds.Metadata, error)
+
 type AWSRDSEnhancedMetricsGatherer struct {
 	logger           logging.Logger
 	debug            bool
-	metadata         awsrds.Metadata
 	cwlogsclient     *cloudwatchlogs.Client
 	configuration    *config.Config
-	discoverMetadata func(context.Context) (awsrds.Metadata, error)
-	refreshMu        sync.Mutex
+	discoverMetadata RDSMetadataDiscoverer
 }
 
 type osMetrics struct {
@@ -188,36 +187,25 @@ func parseOSMetrics(b []byte, disallowUnknownFields bool) (*osMetrics, error) {
 	return &m, nil
 }
 
-func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, metadata awsrds.Metadata, cwlogsclient *cloudwatchlogs.Client,
-	configuration *config.Config, discoverMetadata ...func(context.Context) (awsrds.Metadata, error)) *AWSRDSEnhancedMetricsGatherer {
-	gatherer := &AWSRDSEnhancedMetricsGatherer{
-		logger:        logger,
-		debug:         configuration.Debug,
-		cwlogsclient:  cwlogsclient,
-		metadata:      metadata,
-		configuration: configuration,
+func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, cwlogsclient *cloudwatchlogs.Client,
+	configuration *config.Config, discoverMetadata RDSMetadataDiscoverer) *AWSRDSEnhancedMetricsGatherer {
+	return &AWSRDSEnhancedMetricsGatherer{
+		logger:           logger,
+		debug:            configuration.Debug,
+		cwlogsclient:     cwlogsclient,
+		configuration:    configuration,
+		discoverMetadata: discoverMetadata,
 	}
-	if len(discoverMetadata) > 0 {
-		gatherer.discoverMetadata = discoverMetadata[0]
-	}
-	return gatherer
 }
 
 func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *models.Metrics) error {
 	defer utils.HandlePanic(awsrdsenhancedmetrics.configuration, awsrdsenhancedmetrics.logger)
-	awsrdsenhancedmetrics.refreshMu.Lock()
-	defer awsrdsenhancedmetrics.refreshMu.Unlock()
 
 	ctx := context.Background()
-	metadata := awsrdsenhancedmetrics.metadata
-	if awsrdsenhancedmetrics.discoverMetadata != nil {
-		refreshed, err := awsrdsenhancedmetrics.discoverMetadata(ctx)
-		if err != nil {
-			awsrdsenhancedmetrics.logger.Errorf("Failed to refresh AWS RDS metadata: %v", err)
-			return fmt.Errorf("refresh AWS RDS metadata: %w", err)
-		}
-		metadata = refreshed
-		metadata.ApplyEndpoint(awsrdsenhancedmetrics.configuration)
+	metadata, err := awsrdsenhancedmetrics.discoverMetadata(ctx)
+	if err != nil {
+		awsrdsenhancedmetrics.logger.Errorf("Failed to refresh AWS RDS metadata: %v", err)
+		return fmt.Errorf("refresh AWS RDS metadata: %w", err)
 	}
 
 	info := make(models.MetricGroupValue)

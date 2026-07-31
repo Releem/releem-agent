@@ -111,7 +111,9 @@ func TestAWSRDSEnhancedMetricsGathererPublishesRDSMetadata(t *testing.T) {
 
 			client, requestedStream := testCloudWatchLogsClient(t, fixture)
 			logger := *logging.Init("aws-rds-enhanced-metrics-test", false, false, io.Discard)
-			gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, tt.metadata, client, &config.Config{})
+			gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, client, &config.Config{}, func(context.Context) (awsrds.Metadata, error) {
+				return tt.metadata, nil
+			})
 			metrics := &models.Metrics{}
 			if err := gatherer.GetMetrics(metrics); err != nil {
 				t.Fatalf("GetMetrics() error = %v", err)
@@ -185,20 +187,23 @@ func TestAWSRDSEnhancedMetricsGathererRefreshesMetadataForEveryReport(t *testing
 		},
 	}
 	discoveryCalls := 0
-	discover := func(context.Context) (awsrds.Metadata, error) {
-		discoveryCalls++
-		if discoveryCalls > len(reports) {
-			return awsrds.Metadata{}, errors.New("discovery unavailable")
-		}
-		return reports[discoveryCalls-1], nil
-	}
 	gatherer := NewAWSRDSEnhancedMetricsGatherer(
 		logger,
-		awsrds.Metadata{IsClusterWriter: false},
 		client,
 		configuration,
-		discover,
+		func(context.Context) (awsrds.Metadata, error) {
+			if discoveryCalls >= len(reports) {
+				discoveryCalls++
+				return awsrds.Metadata{}, errors.New("discovery unavailable")
+			}
+			metadata := reports[discoveryCalls]
+			discoveryCalls++
+			return metadata, nil
+		},
 	)
+	if got := configuration.MysqlHost; got != "startup.example" {
+		t.Fatalf("MysqlHost = %q, want startup endpoint unchanged", got)
+	}
 
 	first := &models.Metrics{}
 	if err := gatherer.GetMetrics(first); err != nil {
@@ -208,8 +213,8 @@ func TestAWSRDSEnhancedMetricsGathererRefreshesMetadataForEveryReport(t *testing
 	if firstHost["IsClusterWriter"] != true {
 		t.Fatalf("first IsClusterWriter = %#v, want true", firstHost["IsClusterWriter"])
 	}
-	if configuration.MysqlHost != "orders-writer.example" {
-		t.Fatalf("first MySQL host = %q, want refreshed writer endpoint", configuration.MysqlHost)
+	if configuration.MysqlHost != "startup.example" {
+		t.Fatalf("first MySQL host = %q, want startup endpoint unchanged", configuration.MysqlHost)
 	}
 	if got := <-requestedStream; got != "db-resource-orders-1" {
 		t.Fatalf("first CloudWatch stream = %q, want refreshed resource ID", got)
@@ -223,8 +228,8 @@ func TestAWSRDSEnhancedMetricsGathererRefreshesMetadataForEveryReport(t *testing
 	if secondHost["IsClusterWriter"] != false {
 		t.Fatalf("second IsClusterWriter = %#v, want false after failover", secondHost["IsClusterWriter"])
 	}
-	if configuration.MysqlHost != "orders-reader.example" {
-		t.Fatalf("second MySQL host = %q, want refreshed reader endpoint", configuration.MysqlHost)
+	if configuration.MysqlHost != "startup.example" {
+		t.Fatalf("second MySQL host = %q, want startup endpoint unchanged", configuration.MysqlHost)
 	}
 	if got := <-requestedStream; got != "db-resource-orders-1" {
 		t.Fatalf("second CloudWatch stream = %q, want one consistent refreshed resource ID", got)
@@ -238,8 +243,8 @@ func TestAWSRDSEnhancedMetricsGathererRefreshesMetadataForEveryReport(t *testing
 	if failed.System.Info["sentinel"] != "unchanged" || len(failed.System.Info) != 1 {
 		t.Fatalf("failed report metadata = %#v, want untouched sentinel", failed.System.Info)
 	}
-	if configuration.MysqlHost != "orders-reader.example" {
-		t.Fatalf("host after failed discovery = %q, want last complete endpoint", configuration.MysqlHost)
+	if configuration.MysqlHost != "startup.example" {
+		t.Fatalf("host after failed discovery = %q, want startup endpoint unchanged", configuration.MysqlHost)
 	}
 	if discoveryCalls != 3 {
 		t.Fatalf("discovery calls = %d, want one per report", discoveryCalls)

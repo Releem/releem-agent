@@ -78,7 +78,7 @@ func (e *Executor) backupWithMysqldump(options ExecuteOptions) (string, error) {
 		return "", fmt.Errorf("config is required for backup")
 	}
 
-	configuration := options.Config.Snapshot()
+	configuration := options.Config
 	host := configuration.MysqlHost
 	port := configuration.MysqlPort
 	user := configuration.MysqlUser
@@ -154,7 +154,7 @@ func (e *Executor) backupWithXtrabackup(options ExecuteOptions) (string, error) 
 		return "", fmt.Errorf("config is required for backup")
 	}
 
-	configuration := options.Config.Snapshot()
+	configuration := options.Config
 	host := configuration.MysqlHost
 	port := configuration.MysqlPort
 	user := configuration.MysqlUser

@@ -37,7 +37,7 @@ func (e *Executor) dryRunPTOSC(options ExecuteOptions) error {
 		return fmt.Errorf("config is required for pt-online-schema-change")
 	}
 
-	configuration := options.Config.Snapshot()
+	configuration := options.Config
 	ptosc := configuration.PTOSCPath
 	if ptosc == "" {
 		ptosc = "pt-online-schema-change"
@@ -88,7 +88,7 @@ func (e *Executor) runPTOSC(options ExecuteOptions) error {
 		return fmt.Errorf("config is required for pt-online-schema-change")
 	}
 
-	configuration := options.Config.Snapshot()
+	configuration := options.Config
 	ptosc := configuration.PTOSCPath
 	if ptosc == "" {
 		ptosc = "pt-online-schema-change"

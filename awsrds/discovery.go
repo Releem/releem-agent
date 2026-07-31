@@ -123,7 +123,12 @@ func (m Metadata) ApplyEndpoint(configuration *config.Config) {
 		return
 	}
 
-	configuration.SetDatabaseEndpoint(m.DatabaseType(), m.Endpoint)
+	switch m.DatabaseType() {
+	case "mysql":
+		configuration.MysqlHost = m.Endpoint
+	case "postgresql":
+		configuration.PgHost = m.Endpoint
+	}
 }
 
 func metadataFromInstance(instance types.DBInstance) Metadata {
