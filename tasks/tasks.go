@@ -11,7 +11,6 @@ import (
 	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/Releem/mysqlconfigurer/task-automator/pkg/phase2"
 	"github.com/Releem/mysqlconfigurer/utils"
-	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 	logging "github.com/google/logger"
 )
 
@@ -22,6 +21,10 @@ type schemaChangeExecutor interface {
 var newSchemaChangeExecutor = func(logger logging.Logger) schemaChangeExecutor {
 	return phase2.NewExecutor(models.DB, &logger)
 }
+
+var runAWSRDSApply = ApplyConfAwsRds
+
+var processTaskSleep = time.Sleep
 
 func ProcessTaskFunc(repeaters models.MetricsRepeater, gatherers []models.MetricsGatherer, logger logging.Logger, configuration *config.Config) func() {
 	return func() {
@@ -77,12 +80,8 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 	case 4:
 		switch configuration.InstanceType {
 		case "aws/rds":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAwsRds(repeaters, gatherers, logger, configuration, types.ApplyMethodImmediate)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = runAWSRDSApply(repeaters, gatherers, logger, configuration, AWSApplyAll)
 			TaskStruct.Output = TaskStruct.Output + task_output
-			if TaskStruct.ExitCode == 0 {
-				TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAwsRds(repeaters, gatherers, logger, configuration, types.ApplyMethodPendingReboot)
-				TaskStruct.Output = TaskStruct.Output + task_output
-			}
 		case "gcp/cloudsql":
 			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration)
 			TaskStruct.Output = TaskStruct.Output + task_output
@@ -109,7 +108,7 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 	case 5:
 		switch configuration.InstanceType {
 		case "aws/rds":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAwsRds(repeaters, gatherers, logger, configuration, types.ApplyMethodPendingReboot)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = runAWSRDSApply(repeaters, gatherers, logger, configuration, AWSApplyPendingRebootOnly)
 			TaskStruct.Output = TaskStruct.Output + task_output
 		case "gcp/cloudsql":
 			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration)
@@ -162,7 +161,7 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 		TaskStruct.Status = 4
 	}
 
-	time.Sleep(10 * time.Second)
+	processTaskSleep(10 * time.Second)
 	metrics = utils.CollectMetrics(gatherers, logger, configuration)
 	logger.Infof(" * Task with id - %d and type id - %d completed with code %d", TaskStruct.ID, TaskStruct.TypeID, TaskStruct.ExitCode)
 
