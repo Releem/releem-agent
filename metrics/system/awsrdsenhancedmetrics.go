@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/Releem/mysqlconfigurer/utils"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 )
 
 const rdsMetricsLogGroupName = "RDSOSMetrics"
@@ -22,7 +22,7 @@ const rdsMetricsLogGroupName = "RDSOSMetrics"
 type AWSRDSEnhancedMetricsGatherer struct {
 	logger        logging.Logger
 	debug         bool
-	dbinstance    types.DBInstance
+	metadata      awsrds.Metadata
 	cwlogsclient  *cloudwatchlogs.Client
 	configuration *config.Config
 }
@@ -184,12 +184,12 @@ func parseOSMetrics(b []byte, disallowUnknownFields bool) (*osMetrics, error) {
 	return &m, nil
 }
 
-func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, dbinstance types.DBInstance, cwlogsclient *cloudwatchlogs.Client, configuration *config.Config) *AWSRDSEnhancedMetricsGatherer {
+func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, metadata awsrds.Metadata, cwlogsclient *cloudwatchlogs.Client, configuration *config.Config) *AWSRDSEnhancedMetricsGatherer {
 	return &AWSRDSEnhancedMetricsGatherer{
 		logger:        logger,
 		debug:         configuration.Debug,
 		cwlogsclient:  cwlogsclient,
-		dbinstance:    dbinstance,
+		metadata:      metadata,
 		configuration: configuration,
 	}
 }
@@ -204,13 +204,13 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 		Limit:         aws.Int32(1),
 		StartFromHead: aws.Bool(false),
 		LogGroupName:  aws.String(rdsMetricsLogGroupName),
-		LogStreamName: awsrdsenhancedmetrics.dbinstance.DbiResourceId,
+		LogStreamName: aws.String(awsrdsenhancedmetrics.metadata.DBInstanceResourceID),
 	}
 
 	result, err := awsrdsenhancedmetrics.cwlogsclient.GetLogEvents(context.TODO(), &input)
 
 	if err != nil {
-		awsrdsenhancedmetrics.logger.Fatalf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, aws.ToString(awsrdsenhancedmetrics.dbinstance.DbiResourceId), err)
+		awsrdsenhancedmetrics.logger.Fatalf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, awsrdsenhancedmetrics.metadata.DBInstanceResourceID, err)
 		return err
 	}
 
@@ -262,15 +262,24 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 	metricsMap["CPU"] = osMetrics.LoadAverageMinute //StructToMap(Avg.String())
 	awsrdsenhancedmetrics.logger.V(5).Info("CPU ", osMetrics.LoadAverageMinute)
 
+	metadata := awsrdsenhancedmetrics.metadata
 	info["Host"] = models.MetricGroupValue{
 		"InstanceType":               "aws/rds",
 		"platform":                   "aws",
-		"platformVersion":            "rds " + osMetrics.Engine,
+		"platformVersion":            "rds " + metadata.Engine,
 		"Timestamp":                  osMetrics.Timestamp,
 		"Uptime":                     osMetrics.Uptime,
-		"Engine":                     osMetrics.Engine,
+		"Engine":                     metadata.Engine,
 		"Version":                    osMetrics.Version,
 		"ServerlessDatabaseCapacity": osMetrics.ServerlessDatabaseCapacity,
+		"DBInstanceIdentifier":       metadata.DBInstanceIdentifier,
+		"DBInstanceResourceID":       metadata.DBInstanceResourceID,
+		"DBInstanceClass":            metadata.DBInstanceClass,
+		"DBParameterGroup":           metadata.DBParameterGroup,
+		"DBClusterIdentifier":        metadata.DBClusterIdentifier,
+		"DBClusterParameterGroup":    metadata.DBClusterParameterGroup,
+		"IsClusterWriter":            metadata.IsClusterWriter,
+		"EngineMode":                 metadata.EngineMode,
 	}
 
 	metrics.System.Info = info

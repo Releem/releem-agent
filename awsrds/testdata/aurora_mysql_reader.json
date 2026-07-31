@@ -1,0 +1,15 @@
+{
+  "engine": "enhanced-monitoring-engine",
+  "instanceID": "enhanced-monitoring-instance",
+  "instanceResourceID": "enhanced-monitoring-resource",
+  "numVCPUs": 2,
+  "timestamp": "2026-07-31T08:09:11Z",
+  "uptime": "2 days, 01:02:03",
+  "version": 1.0,
+  "serverlessDatabaseCapacity": 8.5,
+  "diskIO": [
+    {"device": "aurora", "readIOsPS": 4.5, "writeIOsPS": 1.25}
+  ],
+  "memory": {"total": 16777216},
+  "swap": {"total": 0}
+}

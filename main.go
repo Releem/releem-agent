@@ -11,6 +11,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Releem/daemon"
+	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/metrics"
 	"github.com/Releem/mysqlconfigurer/metrics/mysql"
@@ -116,29 +117,15 @@ func (programm *Programm) Run() {
 		rdsclient := rds.NewFromConfig(awscfg)
 		//	ec2client := ec2.NewFromConfig(awscfg)
 
-		// Prepare request to RDS
-		input := &rds.DescribeDBInstancesInput{
-			DBInstanceIdentifier: &configuration.AwsRDSDB,
-		}
-
-		// Request to RDS
-		result, err := rdsclient.DescribeDBInstances(context.TODO(), input)
-
+		metadata, err := awsrds.DiscoverInstance(context.TODO(), rdsclient, configuration.AwsRDSDB)
 		if err != nil {
 			exitRunWithError(err.Error())
 		}
 
-		// Request detailed instance info
-		if result != nil && len(result.DBInstances) == 1 {
-			configuration.Hostname = configuration.AwsRDSDB
-			configuration.MysqlHost = *result.DBInstances[0].Endpoint.Address
-			gatherers["default"] = append(gatherers["default"], system.NewAWSRDSEnhancedMetricsGatherer(logger, result.DBInstances[0], cwlogsclient, configuration))
-			logger.Info("AWS RDS DB instance found: ", configuration.AwsRDSDB)
-		} else if result != nil && len(result.DBInstances) > 1 {
-			exitRunWithError("RDS.DescribeDBInstances: Database has ", len(result.DBInstances), " instances. Clusters are not supported")
-		} else {
-			exitRunWithError("RDS.DescribeDBInstances: No instances")
-		}
+		configuration.Hostname = configuration.AwsRDSDB
+		metadata.ApplyEndpoint(configuration)
+		gatherers["default"] = append(gatherers["default"], system.NewAWSRDSEnhancedMetricsGatherer(logger, metadata, cwlogsclient, configuration))
+		logger.Info("AWS RDS DB instance found: ", configuration.AwsRDSDB)
 	case "gcp/cloudsql":
 		logger.Info("InstanceType is gcp/cloudsql")
 		logger.Info("Loading GCP configuration")
