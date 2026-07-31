@@ -302,18 +302,25 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 		return
 	}
 
-	value, err := normalizeParameterValue(name, input.Recommendations[name])
+	value, err := normalizeAWSRecommendationValue(input.Metadata, name, input.Recommendations[name])
 	if err != nil {
 		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})
 		return
 	}
 	current, currentExists := input.CurrentValues[name]
 	if parameter.HasParameterValue {
-		current = parameter.ParameterValue
-		currentExists = true
-	}
-	if currentExists {
-		if currentValue, currentErr := normalizeParameterValue(name, current); currentErr == nil && currentValue == value {
+		if currentValue, currentErr := normalizeParameterValue(name, parameter.ParameterValue); currentErr == nil && currentValue == value {
+			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnchanged})
+			return
+		}
+	} else if currentExists {
+		currentValue, currentErr := normalizeAWSRecommendationValue(input.Metadata, name, current)
+		if currentErr != nil {
+			if usesPostgreSQLAWSNativeUnit(input.Metadata, name) {
+				result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})
+				return
+			}
+		} else if currentValue == value {
 			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnchanged})
 			return
 		}
@@ -460,6 +467,42 @@ func normalizeParameterValue(name string, value interface{}) (string, error) {
 		return "", fmt.Errorf("invalid innodb_max_dirty_pages_pct value")
 	}
 	return strconv.FormatFloat(math.Trunc(percentage), 'f', 0, 64), nil
+}
+
+func normalizeAWSRecommendationValue(metadata Metadata, name string, value interface{}) (string, error) {
+	normalized, err := normalizeParameterValue(name, value)
+	if err != nil || !usesPostgreSQLAWSNativeUnit(metadata, name) {
+		return normalized, err
+	}
+
+	divisor, _ := postgreSQLAWSNativeUnitDivisor(name)
+	bytes, err := strconv.ParseUint(normalized, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("invalid PostgreSQL byte value for %s: %w", name, err)
+	}
+	if bytes%divisor != 0 {
+		return "", fmt.Errorf("PostgreSQL byte value for %s is not divisible by %d", name, divisor)
+	}
+	return strconv.FormatUint(bytes/divisor, 10), nil
+}
+
+func usesPostgreSQLAWSNativeUnit(metadata Metadata, name string) bool {
+	if metadata.DatabaseType() != "postgresql" {
+		return false
+	}
+	_, exists := postgreSQLAWSNativeUnitDivisor(name)
+	return exists
+}
+
+func postgreSQLAWSNativeUnitDivisor(name string) (uint64, bool) {
+	switch name {
+	case "work_mem", "maintenance_work_mem":
+		return 1024, true
+	case "shared_buffers", "effective_cache_size", "wal_buffers":
+		return 8192, true
+	default:
+		return 0, false
+	}
 }
 
 func emptyScopeResult(group string) ScopeResult {

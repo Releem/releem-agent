@@ -429,7 +429,7 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 						"work_mem":       liveParameter("work_mem", "dynamic", true, ScopeInstance),
 					},
 					nil,
-					map[string]interface{}{"shared_buffers": "8192", "work_mem": "4096"},
+					map[string]interface{}{"shared_buffers": "134217728", "work_mem": "4194304"},
 				)
 				input.Metadata.Engine = "aurora-postgresql"
 				input.Metadata.IsServerlessV2 = true
@@ -598,6 +598,132 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				t.Errorf("cluster groups = plan %q result %q, want %q", plan.Cluster.Group, result.Cluster.Group, tt.input.ConfiguredClusterGroup)
 			}
 		})
+	}
+}
+
+func TestBuildApplyPlanPostgreSQLCurrentValueUnitSources(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		parameter ParameterInfo
+		current   interface{}
+		wantSkip  SkipReason
+	}{
+		{
+			name: "live AWS value is already native",
+			parameter: ParameterInfo{
+				Name:              "work_mem",
+				ApplyType:         "dynamic",
+				IsModifiable:      true,
+				ParameterValue:    "4096",
+				HasParameterValue: true,
+			},
+			current:  json.Number("4096"),
+			wantSkip: SkipUnchanged,
+		},
+		{
+			name:      "DB metrics fallback remains byte-valued",
+			parameter: liveParameter("work_mem", "dynamic", true, ScopeInstance),
+			current:   json.Number("4194304"),
+			wantSkip:  SkipUnchanged,
+		},
+		{
+			name:      "unsafe DB metrics fallback fails closed",
+			parameter: liveParameter("work_mem", "dynamic", true, ScopeInstance),
+			current:   json.Number("4194305"),
+			wantSkip:  SkipInvalidValue,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			input := planInput(
+				map[string]ParameterInfo{"work_mem": tt.parameter},
+				nil,
+				map[string]interface{}{"work_mem": json.Number("4194304")},
+			)
+			input.Metadata.Engine = "postgres"
+			input.Metadata.DBClusterParameterGroup = ""
+			input.ConfiguredClusterGroup = ""
+			input.CurrentValues = map[string]interface{}{"work_mem": tt.current}
+
+			plan, result := BuildApplyPlan(input)
+			if len(plan.Instance.Parameters) != 0 {
+				t.Fatalf("instance parameters = %#v, want fail-closed no-op", simpleParameters(plan.Instance.Parameters))
+			}
+			want := []SkippedVariable{{Name: "work_mem", Reason: tt.wantSkip}}
+			if !reflect.DeepEqual(result.Instance.Skipped, want) {
+				t.Fatalf("instance skips = %#v, want %#v", result.Instance.Skipped, want)
+			}
+		})
+	}
+}
+
+func TestBuildApplyPlanPostgreSQLUnitConversionRejectsUnsafeValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value interface{}
+	}{
+		{name: "non-integral", value: json.Number("4194304.5")},
+		{name: "not unit aligned", value: json.Number("4194305")},
+		{name: "non-numeric", value: "four megabytes"},
+		{name: "overflow", value: json.Number("18446744073709551616")},
+		{name: "negative", value: json.Number("-1024")},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			input := planInput(
+				map[string]ParameterInfo{
+					"work_mem": liveParameter("work_mem", "dynamic", true, ScopeInstance),
+				},
+				nil,
+				map[string]interface{}{"work_mem": tt.value},
+			)
+			input.Metadata.Engine = "postgres"
+			input.Metadata.DBClusterParameterGroup = ""
+			input.ConfiguredClusterGroup = ""
+
+			plan, result := BuildApplyPlan(input)
+			if len(plan.Instance.Parameters) != 0 {
+				t.Fatalf("instance parameters = %#v, want no unsafe conversion", simpleParameters(plan.Instance.Parameters))
+			}
+			want := []SkippedVariable{{Name: "work_mem", Reason: SkipInvalidValue}}
+			if !reflect.DeepEqual(result.Instance.Skipped, want) {
+				t.Fatalf("instance skips = %#v, want %#v", result.Instance.Skipped, want)
+			}
+		})
+	}
+}
+
+func TestBuildApplyPlanMySQLDoesNotConvertPostgreSQLNamedParameter(t *testing.T) {
+	t.Parallel()
+
+	input := planInput(
+		map[string]ParameterInfo{
+			"work_mem": liveParameter("work_mem", "dynamic", true, ScopeInstance),
+		},
+		nil,
+		map[string]interface{}{"work_mem": json.Number("4194304")},
+	)
+	input.Metadata.Engine = "mysql"
+	input.Metadata.DBClusterParameterGroup = ""
+	input.ConfiguredClusterGroup = ""
+
+	plan, result := BuildApplyPlan(input)
+	want := []simpleParameter{{name: "work_mem", value: "4194304", method: types.ApplyMethodImmediate}}
+	if got := simpleParameters(plan.Instance.Parameters); !reflect.DeepEqual(got, want) {
+		t.Fatalf("instance parameters = %#v, want unchanged MySQL value %#v", got, want)
+	}
+	if len(result.Instance.Skipped) != 0 {
+		t.Fatalf("instance skips = %#v, want none", result.Instance.Skipped)
 	}
 }
 

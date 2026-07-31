@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -685,6 +687,85 @@ func TestApplyConfAwsRdsUsesDBMetricsOnlyWhenAWSOmitsParameterValue(t *testing.T
 	}
 }
 
+func TestApplyConfAwsRdsConvertsPostgreSQLByteRecommendationsToAWSNativeUnits(t *testing.T) {
+	contract := loadPostgreSQLAWSParameterUnitContract(t)
+
+	tests := []struct {
+		name                   string
+		client                 *awsApplyClientFake
+		configuration          *config.Config
+		wantInstanceModifyCall bool
+		wantClusterModifyCall  bool
+	}{
+		{
+			name: "provisioned Aurora PostgreSQL",
+			client: func() *awsApplyClientFake {
+				client := auroraApplyClient(true, "instance-custom", "cluster-custom")
+				client.instanceOutput.DBInstances[0].Engine = aws.String("aurora-postgresql")
+				client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+					Parameters: []types.Parameter{
+						modifiableAWSParameter("shared_buffers", "static"),
+						modifiableAWSParameter("work_mem", "dynamic"),
+						modifiableAWSParameter("maintenance_work_mem", "dynamic"),
+						modifiableAWSParameter("effective_cache_size", "dynamic"),
+					},
+				}}
+				client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
+					Parameters: []types.Parameter{modifiableAWSParameter("wal_buffers", "dynamic")},
+				}}
+				return client
+			}(),
+			configuration:          awsApplyConfig("instance-custom", "cluster-custom"),
+			wantInstanceModifyCall: true,
+			wantClusterModifyCall:  true,
+		},
+		{
+			name: "ordinary RDS PostgreSQL",
+			client: func() *awsApplyClientFake {
+				client := mysqlApplyClient("instance-custom")
+				client.instanceOutput.DBInstances[0].Engine = aws.String("postgres")
+				client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+					Parameters: []types.Parameter{
+						modifiableAWSParameter("shared_buffers", "static"),
+						modifiableAWSParameter("work_mem", "dynamic"),
+						modifiableAWSParameter("maintenance_work_mem", "dynamic"),
+						modifiableAWSParameter("effective_cache_size", "dynamic"),
+						modifiableAWSParameter("wal_buffers", "dynamic"),
+					},
+				}}
+				return client
+			}(),
+			configuration:          awsApplyConfig("instance-custom", ""),
+			wantInstanceModifyCall: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			installAWSApplyTestDependencies(t, tt.client, nil)
+
+			exitCode, status, output := ApplyConfAwsRds(
+				&awsApplyRepeater{recommendations: string(contract.Recommendations)},
+				[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{}}},
+				testAWSApplyLogger(),
+				tt.configuration,
+				AWSApplyAll,
+			)
+
+			if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+				t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s", exitCode, status, output)
+			}
+			if (len(tt.client.instanceModifyCalls) > 0) != tt.wantInstanceModifyCall || (len(tt.client.clusterModifyCalls) > 0) != tt.wantClusterModifyCall {
+				t.Fatalf("modify calls = instance %d cluster %d, want instance=%v cluster=%v", len(tt.client.instanceModifyCalls), len(tt.client.clusterModifyCalls), tt.wantInstanceModifyCall, tt.wantClusterModifyCall)
+			}
+			allCalls := append(append([]awsModifyCall(nil), tt.client.instanceModifyCalls...), tt.client.clusterModifyCalls...)
+			if got := awsModifiedParameterValues(t, allCalls); !reflect.DeepEqual(got, contract.AWSParameterValues) {
+				t.Fatalf("AWS parameter values = %#v, want native PostgreSQL units %#v", got, contract.AWSParameterValues)
+			}
+		})
+	}
+}
+
 func TestApplyConfAwsRdsRepeatedPendingRebootUsesCanonicalAWSValuesForBothScopes(t *testing.T) {
 	client := auroraApplyClient(true, "instance-custom", "cluster-custom")
 	client.instanceOutput.DBInstances[0].Engine = aws.String("aurora-postgresql")
@@ -1079,6 +1160,40 @@ func mustJSON(t *testing.T, value interface{}) string {
 		t.Fatal(err)
 	}
 	return string(encoded)
+}
+
+type postgreSQLAWSParameterUnitContract struct {
+	Recommendations    json.RawMessage   `json:"recommendations"`
+	AWSParameterValues map[string]string `json:"aws_parameter_values"`
+}
+
+func loadPostgreSQLAWSParameterUnitContract(t *testing.T) postgreSQLAWSParameterUnitContract {
+	t.Helper()
+	path := filepath.Join("..", "awsrds", "testdata", "postgresql_aws_parameter_units_v1.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read PostgreSQL AWS parameter-unit contract %q: %v", path, err)
+	}
+	var contract postgreSQLAWSParameterUnitContract
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		t.Fatalf("decode PostgreSQL AWS parameter-unit contract %q: %v", path, err)
+	}
+	return contract
+}
+
+func awsModifiedParameterValues(t *testing.T, calls []awsModifyCall) map[string]string {
+	t.Helper()
+	values := make(map[string]string)
+	for _, call := range calls {
+		for _, parameter := range call.parameters {
+			name := aws.ToString(parameter.ParameterName)
+			if _, exists := values[name]; exists {
+				t.Fatalf("AWS parameter %q was modified more than once", name)
+			}
+			values[name] = aws.ToString(parameter.ParameterValue)
+		}
+	}
+	return values
 }
 
 func TestAWSApplyFailureOutputDoesNotContainConfigSecrets(t *testing.T) {

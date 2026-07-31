@@ -1,0 +1,23 @@
+{
+  "persisted_values": {
+    "shared_buffers": "128MB",
+    "work_mem": "4MB",
+    "maintenance_work_mem": "64MB",
+    "effective_cache_size": "1GB",
+    "wal_buffers": "16384kB"
+  },
+  "recommendations": {
+    "shared_buffers": 134217728,
+    "work_mem": 4194304,
+    "maintenance_work_mem": 67108864,
+    "effective_cache_size": 1073741824,
+    "wal_buffers": 16777216
+  },
+  "aws_parameter_values": {
+    "shared_buffers": "16384",
+    "work_mem": "4096",
+    "maintenance_work_mem": "65536",
+    "effective_cache_size": "131072",
+    "wal_buffers": "2048"
+  }
+}
