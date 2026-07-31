@@ -20,6 +20,10 @@ interval_read_config_seconds=3600
 # Defaults to 43200 seconds, how often to generate recommend the config.
 interval_generate_config_seconds=${RELEEM_INTERVAL_COLLECT_ALL_METRICS:-43200}
 
+table_size_cache_table_threshold=${RELEEM_TABLE_SIZE_CACHE_TABLE_THRESHOLD:-10000}
+table_size_cache_ram_multiplier=${RELEEM_TABLE_SIZE_CACHE_RAM_MULTIPLIER:-4}
+table_size_cache_ttl_seconds=${RELEEM_TABLE_SIZE_CACHE_TTL_SECONDS:-604800}
+
 # QueryOptimization time.Duration `hcl:"interval_query_optimization_seconds"`
 # Defaults to 3600 seconds, how often query metrics are collected.
 interval_query_optimization_seconds=3600
