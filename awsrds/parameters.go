@@ -32,6 +32,30 @@ type ParameterInfo struct {
 	Scope                Scope
 }
 
+// ClusterParameterGroupLookup selects the group that may be described for
+// live cluster membership. ClassificationOnly means Group must never be used
+// as an AWS modification target.
+type ClusterParameterGroupLookup struct {
+	Group              string
+	ClassificationOnly bool
+}
+
+// SelectClusterParameterGroupLookup uses the configured group whenever one is
+// present. If configuration is empty, an attached Aurora cluster group may be
+// read solely to distinguish cluster membership from complete absence.
+func SelectClusterParameterGroupLookup(metadata Metadata, configuredGroup string) ClusterParameterGroupLookup {
+	if configuredGroup != "" {
+		return ClusterParameterGroupLookup{Group: configuredGroup}
+	}
+	if metadata.IsAurora() && metadata.DBClusterParameterGroup != "" {
+		return ClusterParameterGroupLookup{
+			Group:              metadata.DBClusterParameterGroup,
+			ClassificationOnly: true,
+		}
+	}
+	return ClusterParameterGroupLookup{}
+}
+
 // SkipReason is a stable, machine-readable explanation for a recommendation
 // that was not included in an apply plan.
 type SkipReason string
@@ -365,14 +389,9 @@ func normalizeParameterValue(name string, value interface{}) (string, error) {
 	case string:
 		normalized = typed
 	case json.Number:
-		if integer, err := typed.Int64(); err == nil {
-			normalized = strconv.FormatInt(integer, 10)
-		} else {
-			floating, floatErr := typed.Float64()
-			if floatErr != nil || math.IsNaN(floating) || math.IsInf(floating, 0) {
-				return "", fmt.Errorf("invalid JSON number")
-			}
-			normalized = strconv.FormatFloat(floating, 'f', -1, 64)
+		normalized = typed.String()
+		if normalized == "" || strings.TrimSpace(normalized) != normalized || !json.Valid([]byte(normalized)) || (normalized[0] != '-' && (normalized[0] < '0' || normalized[0] > '9')) {
+			return "", fmt.Errorf("invalid JSON number")
 		}
 	case float64:
 		if math.IsNaN(typed) || math.IsInf(typed, 0) {

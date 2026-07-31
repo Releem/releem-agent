@@ -485,7 +485,7 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			wantInstance: []simpleParameter{
 				{name: "innodb_max_dirty_pages_pct", value: "75", method: types.ApplyMethodImmediate},
 				{name: "max_connections", value: "250", method: types.ApplyMethodImmediate},
-				{name: "table_open_cache", value: "4000", method: types.ApplyMethodPendingReboot},
+				{name: "table_open_cache", value: "4000.0", method: types.ApplyMethodPendingReboot},
 			},
 		},
 		{
@@ -579,6 +579,163 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				t.Errorf("cluster groups = plan %q result %q, want %q", plan.Cluster.Group, result.Cluster.Group, tt.input.ConfiguredClusterGroup)
 			}
 		})
+	}
+}
+
+func TestBuildApplyPlanPreservesJSONNumberPrecision(t *testing.T) {
+	t.Parallel()
+
+	const (
+		largeInteger         = "9223372036854775809"
+		highPrecisionDecimal = "0.123456789012345678901234567890"
+	)
+	input := planInput(
+		map[string]ParameterInfo{
+			"large_integer":           liveParameter("large_integer", "dynamic", true, ScopeInstance),
+			"precise_decimal":         liveParameter("precise_decimal", "dynamic", true, ScopeInstance),
+			"unchanged_decimal":       liveParameter("unchanged_decimal", "dynamic", true, ScopeInstance),
+			"unchanged_large_integer": liveParameter("unchanged_large_integer", "dynamic", true, ScopeInstance),
+		},
+		nil,
+		map[string]interface{}{
+			"large_integer":           json.Number(largeInteger),
+			"precise_decimal":         json.Number(highPrecisionDecimal),
+			"unchanged_decimal":       json.Number(highPrecisionDecimal),
+			"unchanged_large_integer": json.Number(largeInteger),
+		},
+	)
+	input.CurrentValues = map[string]interface{}{
+		"unchanged_decimal":       highPrecisionDecimal,
+		"unchanged_large_integer": largeInteger,
+	}
+
+	plan, result := BuildApplyPlan(input)
+	wantParameters := []simpleParameter{
+		{name: "large_integer", value: largeInteger, method: types.ApplyMethodImmediate},
+		{name: "precise_decimal", value: highPrecisionDecimal, method: types.ApplyMethodImmediate},
+	}
+	if got := simpleParameters(plan.Instance.Parameters); !reflect.DeepEqual(got, wantParameters) {
+		t.Fatalf("instance parameters = %#v, want exact JSON number tokens %#v", got, wantParameters)
+	}
+	wantSkips := []SkippedVariable{
+		{Name: "unchanged_decimal", Reason: SkipUnchanged},
+		{Name: "unchanged_large_integer", Reason: SkipUnchanged},
+	}
+	if !reflect.DeepEqual(result.Instance.Skipped, wantSkips) {
+		t.Fatalf("instance skips = %#v, want %#v", result.Instance.Skipped, wantSkips)
+	}
+}
+
+func TestParameterGroupLookupSelectsConfiguredOrClassificationOnlyClusterGroup(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		metadata   Metadata
+		configured string
+		want       ClusterParameterGroupLookup
+	}{
+		{
+			name: "configured group is the lookup and apply candidate",
+			metadata: Metadata{
+				Engine:                  "aurora-mysql",
+				DBClusterParameterGroup: "attached-cluster-custom",
+			},
+			configured: "configured-cluster-custom",
+			want: ClusterParameterGroupLookup{
+				Group: "configured-cluster-custom",
+			},
+		},
+		{
+			name: "attached Aurora group is classification-only when configuration is empty",
+			metadata: Metadata{
+				Engine:                  "aurora-postgresql",
+				DBClusterParameterGroup: "attached-cluster-custom",
+			},
+			want: ClusterParameterGroupLookup{
+				Group:              "attached-cluster-custom",
+				ClassificationOnly: true,
+			},
+		},
+		{
+			name: "ordinary RDS never falls back to an attached cluster group",
+			metadata: Metadata{
+				Engine:                  "mysql",
+				DBClusterParameterGroup: "multi-az-cluster-group",
+			},
+			want: ClusterParameterGroupLookup{},
+		},
+		{
+			name:     "Aurora without an attached group has no lookup",
+			metadata: Metadata{Engine: "aurora-mysql"},
+			want:     ClusterParameterGroupLookup{},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := SelectClusterParameterGroupLookup(tt.metadata, tt.configured); got != tt.want {
+				t.Fatalf("SelectClusterParameterGroupLookup() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParameterGroupClassificationLookupKeepsEmptyClusterApplyTarget(t *testing.T) {
+	t.Parallel()
+
+	metadata := Metadata{
+		Engine:                  "aurora-mysql",
+		EngineMode:              "provisioned",
+		DBParameterGroup:        "orders-instance-custom",
+		DBClusterParameterGroup: "attached-cluster-custom",
+		IsClusterWriter:         true,
+	}
+	lookup := SelectClusterParameterGroupLookup(metadata, "")
+	client := &parameterClientFake{clusterPages: map[string]*rds.DescribeDBClusterParametersOutput{
+		"": {Parameters: []types.Parameter{{
+			ParameterName: aws.String("cluster_only"),
+			ApplyType:     aws.String("dynamic"),
+			IsModifiable:  aws.Bool(true),
+		}}},
+	}}
+	clusterParameters, err := ListParameters(context.Background(), client, lookup.Group, ScopeCluster)
+	if err != nil {
+		t.Fatalf("ListParameters() error = %v", err)
+	}
+
+	input := BuildApplyPlanInput{
+		Metadata:                metadata,
+		ConfiguredInstanceGroup: "orders-instance-custom",
+		ConfiguredClusterGroup:  "",
+		ClusterParameters:       clusterParameters,
+		Recommendations: map[string]interface{}{
+			"cluster_only": "1",
+			"absent":       "2",
+		},
+		CurrentValues: map[string]interface{}{},
+	}
+	plan, result := BuildApplyPlan(input)
+
+	if !lookup.ClassificationOnly {
+		t.Fatal("lookup is not classification-only")
+	}
+	if len(client.calls) != 1 || client.calls[0].group != metadata.DBClusterParameterGroup {
+		t.Fatalf("describe calls = %#v, want one read from attached group %q", client.calls, metadata.DBClusterParameterGroup)
+	}
+	if plan.Cluster.Group != "" || len(plan.Cluster.Parameters) != 0 {
+		t.Fatalf("cluster apply plan = %#v, want no target and no mutations", plan.Cluster)
+	}
+	wantClusterSkips := []SkippedVariable{{Name: "cluster_only", Reason: SkipGroupNotConfigured}}
+	if !reflect.DeepEqual(result.Cluster.Skipped, wantClusterSkips) {
+		t.Fatalf("cluster skips = %#v, want %#v", result.Cluster.Skipped, wantClusterSkips)
+	}
+	wantInstanceSkips := []SkippedVariable{{Name: "absent", Reason: SkipAbsent}}
+	if !reflect.DeepEqual(result.Instance.Skipped, wantInstanceSkips) {
+		t.Fatalf("instance skips = %#v, want %#v", result.Instance.Skipped, wantInstanceSkips)
 	}
 }
 
