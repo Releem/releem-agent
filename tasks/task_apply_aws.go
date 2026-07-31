@@ -667,72 +667,17 @@ func awsApplyScopeReady(ctx context.Context, client awsrds.Client, metadata awsr
 }
 
 func awsAppliedParametersObserved(ctx context.Context, client awsrds.Client, scope awsrds.Scope, plan awsrds.ScopePlan) (bool, error) {
-	expected := make(map[string]string, len(plan.Parameters))
+	listed, err := awsrds.ListParameters(ctx, client, plan.Group, scope)
+	if err != nil {
+		return false, fmt.Errorf("poll %s parameter group %q: %w", scope, plan.Group, err)
+	}
 	for _, parameter := range plan.Parameters {
-		expected[aws.ToString(parameter.ParameterName)] = aws.ToString(parameter.ParameterValue)
-	}
-	if len(expected) == 0 {
-		return true, nil
-	}
-
-	type parameterPage struct {
-		Parameters []types.Parameter
-		Marker     *string
-	}
-
-	seenMarkers := map[string]struct{}{}
-	var marker *string
-	for {
-		var page parameterPage
-		switch scope {
-		case awsrds.ScopeInstance:
-			output, err := client.DescribeDBParameters(ctx, &rds.DescribeDBParametersInput{
-				DBParameterGroupName: aws.String(plan.Group),
-				Marker:               marker,
-			})
-			if err != nil {
-				return false, fmt.Errorf("poll DB parameter group %q: %w", plan.Group, err)
-			}
-			if output == nil {
-				return false, fmt.Errorf("poll DB parameter group %q: nil output", plan.Group)
-			}
-			page = parameterPage{Parameters: output.Parameters, Marker: output.Marker}
-
-		case awsrds.ScopeCluster:
-			output, err := client.DescribeDBClusterParameters(ctx, &rds.DescribeDBClusterParametersInput{
-				DBClusterParameterGroupName: aws.String(plan.Group),
-				Marker:                      marker,
-			})
-			if err != nil {
-				return false, fmt.Errorf("poll DB cluster parameter group %q: %w", plan.Group, err)
-			}
-			if output == nil {
-				return false, fmt.Errorf("poll DB cluster parameter group %q: nil output", plan.Group)
-			}
-			page = parameterPage{Parameters: output.Parameters, Marker: output.Marker}
-
-		default:
-			return false, fmt.Errorf("unsupported AWS parameter scope %q", scope)
-		}
-
-		for _, parameter := range page.Parameters {
-			name := aws.ToString(parameter.ParameterName)
-			if value, exists := expected[name]; exists && aws.ToString(parameter.ParameterValue) == value {
-				delete(expected, name)
-			}
-		}
-		if len(expected) == 0 {
-			return true, nil
-		}
-
-		nextMarker := aws.ToString(page.Marker)
-		if nextMarker == "" {
+		name := aws.ToString(parameter.ParameterName)
+		actual, exists := listed[name]
+		if !exists || !actual.HasParameterValue ||
+			actual.ParameterValue != aws.ToString(parameter.ParameterValue) {
 			return false, nil
 		}
-		if _, exists := seenMarkers[nextMarker]; exists {
-			return false, fmt.Errorf("poll %s parameter group %q: repeated marker %q", scope, plan.Group, nextMarker)
-		}
-		seenMarkers[nextMarker] = struct{}{}
-		marker = aws.String(nextMarker)
 	}
+	return true, nil
 }
