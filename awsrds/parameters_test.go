@@ -90,13 +90,11 @@ func TestListParametersPaginatesAndIndexesLiveFields(t *testing.T) {
 					ApplyType:            "dynamic",
 					IsModifiable:         true,
 					SupportedEngineModes: []string{"provisioned", "serverless"},
-					Scope:                ScopeInstance,
 				},
 				"innodb_log_buffer_size": {
 					Name:         "innodb_log_buffer_size",
 					ApplyType:    "static",
 					IsModifiable: false,
-					Scope:        ScopeInstance,
 				},
 			},
 		},
@@ -132,13 +130,11 @@ func TestListParametersPaginatesAndIndexesLiveFields(t *testing.T) {
 					ApplyType:            "dynamic",
 					IsModifiable:         true,
 					SupportedEngineModes: []string{"provisioned"},
-					Scope:                ScopeCluster,
 				},
 				"binlog_format": {
 					Name:         "binlog_format",
 					ApplyType:    "static",
 					IsModifiable: true,
-					Scope:        ScopeCluster,
 				},
 			},
 		},
@@ -224,6 +220,31 @@ type simpleParameter struct {
 	name   string
 	value  string
 	method types.ApplyMethod
+}
+
+func TestBuildApplyPlanUnknownInstanceMembershipFailsClosed(t *testing.T) {
+	input := BuildApplyPlanInput{
+		Metadata: Metadata{
+			Engine: "aurora-mysql", IsClusterWriter: true,
+			DBParameterGroup:        "default.aurora-mysql8.0",
+			DBClusterParameterGroup: "cluster-custom",
+		},
+		ConfiguredInstanceGroup:   "default.aurora-mysql8.0",
+		ConfiguredClusterGroup:    "cluster-custom",
+		InstanceMembershipUnknown: true,
+		ClusterParameters: map[string]ParameterInfo{
+			"cluster_only": {Name: "cluster_only", ApplyType: "dynamic", IsModifiable: true},
+		},
+		Recommendations: map[string]interface{}{"cluster_only": "1"},
+	}
+	plan, result := BuildApplyPlan(input)
+	if len(plan.Cluster.Parameters) != 0 {
+		t.Fatalf("cluster plan = %#v, want fail-closed empty plan", plan.Cluster)
+	}
+	if len(result.Instance.Skipped) != 1 ||
+		result.Instance.Skipped[0].Reason != SkipDefaultGroup {
+		t.Fatalf("instance result = %#v, want default-group skip", result.Instance)
+	}
 }
 
 func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
@@ -803,12 +824,11 @@ func planInput(instance, cluster map[string]ParameterInfo, recommendations map[s
 	}
 }
 
-func liveParameter(name, applyType string, modifiable bool, scope Scope) ParameterInfo {
+func liveParameter(name, applyType string, modifiable bool, _ Scope) ParameterInfo {
 	return ParameterInfo{
 		Name:         name,
 		ApplyType:    applyType,
 		IsModifiable: modifiable,
-		Scope:        scope,
 	}
 }
 

@@ -271,8 +271,8 @@ func TestApplyConfAwsRdsValidatesGroupMismatchesIndependently(t *testing.T) {
 			} else {
 				scopeResult = result.Cluster
 			}
-			if len(scopeResult.Skipped) != 1 || scopeResult.Skipped[0].Reason != awsrds.SkipGroupMismatch || scopeResult.Skipped[0].ExpectedGroup != "" || scopeResult.Skipped[0].ActualGroup != "" {
-				t.Fatalf("per-variable mismatch result = %#v, want one value-free group-mismatch skip", scopeResult.Skipped)
+			if len(scopeResult.Skipped) != 1 || scopeResult.Skipped[0].Reason != awsrds.SkipGroupMismatch {
+				t.Fatalf("per-variable mismatch result = %#v, want one group-mismatch skip", scopeResult.Skipped)
 			}
 			if len(scopeResult.Diagnostics) != 1 || scopeResult.Diagnostics[0].Reason != awsrds.SkipGroupMismatch || scopeResult.Diagnostics[0].ExpectedGroup != tt.wantExpected || scopeResult.Diagnostics[0].ActualGroup != tt.wantActual {
 				t.Fatalf("scope diagnostics = %#v, want expected %q actual %q", scopeResult.Diagnostics, tt.wantExpected, tt.wantActual)
@@ -341,8 +341,8 @@ func TestApplyConfAwsRdsReportsEachGroupMismatchOnceAtScopeLevel(t *testing.T) {
 		t.Fatalf("instance skips = %#v, want two rejected variables", structured.Instance.Skipped)
 	}
 	for _, skipped := range structured.Instance.Skipped {
-		if skipped.Reason != awsrds.SkipGroupMismatch || skipped.ExpectedGroup != "" || skipped.ActualGroup != "" {
-			t.Fatalf("per-variable mismatch duplicated scope details: %#v", skipped)
+		if skipped.Reason != awsrds.SkipGroupMismatch {
+			t.Fatalf("per-variable mismatch skip = %#v, want group mismatch", skipped)
 		}
 	}
 	if len(structured.Cluster.Skipped) != 0 {
@@ -817,7 +817,7 @@ func TestAWSApplyWaiterDoesNotAcceptPreChangeSnapshot(t *testing.T) {
 }
 
 func TestAWSApplyWaitTimeoutPreservesExitCodeSixThroughScopeWrapping(t *testing.T) {
-	err := newAWSApplyTimeoutError(awsrds.ScopeCluster)
+	err := newAWSApplyTimeoutErrorForScopes(awsApplyModifiedScopes{Cluster: true})
 	if exitCode := awsApplyExitCode(err); exitCode != awsApplyExitTimeout {
 		t.Fatalf("awsApplyExitCode() = %d, want timeout exit %d", exitCode, awsApplyExitTimeout)
 	}

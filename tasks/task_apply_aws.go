@@ -231,19 +231,16 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 			logger.Infof("DB cluster parameter group %q loaded for recommendation classification only", clusterLookup.Group)
 		}
 	}
-	if instanceMembershipUnknown {
-		reserveUnknownInstanceMembership(instanceParameters, recommendations)
-	}
-
 	plan, plannedResult := awsrds.BuildApplyPlan(awsrds.BuildApplyPlanInput{
-		Metadata:                metadata,
-		ConfiguredInstanceGroup: configuration.AwsRDSParameterGroup,
-		ConfiguredClusterGroup:  configuration.AwsRDSClusterParameterGroup,
-		InstanceParameters:      instanceParameters,
-		ClusterParameters:       clusterParameters,
-		Recommendations:         recommendations,
-		CurrentValues:           awsCurrentParameterValues(metrics.DB.Conf.Variables),
-		PendingRebootOnly:       mode == AWSApplyPendingRebootOnly,
+		Metadata:                  metadata,
+		ConfiguredInstanceGroup:   configuration.AwsRDSParameterGroup,
+		ConfiguredClusterGroup:    configuration.AwsRDSClusterParameterGroup,
+		InstanceMembershipUnknown: instanceMembershipUnknown,
+		InstanceParameters:        instanceParameters,
+		ClusterParameters:         clusterParameters,
+		Recommendations:           recommendations,
+		CurrentValues:             awsCurrentParameterValues(metrics.DB.Conf.Variables),
+		PendingRebootOnly:         mode == AWSApplyPendingRebootOnly,
 	})
 	result = plannedResult
 	recordAWSGroupMismatchDiagnostics(&result, groupValidation, metadata, configuration)
@@ -325,23 +322,6 @@ func appendAWSGroupMismatchDiagnostic(result *awsrds.ScopeResult, expected, actu
 
 func isDefaultAWSParameterGroup(group string) bool {
 	return strings.HasPrefix(strings.ToLower(group), "default.")
-}
-
-func reserveUnknownInstanceMembership(parameters map[string]awsrds.ParameterInfo, recommendations map[string]interface{}) {
-	for name := range recommendations {
-		if _, exists := parameters[name]; exists {
-			continue
-		}
-		// groupSkip runs before live mutability/apply-type checks. This
-		// placeholder therefore cannot become an AWS parameter; it only keeps
-		// an unknown instance member from falling through to cluster scope.
-		parameters[name] = awsrds.ParameterInfo{
-			Name:         name,
-			ApplyType:    "dynamic",
-			IsModifiable: true,
-			Scope:        awsrds.ScopeInstance,
-		}
-	}
 }
 
 func awsCurrentParameterValues(values models.MetricGroupValue) map[string]interface{} {
@@ -479,11 +459,6 @@ func (err *awsApplyWaitError) Error() string {
 
 func (err *awsApplyWaitError) Unwrap() error {
 	return err.Err
-}
-
-func newAWSApplyTimeoutError(scope awsrds.Scope) error {
-	unresolved := awsApplyModifiedScopes{Instance: scope == awsrds.ScopeInstance, Cluster: scope == awsrds.ScopeCluster}
-	return newAWSApplyTimeoutErrorForScopes(unresolved)
 }
 
 func newAWSApplyTimeoutErrorForScopes(unresolved awsApplyModifiedScopes) error {

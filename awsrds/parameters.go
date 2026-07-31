@@ -29,7 +29,6 @@ type ParameterInfo struct {
 	ApplyType            string
 	IsModifiable         bool
 	SupportedEngineModes []string
-	Scope                Scope
 	ParameterValue       string
 	HasParameterValue    bool
 }
@@ -79,12 +78,9 @@ const (
 )
 
 // SkippedVariable records one recommendation rejected by live Agent checks.
-// Group mismatch fields are names only and never contain parameter values.
 type SkippedVariable struct {
-	Name          string     `json:"name"`
-	Reason        SkipReason `json:"reason"`
-	ExpectedGroup string     `json:"expected_group,omitempty"`
-	ActualGroup   string     `json:"actual_group,omitempty"`
+	Name   string     `json:"name"`
+	Reason SkipReason `json:"reason"`
 }
 
 // FailedBatch is populated by the apply service when one AWS modification
@@ -130,14 +126,15 @@ func (result *ApplyResult) Sort() {
 // BuildApplyPlanInput contains only discovered/live state and current and
 // recommended values, which keeps BuildApplyPlan pure and unit-testable.
 type BuildApplyPlanInput struct {
-	Metadata                Metadata
-	ConfiguredInstanceGroup string
-	ConfiguredClusterGroup  string
-	InstanceParameters      map[string]ParameterInfo
-	ClusterParameters       map[string]ParameterInfo
-	Recommendations         map[string]interface{}
-	CurrentValues           map[string]interface{}
-	PendingRebootOnly       bool
+	Metadata                  Metadata
+	ConfiguredInstanceGroup   string
+	ConfiguredClusterGroup    string
+	InstanceMembershipUnknown bool
+	InstanceParameters        map[string]ParameterInfo
+	ClusterParameters         map[string]ParameterInfo
+	Recommendations           map[string]interface{}
+	CurrentValues             map[string]interface{}
+	PendingRebootOnly         bool
 }
 
 // ScopePlan contains the exact group and AWS parameters for one modify API.
@@ -218,7 +215,6 @@ func ListParameters(ctx context.Context, client ParameterReader, group string, s
 				ApplyType:            aws.ToString(parameter.ApplyType),
 				IsModifiable:         aws.ToBool(parameter.IsModifiable),
 				SupportedEngineModes: append([]string(nil), parameter.SupportedEngineModes...),
-				Scope:                scope,
 			}
 			if parameter.ParameterValue != nil {
 				info.ParameterValue = aws.ToString(parameter.ParameterValue)
@@ -261,6 +257,14 @@ func BuildApplyPlan(input BuildApplyPlanInput) (ApplyPlan, ApplyResult) {
 		parameter, inInstance := input.InstanceParameters[name]
 		if inInstance {
 			buildScopeParameter(input, name, parameter, ScopeInstance, &plan.Instance, &result.Instance)
+			continue
+		}
+		if input.InstanceMembershipUnknown {
+			skip, rejected := groupSkip(input, name, ScopeInstance)
+			if !rejected {
+				skip = SkippedVariable{Name: name, Reason: SkipAbsent}
+			}
+			result.Instance.Skipped = append(result.Instance.Skipped, skip)
 			continue
 		}
 
@@ -484,13 +488,7 @@ func sortScopeResult(result *ScopeResult) {
 		if left.Name != right.Name {
 			return left.Name < right.Name
 		}
-		if left.Reason != right.Reason {
-			return left.Reason < right.Reason
-		}
-		if left.ExpectedGroup != right.ExpectedGroup {
-			return left.ExpectedGroup < right.ExpectedGroup
-		}
-		return left.ActualGroup < right.ActualGroup
+		return left.Reason < right.Reason
 	})
 	for index := range result.Failed {
 		if result.Failed[index].Parameters == nil {
