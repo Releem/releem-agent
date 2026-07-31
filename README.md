@@ -60,6 +60,15 @@ The easiest way to get started with Releem is with [our managed service in the c
 
 To start using Releem just sign up at [https://releem.com](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#) and install Releem Agent on your server.
 
+### Aurora parameter groups
+
+Releem supports Amazon Aurora MySQL and Aurora PostgreSQL. Configure one Agent
+for each DB instance endpoint. In the CloudFormation templates,
+`DBClusterParameterGroup` is optional; set it when the Aurora cluster has a
+separate cluster parameter group to auto-apply. Run the Agent that targets the
+writer instance with `rds:ModifyDBClusterParameterGroup` permission so cluster
+parameters can be auto-applied.
+
 ## Security
 
 Releem does not collect any user data.
@@ -84,7 +93,7 @@ Join the Releem Community on [Slack](https://join.slack.com/t/releem-community/s
 - PostgreSQL 15, PostgreSQL 16, PostgreSQL 17, PostgreSQL 18
 - Centos, CloudLinux, Debian, Ubuntu, RockyLinux
 - Windows Server 2012, Windows Server 2016, Windows Server 2019, Windows Server 2022, Windows Server 2025
-- Amazon RDS MySQL, Amazon RDS Aurora, Amazon RDS MariaDB
+- Amazon RDS MySQL, Amazon RDS Aurora MySQL, Amazon RDS Aurora PostgreSQL, Amazon RDS MariaDB
 - Google Cloud SQL MySQL, Google Cloud SQL PostgreSQL
 
 *** MINIMAL REQUIREMENTS ***
@@ -116,4 +125,3 @@ You can help us by reporting problems, suggestions or contributing to the code.
 Go to our [issue tracker](https://github.com/releem/mysqlconfigurer/issues) and check if your problem is already reported. If not, create a new issue with a descriptive title and detail your suggestion or steps to reproduce the problem.
 
 If you have suggestions or want to discuss potential improvements, please visit our [Discussions](https://github.com/releem/mysqlconfigurer/discussions) page. We value your input and look forward to engaging with the community to enhance our product.
-

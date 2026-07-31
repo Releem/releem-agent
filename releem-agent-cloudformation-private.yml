@@ -38,6 +38,10 @@ Parameters:
   DBParameterGroup:
     Description: The Parameter group name.
     Type: String    
+  DBClusterParameterGroup:
+    Description: Optional Aurora DB cluster parameter group name.
+    Type: String
+    Default: ""
   ClusterName:
     Description: ECS cluster name
     Type: String
@@ -168,6 +172,8 @@ Resources:
                   Value: !Ref QueryOptimization       
                 - Name: AWS_RDS_PARAMETER_GROUP
                   Value: !Ref DBParameterGroup
+                - Name: AWS_RDS_CLUSTER_PARAMETER_GROUP
+                  Value: !Ref DBClusterParameterGroup
                 - Name: RELEEM_DATABASES_QUERY_OPTIMIZATION
                   Value: !Ref DBQueryOptimization
                 - Name: RELEEM_INTERVAL_COLLECT_ALL_METRICS
@@ -298,6 +304,7 @@ Resources:
                     - rds:Describe*
                     - cloudwatch:Get*
                     - rds:ModifyDBParameterGroup
+                    - rds:ModifyDBClusterParameterGroup
                   Resource: "*"
                   
 Metadata:
@@ -320,5 +327,6 @@ Metadata:
         - QueryOptimization
         - DBQueryOptimization
         - DBParameterGroup
+        - DBClusterParameterGroup
         - DBSSLMode
         - IntervalCollectAllMetrics
