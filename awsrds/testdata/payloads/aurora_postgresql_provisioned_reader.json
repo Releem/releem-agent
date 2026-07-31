@@ -1,0 +1,30 @@
+{
+  "System": {
+    "Info": {
+      "Host": {
+        "Engine": "aurora-postgresql",
+        "ServerlessDatabaseCapacity": 0,
+        "DBInstanceIdentifier": "analytics-reader",
+        "DBInstanceResourceID": "db-resource-pg-reader",
+        "DBInstanceClass": "db.r7g.large",
+        "DBParameterGroup": "analytics-instance-pg",
+        "DBClusterIdentifier": "analytics-cluster",
+        "DBClusterParameterGroup": "analytics-cluster-pg",
+        "IsClusterWriter": false,
+        "EngineMode": "provisioned"
+      }
+    }
+  },
+  "DB": {
+    "Conf": {
+      "Variables": {}
+    }
+  },
+  "ReleemAgent": {
+    "Conf": {
+      "AwsRDSDB": "analytics-reader",
+      "AwsRDSParameterGroup": "analytics-instance-pg",
+      "AwsRDSClusterParameterGroup": "analytics-cluster-pg"
+    }
+  }
+}

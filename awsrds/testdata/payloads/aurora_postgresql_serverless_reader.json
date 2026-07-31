@@ -1,0 +1,30 @@
+{
+  "System": {
+    "Info": {
+      "Host": {
+        "Engine": "aurora-postgresql",
+        "ServerlessDatabaseCapacity": 4,
+        "DBInstanceIdentifier": "analytics-serverless-reader",
+        "DBInstanceResourceID": "db-resource-pg-serverless-reader",
+        "DBInstanceClass": "db.serverless",
+        "DBParameterGroup": "analytics-serverless-instance-pg",
+        "DBClusterIdentifier": "analytics-serverless-cluster",
+        "DBClusterParameterGroup": "analytics-serverless-cluster-pg",
+        "IsClusterWriter": false,
+        "EngineMode": "provisioned"
+      }
+    }
+  },
+  "DB": {
+    "Conf": {
+      "Variables": {}
+    }
+  },
+  "ReleemAgent": {
+    "Conf": {
+      "AwsRDSDB": "analytics-serverless-reader",
+      "AwsRDSParameterGroup": "analytics-serverless-instance-pg",
+      "AwsRDSClusterParameterGroup": "analytics-serverless-cluster-pg"
+    }
+  }
+}
