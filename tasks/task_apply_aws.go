@@ -27,11 +27,13 @@ const (
 )
 
 // These values preserve the public RDS task meanings used before routed
-// parameter application: 8 is a general AWS apply failure and 9 identifies
-// AccessDenied. Group mismatches are safe per-scope skips and use exit code 0.
+// parameter application: 6 is a bounded-wait timeout, 8 is a general AWS
+// apply failure, and 9 identifies AccessDenied. Group mismatches are safe
+// per-scope skips and use exit code 0.
 const (
 	awsApplyExitSuccess             = 0
 	awsApplyExitInstanceUnavailable = 1
+	awsApplyExitTimeout             = 6
 	awsApplyExitFailure             = 8
 	awsApplyExitAccessDenied        = 9
 
@@ -39,6 +41,19 @@ const (
 	awsApplyTaskStatusFailure = 4
 	awsApplyBatchSize         = 20
 )
+
+const (
+	awsApplyErrorTimeout      = "timeout"
+	awsApplyErrorAccessDenied = "access-denied"
+	awsApplyErrorAWSAPI       = "aws-api-error"
+)
+
+var errAWSApplyWaitTimeout = errors.New("timed out waiting for AWS parameter apply")
+
+type awsAPIError interface {
+	error
+	ErrorCode() string
+}
 
 const (
 	awsApplyWaitTimeout  = 400 * time.Second
@@ -136,11 +151,27 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 
 	instanceParameters := map[string]awsrds.ParameterInfo{}
 	instanceLookupGroup := configuration.AwsRDSParameterGroup
-	if groupValidation.InstanceMismatch {
+	instanceClassificationOnly := false
+	instanceMembershipUnknown := false
+	switch {
+	case isDefaultAWSParameterGroup(configuration.AwsRDSParameterGroup):
+		// Default groups cannot be modified. Do not call AWS for them and
+		// conservatively reserve instance priority for every recommendation.
+		instanceLookupGroup = ""
+		instanceMembershipUnknown = true
+	case configuration.AwsRDSParameterGroup == "":
+		// An attached group can still classify instance membership when old or
+		// incomplete Agent configuration omits the mutation target.
+		instanceLookupGroup = metadata.DBParameterGroup
+		instanceClassificationOnly = true
+		instanceMembershipUnknown = instanceLookupGroup == ""
+	case groupValidation.InstanceMismatch:
 		// A mismatched configured group is never a mutation target. Read the
 		// attached group only to classify recommendations so BuildApplyPlan can
 		// report the mismatch without blocking the cluster scope.
 		instanceLookupGroup = metadata.DBParameterGroup
+		instanceClassificationOnly = true
+		instanceMembershipUnknown = instanceLookupGroup == ""
 	}
 	if instanceLookupGroup != "" {
 		instanceParameters, err = awsrds.ListParameters(
@@ -150,8 +181,13 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 			awsrds.ScopeInstance,
 		)
 		if err != nil {
-			recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
-			return fail(awsApplyExitCode(err))
+			if !instanceClassificationOnly {
+				recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
+				return fail(awsApplyExitCode(err))
+			}
+			logger.Errorf("Optional instance parameter classification for group %q failed: %v", instanceLookupGroup, err)
+			instanceParameters = map[string]awsrds.ParameterInfo{}
+			instanceMembershipUnknown = true
 		}
 	}
 
@@ -160,7 +196,12 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		metadata,
 		configuration.AwsRDSClusterParameterGroup,
 	)
-	if groupValidation.ClusterMismatch {
+	switch {
+	case isDefaultAWSParameterGroup(configuration.AwsRDSClusterParameterGroup):
+		// Reject default groups before ListParameters; they are never eligible
+		// targets and their metadata is unnecessary for valid instance work.
+		clusterLookup = awsrds.ClusterParameterGroupLookup{}
+	case groupValidation.ClusterMismatch:
 		// Keep the selector call as the normal lookup contract, but never read
 		// or modify a mismatched configured group. Attached membership is safe
 		// classification data and the original configuration remains the plan
@@ -178,12 +219,18 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 			awsrds.ScopeCluster,
 		)
 		if err != nil {
-			recordAWSApplyFailure(&result, awsrds.ScopeCluster, nil, err)
-			return fail(awsApplyExitCode(err))
-		}
-		if clusterLookup.ClassificationOnly {
+			if !clusterLookup.ClassificationOnly {
+				recordAWSApplyFailure(&result, awsrds.ScopeCluster, nil, err)
+				return fail(awsApplyExitCode(err))
+			}
+			logger.Errorf("Optional cluster parameter classification for group %q failed: %v", clusterLookup.Group, err)
+			clusterParameters = map[string]awsrds.ParameterInfo{}
+		} else if clusterLookup.ClassificationOnly {
 			logger.Infof("DB cluster parameter group %q loaded for recommendation classification only", clusterLookup.Group)
 		}
+	}
+	if instanceMembershipUnknown {
+		reserveUnknownInstanceMembership(instanceParameters, recommendations)
 	}
 
 	plan, plannedResult := awsrds.BuildApplyPlan(awsrds.BuildApplyPlanInput{
@@ -248,6 +295,27 @@ func validateAWSGroups(logger logging.Logger, metadata awsrds.Metadata, configur
 	return validation
 }
 
+func isDefaultAWSParameterGroup(group string) bool {
+	return strings.HasPrefix(strings.ToLower(group), "default.")
+}
+
+func reserveUnknownInstanceMembership(parameters map[string]awsrds.ParameterInfo, recommendations map[string]interface{}) {
+	for name := range recommendations {
+		if _, exists := parameters[name]; exists {
+			continue
+		}
+		// groupSkip runs before live mutability/apply-type checks. This
+		// placeholder therefore cannot become an AWS parameter; it only keeps
+		// an unknown instance member from falling through to cluster scope.
+		parameters[name] = awsrds.ParameterInfo{
+			Name:         name,
+			ApplyType:    "dynamic",
+			IsModifiable: true,
+			Scope:        awsrds.ScopeInstance,
+		}
+	}
+}
+
 func applyAWSPlan(ctx context.Context, client awsrds.Client, plan awsrds.ApplyPlan, result *awsrds.ApplyResult) (awsApplyWaitRequest, error) {
 	waitRequest := awsApplyWaitRequest{
 		Instance: awsrds.ScopePlan{Group: plan.Instance.Group, Parameters: []types.Parameter{}},
@@ -298,7 +366,7 @@ func applyAWSScopeBatches(ctx context.Context, client awsrds.Client, scope awsrd
 		if err != nil {
 			result.Failed = append(result.Failed, awsrds.FailedBatch{
 				Parameters: names,
-				Error:      err.Error(),
+				Error:      awsApplySafeErrorCode(err),
 			})
 			return applied, fmt.Errorf("modify %s parameter group %q for parameters %s: %w", scope, plan.Group, strings.Join(names, ","), err)
 		}
@@ -341,7 +409,7 @@ func newAWSApplyScopeResult(group string) awsrds.ScopeResult {
 func recordAWSApplyFailure(result *awsrds.ApplyResult, scope awsrds.Scope, parameters []string, err error) {
 	failure := awsrds.FailedBatch{
 		Parameters: append([]string(nil), parameters...),
-		Error:      err.Error(),
+		Error:      awsApplySafeErrorCode(err),
 	}
 	if scope == awsrds.ScopeCluster {
 		result.Cluster.Failed = append(result.Cluster.Failed, failure)
@@ -361,6 +429,17 @@ func (err *awsApplyWaitError) Error() string {
 
 func (err *awsApplyWaitError) Unwrap() error {
 	return err.Err
+}
+
+func newAWSApplyTimeoutError(scope awsrds.Scope) error {
+	return &awsApplyWaitError{Scope: scope, Err: errAWSApplyWaitTimeout}
+}
+
+func newAWSApplyPollingError(scope awsrds.Scope, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return newAWSApplyTimeoutError(scope)
+	}
+	return &awsApplyWaitError{Scope: scope, Err: err}
 }
 
 func recordAWSWaitFailure(result *awsrds.ApplyResult, request awsApplyWaitRequest, err error) {
@@ -389,10 +468,54 @@ func marshalAWSApplyResult(result *awsrds.ApplyResult) string {
 }
 
 func awsApplyExitCode(err error) int {
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "accessdenied") {
+	if errors.Is(err, errAWSApplyWaitTimeout) {
+		return awsApplyExitTimeout
+	}
+	if isAWSAccessDenied(err) {
 		return awsApplyExitAccessDenied
 	}
 	return awsApplyExitFailure
+}
+
+func awsApplySafeErrorCode(err error) string {
+	if errors.Is(err, errAWSApplyWaitTimeout) {
+		return awsApplyErrorTimeout
+	}
+	if isAWSAccessDenied(err) {
+		return awsApplyErrorAccessDenied
+	}
+
+	var apiError awsAPIError
+	if errors.As(err, &apiError) {
+		if code := apiError.ErrorCode(); isSafeAWSAPIErrorCode(code) {
+			return "aws-api:" + code
+		}
+	}
+	return awsApplyErrorAWSAPI
+}
+
+func isAWSAccessDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiError awsAPIError
+	if errors.As(err, &apiError) && strings.Contains(strings.ToLower(apiError.ErrorCode()), "accessdenied") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "accessdenied")
+}
+
+func isSafeAWSAPIErrorCode(code string) bool {
+	if code == "" || len(code) > 128 {
+		return false
+	}
+	for _, char := range code {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '.' || char == '_' || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request awsApplyWaitRequest) error {
@@ -410,14 +533,14 @@ func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request a
 		if !instanceReady {
 			ready, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeInstance, request.Instance)
 			if err != nil {
-				return &awsApplyWaitError{Scope: awsrds.ScopeInstance, Err: err}
+				return newAWSApplyPollingError(awsrds.ScopeInstance, err)
 			}
 			instanceReady = ready
 		}
 		if !clusterReady {
 			ready, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeCluster, request.Cluster)
 			if err != nil {
-				return &awsApplyWaitError{Scope: awsrds.ScopeCluster, Err: err}
+				return newAWSApplyPollingError(awsrds.ScopeCluster, err)
 			}
 			clusterReady = ready
 		}
@@ -433,7 +556,7 @@ func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request a
 			if instanceReady {
 				scope = awsrds.ScopeCluster
 			}
-			return &awsApplyWaitError{Scope: scope, Err: fmt.Errorf("timed out after %s", awsApplyWaitTimeout)}
+			return newAWSApplyTimeoutError(scope)
 		case <-timer.C:
 		}
 	}

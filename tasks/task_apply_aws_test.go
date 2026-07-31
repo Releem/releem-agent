@@ -323,6 +323,129 @@ func TestApplyConfAwsRdsReaderAndClassificationOnlyClusterGroupsNeverModifyClust
 	}
 }
 
+func TestApplyConfAwsRdsIneligibleClusterClassificationErrorsDoNotBlockInstance(t *testing.T) {
+	const classificationSecret = "classification-error-secret"
+	tests := []struct {
+		name                   string
+		configuredClusterGroup string
+		attachedClusterGroup   string
+		wantDescribeGroups     []string
+	}{
+		{
+			name:                 "missing cluster config makes attached lookup optional",
+			attachedClusterGroup: "attached-cluster",
+			wantDescribeGroups:   []string{"attached-cluster"},
+		},
+		{
+			name:                   "cluster mismatch makes attached lookup optional",
+			configuredClusterGroup: "missing-cluster",
+			attachedClusterGroup:   "attached-cluster",
+			wantDescribeGroups:     []string{"attached-cluster"},
+		},
+		{
+			name:                   "default cluster group is rejected before lookup",
+			configuredClusterGroup: "default.aurora-mysql8.0",
+			attachedClusterGroup:   "default.aurora-mysql8.0",
+			wantDescribeGroups:     nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := auroraApplyClient(true, "instance-custom", tt.attachedClusterGroup)
+			client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+				Parameters: []types.Parameter{modifiableAWSParameter("instance_value", "dynamic")},
+			}}
+			client.clusterDescribeErrors[tt.attachedClusterGroup] = errors.New(classificationSecret)
+			installAWSApplyTestDependencies(t, client, nil)
+
+			exitCode, status, output := ApplyConfAwsRds(
+				&awsApplyRepeater{recommendations: `{"instance_value":"2"}`},
+				[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"instance_value": "1"}}},
+				testAWSApplyLogger(),
+				awsApplyConfig("instance-custom", tt.configuredClusterGroup),
+				AWSApplyAll,
+			)
+
+			if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+				t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want valid instance success", exitCode, status, output)
+			}
+			if len(client.instanceModifyCalls) != 1 || len(client.clusterModifyCalls) != 0 {
+				t.Fatalf("modify calls = instance %d cluster %d, want 1/0", len(client.instanceModifyCalls), len(client.clusterModifyCalls))
+			}
+			if !reflect.DeepEqual(client.clusterDescribeGroups, tt.wantDescribeGroups) {
+				t.Fatalf("cluster classification reads = %v, want %v", client.clusterDescribeGroups, tt.wantDescribeGroups)
+			}
+			if strings.Contains(output, classificationSecret) {
+				t.Fatalf("optional classification error leaked into task output: %s", output)
+			}
+		})
+	}
+}
+
+func TestApplyConfAwsRdsUnknownInstanceClassificationCannotFallThroughToCluster(t *testing.T) {
+	client := auroraApplyClient(true, "attached-instance", "cluster-custom")
+	client.instanceDescribeErrors["attached-instance"] = errors.New("instance classification unavailable")
+	client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
+		Parameters: []types.Parameter{modifiableAWSParameter("shared_name", "dynamic")},
+	}}
+	installAWSApplyTestDependencies(t, client, nil)
+
+	exitCode, status, output := ApplyConfAwsRds(
+		&awsApplyRepeater{recommendations: `{"shared_name":"2"}`},
+		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"shared_name": "1"}}},
+		testAWSApplyLogger(),
+		awsApplyConfig("", "cluster-custom"),
+		AWSApplyAll,
+	)
+
+	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want safe no-op", exitCode, status, output)
+	}
+	if !reflect.DeepEqual(client.instanceDescribeGroups, []string{"attached-instance"}) {
+		t.Fatalf("instance classification reads = %v, want attached-instance", client.instanceDescribeGroups)
+	}
+	if len(client.clusterModifyCalls) != 0 {
+		t.Fatalf("cluster modify calls = %d, want none when instance membership is unknown", len(client.clusterModifyCalls))
+	}
+	result := decodeAWSApplyResult(t, output)
+	if len(result.Instance.Skipped) != 1 || result.Instance.Skipped[0].Name != "shared_name" || result.Instance.Skipped[0].Reason != awsrds.SkipGroupNotConfigured {
+		t.Fatalf("instance safety result = %#v, want group-not-configured ownership guard", result.Instance)
+	}
+}
+
+func TestApplyConfAwsRdsDefaultInstanceGroupIsRejectedBeforeLookup(t *testing.T) {
+	const defaultGroup = "default.aurora-mysql8.0"
+	client := auroraApplyClient(true, defaultGroup, "cluster-custom")
+	client.instanceDescribeErrors[defaultGroup] = errors.New("default group must not be described")
+	client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
+		Parameters: []types.Parameter{modifiableAWSParameter("shared_name", "dynamic")},
+	}}
+	installAWSApplyTestDependencies(t, client, nil)
+
+	exitCode, status, output := ApplyConfAwsRds(
+		&awsApplyRepeater{recommendations: `{"shared_name":"2"}`},
+		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"shared_name": "1"}}},
+		testAWSApplyLogger(),
+		awsApplyConfig(defaultGroup, "cluster-custom"),
+		AWSApplyAll,
+	)
+
+	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want default-group safe no-op", exitCode, status, output)
+	}
+	if len(client.instanceDescribeGroups) != 0 {
+		t.Fatalf("instance parameter reads = %v, want default group rejected before lookup", client.instanceDescribeGroups)
+	}
+	if len(client.clusterModifyCalls) != 0 {
+		t.Fatalf("cluster modify calls = %d, want none while instance priority is unknown", len(client.clusterModifyCalls))
+	}
+	result := decodeAWSApplyResult(t, output)
+	if len(result.Instance.Skipped) != 1 || result.Instance.Skipped[0].Reason != awsrds.SkipDefaultGroup {
+		t.Fatalf("default instance result = %#v, want default-group skip", result.Instance)
+	}
+}
+
 func TestApplyConfAwsRdsEmptyPlanIsSuccessfulNoOp(t *testing.T) {
 	client := auroraApplyClient(true, "instance-custom", "cluster-custom")
 	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {}}
@@ -385,8 +508,8 @@ func TestApplyConfAwsRdsAWSFailurePreservesEarlierBatchesAndNamesFailure(t *test
 		t.Fatalf("instance failure = %#v, want one failure in instance-custom", result.Instance)
 	}
 	failure := result.Instance.Failed[0]
-	if !reflect.DeepEqual(failure.Parameters, []string{"parameter_20"}) || failure.Error != wantErr.Error() {
-		t.Fatalf("failed batch = %#v, want parameter_20 and %q", failure, wantErr)
+	if !reflect.DeepEqual(failure.Parameters, []string{"parameter_20"}) || failure.Error != awsApplyErrorAWSAPI {
+		t.Fatalf("failed batch = %#v, want parameter_20 and safe category %q", failure, awsApplyErrorAWSAPI)
 	}
 }
 
@@ -408,6 +531,10 @@ func TestApplyConfAwsRdsAccessDeniedHasDistinctExitCode(t *testing.T) {
 
 	if exitCode != awsApplyExitAccessDenied || status != awsApplyTaskStatusFailure {
 		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want AccessDenied exit %d", exitCode, status, output, awsApplyExitAccessDenied)
+	}
+	result := decodeAWSApplyResult(t, output)
+	if len(result.Instance.Failed) != 1 || result.Instance.Failed[0].Error != awsApplyErrorAccessDenied {
+		t.Fatalf("AccessDenied result = %#v, want safe category %q", result.Instance.Failed, awsApplyErrorAccessDenied)
 	}
 }
 
@@ -519,6 +646,45 @@ func TestAWSApplyWaiterDoesNotAcceptPreChangeSnapshot(t *testing.T) {
 	}
 	if !reflect.DeepEqual(client.instanceDescribeGroups, []string{"instance-custom"}) {
 		t.Fatalf("parameter polls = %v, want one pre-change value check", client.instanceDescribeGroups)
+	}
+}
+
+func TestAWSApplyWaitTimeoutPreservesExitCodeSixThroughScopeWrapping(t *testing.T) {
+	err := newAWSApplyTimeoutError(awsrds.ScopeCluster)
+	if exitCode := awsApplyExitCode(err); exitCode != awsApplyExitTimeout {
+		t.Fatalf("awsApplyExitCode() = %d, want timeout exit %d", exitCode, awsApplyExitTimeout)
+	}
+	result := newAWSApplyResult(awsApplyConfig("instance-custom", "cluster-custom"))
+	request := awsApplyWaitRequest{
+		Cluster: awsrds.ScopePlan{Parameters: []types.Parameter{{ParameterName: aws.String("cluster_value")}}},
+	}
+	recordAWSWaitFailure(&result, request, err)
+	decoded := decodeAWSApplyResult(t, marshalAWSApplyResult(&result))
+	if len(decoded.Cluster.Failed) != 1 || decoded.Cluster.Failed[0].Error != awsApplyErrorTimeout {
+		t.Fatalf("timeout result = %#v, want safe category %q", decoded.Cluster.Failed, awsApplyErrorTimeout)
+	}
+}
+
+func TestAWSApplyWaitDeadlineExceededDuringPollPreservesExitCodeSix(t *testing.T) {
+	client := mysqlApplyClient("instance-custom")
+	client.instanceDescribeErrors["instance-custom"] = context.DeadlineExceeded
+	request := awsApplyWaitRequest{
+		Metadata: awsrds.Metadata{DBInstanceIdentifier: "mysql-1"},
+		Instance: awsrds.ScopePlan{
+			Group:      "instance-custom",
+			Parameters: []types.Parameter{{ParameterName: aws.String("max_connections"), ParameterValue: aws.String("200")}},
+		},
+	}
+
+	err := defaultWaitForAWSApply(context.Background(), client, request)
+	if exitCode := awsApplyExitCode(err); exitCode != awsApplyExitTimeout {
+		t.Fatalf("deadline poll exit code = %d error %v, want timeout exit %d", exitCode, err, awsApplyExitTimeout)
+	}
+	result := newAWSApplyResult(awsApplyConfig("instance-custom", ""))
+	recordAWSWaitFailure(&result, request, err)
+	decoded := decodeAWSApplyResult(t, marshalAWSApplyResult(&result))
+	if len(decoded.Instance.Failed) != 1 || decoded.Instance.Failed[0].Error != awsApplyErrorTimeout {
+		t.Fatalf("deadline result = %#v, want safe timeout category", decoded.Instance.Failed)
 	}
 }
 
@@ -658,11 +824,12 @@ func mustJSON(t *testing.T, value interface{}) string {
 }
 
 func TestAWSApplyFailureOutputDoesNotContainConfigSecrets(t *testing.T) {
+	const errorSecret = "raw-aws-error-recommendation-secret-200"
 	client := mysqlApplyClient("instance-custom")
 	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
 		Parameters: []types.Parameter{modifiableAWSParameter("max_connections", "dynamic")},
 	}}
-	client.instanceModifyErrors = map[int]error{1: errors.New("request failed")}
+	client.instanceModifyErrors = map[int]error{1: errors.New("request failed with value " + errorSecret)}
 	installAWSApplyTestDependencies(t, client, nil)
 	cfg := awsApplyConfig("instance-custom", "")
 	cfg.ApiKey = "super-secret-api-key"
@@ -676,7 +843,11 @@ func TestAWSApplyFailureOutputDoesNotContainConfigSecrets(t *testing.T) {
 		AWSApplyAll,
 	)
 
-	if strings.Contains(output, cfg.ApiKey) || strings.Contains(output, cfg.MysqlPassword) {
+	if strings.Contains(output, cfg.ApiKey) || strings.Contains(output, cfg.MysqlPassword) || strings.Contains(output, errorSecret) {
 		t.Fatalf("task output leaked configuration secrets: %s", output)
+	}
+	result := decodeAWSApplyResult(t, output)
+	if len(result.Instance.Failed) != 1 || result.Instance.Failed[0].Error != awsApplyErrorAWSAPI {
+		t.Fatalf("sanitized failure = %#v, want category %q", result.Instance.Failed, awsApplyErrorAWSAPI)
 	}
 }
