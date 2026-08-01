@@ -128,6 +128,7 @@ func (programm *Programm) Run() {
 			logger,
 			cwlogsclient,
 			configuration,
+			metadata,
 			func(ctx context.Context) (awsrds.Metadata, error) {
 				return awsrds.DiscoverInstance(ctx, rdsclient, configuration.AwsRDSDB)
 			},
