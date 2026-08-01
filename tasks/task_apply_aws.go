@@ -64,8 +64,8 @@ const (
 )
 
 type awsApplyModifiedScopes struct {
-	Instance bool
-	Cluster  bool
+	Instance bool `json:"instance"`
+	Cluster  bool `json:"cluster"`
 }
 
 type awsApplyWaitRequest struct {
@@ -104,15 +104,27 @@ var readAWSAppliedParameters awsApplyReadbackFunc = defaultReadAWSAppliedParamet
 // and returns the deterministic per-scope result as task output.
 func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.MetricsGatherer,
 	logger logging.Logger, configuration *config.Config, mode AWSApplyMode) (int, int, string) {
+	return applyConfAWSRDS(repeaters, gatherers, logger, configuration, mode, awsApplyTaskContext{})
+}
 
+func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.MetricsGatherer,
+	logger logging.Logger, configuration *config.Config, mode AWSApplyMode, task awsApplyTaskContext) (int, int, string) {
 	result := newAWSApplyResult(configuration)
-	fail := func(exitCode int) (int, int, string) {
-		return exitCode, awsApplyTaskStatusFailure, marshalAWSApplyResult(&result)
+	finish := func(exitCode, status int) (int, int, string) {
+		output := marshalAWSApplyResult(&result)
+		logAWSApplyEvent(logger, "aws_rds_apply_audit", map[string]interface{}{
+			"task_id":        task.TaskID,
+			"task_type_id":   task.TaskTypeID,
+			"task_status":    status,
+			"task_exit_code": exitCode,
+			"audit":          result.Audit,
+		})
+		return exitCode, status, output
 	}
 
 	if configuration == nil {
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, fmt.Errorf("AWS RDS configuration is nil"))
-		return fail(awsApplyExitFailure)
+		return finish(awsApplyExitFailure, awsApplyTaskStatusFailure)
 	}
 
 	// Recommendations and current values must come from the same single
@@ -121,7 +133,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 	metrics := utils.CollectMetrics(gatherers, logger, configuration)
 	if metrics == nil {
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, fmt.Errorf("collect current metrics: no metrics returned"))
-		return fail(awsApplyExitFailure)
+		return finish(awsApplyExitFailure, awsApplyTaskStatusFailure)
 	}
 	recommendationJSON := utils.ProcessRepeaters(
 		metrics,
@@ -133,26 +145,26 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 	recommendations, err := decodeAWSRecommendations(recommendationJSON)
 	if err != nil {
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
-		return fail(awsApplyExitFailure)
+		return finish(awsApplyExitFailure, awsApplyTaskStatusFailure)
 	}
 
 	ctx := context.Background()
 	client, err := newAWSRDSClient(ctx, configuration)
 	if err != nil {
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
-		return fail(awsApplyExitCode(err))
+		return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
 	}
 
 	metadata, err := awsrds.DiscoverInstance(ctx, client, configuration.AwsRDSDB)
 	if err != nil {
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
-		return fail(awsApplyExitCode(err))
+		return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
 	}
 	awsrds.PopulateAuditTopology(&result.Audit, metadata)
 	if metadata.InstanceStatus != "available" {
 		err = fmt.Errorf("DB instance %q status %q is not available", metadata.DBInstanceIdentifier, metadata.InstanceStatus)
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
-		return fail(awsApplyExitInstanceUnavailable)
+		return finish(awsApplyExitInstanceUnavailable, awsApplyTaskStatusFailure)
 	}
 	if metadata.DBParameterGroupStatus != "in-sync" {
 		err = fmt.Errorf(
@@ -163,7 +175,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		)
 		logger.Error(err)
 		recordAWSParameterGroupReadinessFailure(&result, metadata)
-		return fail(awsApplyExitParameterGroupNotInSync)
+		return finish(awsApplyExitParameterGroupNotInSync, awsApplyTaskStatusFailure)
 	}
 
 	groupValidation := validateAWSGroups(logger, metadata, configuration)
@@ -204,9 +216,9 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		if err != nil {
 			if !instanceClassificationOnly {
 				recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
-				return fail(awsApplyExitCode(err))
+				return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
 			}
-			logger.Errorf("Optional instance parameter classification for group %q failed: %v", instanceLookupGroup, err)
+			logger.Errorf("Optional instance parameter classification for group %q failed: %s", instanceLookupGroup, awsApplySafeErrorCode(err))
 			instanceParameters = map[string]awsrds.ParameterInfo{}
 			instanceMembershipUnknown = true
 		}
@@ -242,9 +254,9 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		if err != nil {
 			if !clusterLookup.ClassificationOnly {
 				recordAWSApplyFailure(&result, awsrds.ScopeCluster, nil, err)
-				return fail(awsApplyExitCode(err))
+				return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
 			}
-			logger.Errorf("Optional cluster parameter classification for group %q failed: %v", clusterLookup.Group, err)
+			logger.Errorf("Optional cluster parameter classification for group %q failed: %s", clusterLookup.Group, awsApplySafeErrorCode(err))
 			clusterParameters = map[string]awsrds.ParameterInfo{}
 		} else if clusterLookup.ClassificationOnly {
 			logger.Infof("DB cluster parameter group %q loaded for recommendation classification only", clusterLookup.Group)
@@ -264,11 +276,13 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 	result = plannedResult
 	recordAWSGroupMismatchDiagnostics(&result, groupValidation, metadata, configuration)
 
-	waitRequest, applyErr := applyAWSPlan(ctx, client, plan, &result, logger, awsApplyTaskContext{})
+	waitRequest, applyErr := applyAWSPlan(ctx, client, plan, &result, logger, task)
 	waitRequest.Metadata = metadata
 	modified := waitRequest.modifiedScopes()
 	if modified.Instance || modified.Cluster {
-		if waitErr := waitForAWSApply(ctx, client, waitRequest); waitErr != nil {
+		waitErr := waitForAWSApply(ctx, client, waitRequest)
+		logAWSApplyEvent(logger, "aws_rds_apply_wait", awsApplyWaitEventFields(modified, waitErr, task))
+		if waitErr != nil {
 			recordAWSWaitFailure(&result, waitRequest, waitErr)
 			if applyErr == nil {
 				applyErr = waitErr
@@ -277,11 +291,11 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		verifyAWSAppliedParameters(ctx, client, waitRequest, &result.Audit, logger)
 	}
 	if applyErr != nil {
-		logger.Errorf("AWS parameter apply failed: %v", applyErr)
-		return fail(awsApplyExitCode(applyErr))
+		logger.Errorf("AWS parameter apply failed: %s", awsApplySafeErrorCode(applyErr))
+		return finish(awsApplyExitCode(applyErr), awsApplyTaskStatusFailure)
 	}
 
-	return awsApplyExitSuccess, awsApplyTaskStatusSuccess, marshalAWSApplyResult(&result)
+	return finish(awsApplyExitSuccess, awsApplyTaskStatusSuccess)
 }
 
 func decodeAWSRecommendations(raw string) (map[string]interface{}, error) {

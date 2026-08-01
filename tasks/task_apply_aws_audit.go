@@ -62,6 +62,20 @@ func awsApplyBatchEventFields(scope awsrds.Scope, group string, batch int, names
 	return fields
 }
 
+func awsApplyWaitEventFields(modified awsApplyModifiedScopes, err error, task awsApplyTaskContext) map[string]interface{} {
+	fields := map[string]interface{}{
+		"task_id":         task.TaskID,
+		"task_type_id":    task.TaskTypeID,
+		"modified_scopes": modified,
+		"outcome":         "success",
+	}
+	if err != nil {
+		fields["outcome"] = "failed"
+		fields["error"] = awsApplySafeErrorCode(err)
+	}
+	return fields
+}
+
 func markAWSAuditBatch(audit *awsrds.ApplyAudit, scope awsrds.Scope, parameters []types.Parameter, batch int, outcome awsrds.ApplyOutcome, reason, errorCode string) {
 	if audit == nil {
 		return

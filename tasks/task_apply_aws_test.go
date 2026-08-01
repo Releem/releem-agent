@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1416,7 +1417,9 @@ func awsModifiedParameterValues(t *testing.T, calls []awsModifyCall) map[string]
 
 func TestAWSApplyFailureOutputDoesNotContainConfigSecrets(t *testing.T) {
 	const errorSecret = "raw-aws-error-recommendation-secret-200"
+	const endpointSecret = "private-db-endpoint.example"
 	client := mysqlApplyClient("instance-custom")
+	client.instanceOutput.DBInstances[0].Endpoint = &types.Endpoint{Address: aws.String(endpointSecret)}
 	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
 		Parameters: []types.Parameter{modifiableAWSParameter("max_connections", "dynamic")},
 	}}
@@ -1424,18 +1427,29 @@ func TestAWSApplyFailureOutputDoesNotContainConfigSecrets(t *testing.T) {
 	installAWSApplyTestDependencies(t, client, nil)
 	cfg := awsApplyConfig("instance-custom", "")
 	cfg.ApiKey = "super-secret-api-key"
+	cfg.MysqlUser = "super-secret-db-user"
 	cfg.MysqlPassword = "super-secret-db-password"
+	var logOutput bytes.Buffer
+	logger := *logging.Init("task-apply-aws-secret-test", false, false, &logOutput)
 
-	_, _, output := ApplyConfAwsRds(
+	_, _, output := applyConfAWSRDS(
 		&awsApplyRepeater{recommendations: `{"max_connections":"200"}`},
 		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"max_connections": "100"}}},
-		testAWSApplyLogger(),
+		logger,
 		cfg,
 		AWSApplyAll,
+		awsApplyTaskContext{TaskID: 42, TaskTypeID: 4},
 	)
 
-	if strings.Contains(output, cfg.ApiKey) || strings.Contains(output, cfg.MysqlPassword) || strings.Contains(output, errorSecret) {
-		t.Fatalf("task output leaked configuration secrets: %s", output)
+	combined := output + logOutput.String()
+	for _, secret := range []string{endpointSecret, cfg.ApiKey, cfg.MysqlUser, cfg.MysqlPassword, errorSecret} {
+		if strings.Contains(combined, secret) {
+			t.Fatalf("AWS apply output or audit event leaked %q: %s", secret, combined)
+		}
+	}
+	events := decodeAWSApplyLogEvents(t, logOutput.String())
+	if got := len(awsApplyLogEvents(events, "aws_rds_apply_audit")); got != 1 {
+		t.Fatalf("terminal audit events = %d, want exactly one; events=%#v", got, events)
 	}
 	result := decodeAWSApplyResult(t, output)
 	if len(result.Instance.Failed) != 1 || result.Instance.Failed[0].Error != awsApplyErrorAWSAPI {

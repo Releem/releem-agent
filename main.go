@@ -121,6 +121,7 @@ func (programm *Programm) Run() {
 		if err != nil {
 			exitRunWithError(err.Error())
 		}
+		system.LogAWSRDSDiscovery(logger, "startup", metadata)
 
 		configuration.Hostname = configuration.AwsRDSDB
 		metadata.ApplyEndpoint(configuration)

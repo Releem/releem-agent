@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -373,6 +374,77 @@ func TestAWSRDSEnhancedMetricsMetadataCacheIsConcurrentSafe(t *testing.T) {
 	for resourceID := range results {
 		if resourceID != "initial" && resourceID != "refreshed" {
 			t.Fatalf("metadata resource ID = %q, want a complete cached snapshot", resourceID)
+		}
+	}
+}
+
+func TestAWSRDSEnhancedMetricsDiscoveryLogUsesSafeTopology(t *testing.T) {
+	const endpointSecret = "private-orders-writer.example"
+	const rawErrorSecret = "raw discovery error with credentials"
+	metadata := testRDSMetadata("orders-1", "db-resource-secret", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", true)
+	metadata.Endpoint = endpointSecret
+
+	t.Run("live refresh logs at verbose level", func(t *testing.T) {
+		var output bytes.Buffer
+		logger := logging.Init("aws-rds-live-discovery-log-test", false, false, &output)
+		logger.SetLevel(5)
+		gatherer := NewAWSRDSEnhancedMetricsGatherer(*logger, nil, &config.Config{}, awsrds.Metadata{}, func(context.Context) (awsrds.Metadata, error) {
+			return metadata, nil
+		})
+
+		if got := gatherer.metadataForReport(context.Background()); got.DBInstanceIdentifier != metadata.DBInstanceIdentifier {
+			t.Fatalf("metadataForReport() = %#v, want live metadata", got)
+		}
+		event := awsRDSDiscoveryLogEvent(t, output.String())
+		if event["source"] != "live" {
+			t.Fatalf("discovery source = %#v, want live", event["source"])
+		}
+		assertAWSRDSDiscoveryLogSafe(t, event, output.String(), endpointSecret, "db-resource-secret")
+	})
+
+	t.Run("failed refresh warns with cached topology and error type", func(t *testing.T) {
+		var output bytes.Buffer
+		logger := *logging.Init("aws-rds-cache-discovery-log-test", false, false, &output)
+		gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, nil, &config.Config{}, metadata, func(context.Context) (awsrds.Metadata, error) {
+			return awsrds.Metadata{}, errors.New(rawErrorSecret)
+		})
+
+		if got := gatherer.metadataForReport(context.Background()); got.DBInstanceIdentifier != metadata.DBInstanceIdentifier {
+			t.Fatalf("metadataForReport() = %#v, want cached metadata", got)
+		}
+		event := awsRDSDiscoveryLogEvent(t, output.String())
+		if event["source"] != "cache" || event["reason"] != "discovery-failed" || event["error_type"] != "*errors.errorString" {
+			t.Fatalf("fallback discovery event = %#v", event)
+		}
+		assertAWSRDSDiscoveryLogSafe(t, event, output.String(), endpointSecret, "db-resource-secret", rawErrorSecret)
+	})
+}
+
+func awsRDSDiscoveryLogEvent(t *testing.T, output string) map[string]interface{} {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		start := strings.Index(line, "{")
+		if start < 0 {
+			continue
+		}
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(line[start:]), &event); err == nil && event["event"] == "aws_rds_discovery" {
+			return event
+		}
+	}
+	t.Fatalf("aws_rds_discovery event not found in %q", output)
+	return nil
+}
+
+func assertAWSRDSDiscoveryLogSafe(t *testing.T, event map[string]interface{}, output string, secrets ...string) {
+	t.Helper()
+	topology, ok := event["topology"].(map[string]interface{})
+	if !ok || topology["db_instance_identifier"] != "orders-1" || topology["db_cluster_identifier"] != "orders" {
+		t.Fatalf("safe topology = %#v", event["topology"])
+	}
+	for _, secret := range secrets {
+		if strings.Contains(output, secret) {
+			t.Fatalf("discovery log leaked %q: %s", secret, output)
 		}
 	}
 }

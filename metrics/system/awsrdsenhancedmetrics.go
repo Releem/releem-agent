@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -213,16 +214,59 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ct
 
 	metadata, err := awsrdsenhancedmetrics.discoverMetadata(discoveryCtx)
 	if err != nil {
-		awsrdsenhancedmetrics.logger.Errorf("Failed to refresh AWS RDS metadata, using last known metadata: %v", err)
 		awsrdsenhancedmetrics.metadataMu.RLock()
-		defer awsrdsenhancedmetrics.metadataMu.RUnlock()
-		return awsrdsenhancedmetrics.metadata
+		cached := awsrdsenhancedmetrics.metadata
+		awsrdsenhancedmetrics.metadataMu.RUnlock()
+		logAWSRDSDiscoveryFallback(awsrdsenhancedmetrics.logger, cached, err)
+		return cached
 	}
 
 	awsrdsenhancedmetrics.metadataMu.Lock()
 	awsrdsenhancedmetrics.metadata = metadata
 	awsrdsenhancedmetrics.metadataMu.Unlock()
+	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", metadata)
 	return metadata
+}
+
+// LogAWSRDSDiscovery emits safe discovery topology without endpoint, resource
+// identifier, credentials, or provider response data.
+func LogAWSRDSDiscovery(logger logging.Logger, source string, metadata awsrds.Metadata) {
+	event, err := marshalAWSRDSDiscoveryEvent(source, metadata, nil)
+	if err != nil {
+		logger.Warningf("AWS RDS discovery event could not be serialized: %T", err)
+		return
+	}
+	if source == "live" {
+		logger.V(5).Info(event)
+		return
+	}
+	logger.Info(event)
+}
+
+func logAWSRDSDiscoveryFallback(logger logging.Logger, metadata awsrds.Metadata, discoveryErr error) {
+	event, err := marshalAWSRDSDiscoveryEvent("cache", metadata, map[string]interface{}{
+		"reason":     "discovery-failed",
+		"error_type": fmt.Sprintf("%T", discoveryErr),
+	})
+	if err != nil {
+		logger.Warningf("AWS RDS discovery event could not be serialized: %T", err)
+		return
+	}
+	logger.Warning(event)
+}
+
+func marshalAWSRDSDiscoveryEvent(source string, metadata awsrds.Metadata, extra map[string]interface{}) (string, error) {
+	audit := awsrds.NewApplyAudit(metadata)
+	payload := map[string]interface{}{
+		"event":    "aws_rds_discovery",
+		"source":   source,
+		"topology": audit.Topology,
+	}
+	for name, value := range extra {
+		payload[name] = value
+	}
+	encoded, err := json.Marshal(payload)
+	return string(encoded), err
 }
 
 func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *models.Metrics) error {

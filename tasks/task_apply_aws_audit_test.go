@@ -11,7 +11,9 @@ import (
 	"testing"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
+	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 	logging "github.com/google/logger"
 )
@@ -127,6 +129,45 @@ func TestAWSApplyPlanAndBatchLogsOmitValues(t *testing.T) {
 	}
 }
 
+func TestAWSApplyAuditLog(t *testing.T) {
+	var output bytes.Buffer
+	logger := *logging.Init("task-apply-aws-audit-test", false, false, &output)
+	client := mysqlApplyClient("instance-custom")
+	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+		Parameters: []types.Parameter{modifiableAWSParameter("max_connections", "dynamic")},
+	}}
+	installAWSApplyTestDependencies(t, client, nil)
+
+	exitCode, status, taskOutput := applyConfAWSRDS(
+		&awsApplyRepeater{recommendations: `{"max_connections":"200"}`},
+		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"max_connections": "100"}}},
+		logger,
+		awsApplyConfig("instance-custom", ""),
+		AWSApplyAll,
+		awsApplyTaskContext{TaskID: 42, TaskTypeID: 4},
+	)
+	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+		t.Fatalf("applyConfAWSRDS() = exit %d status %d output %s", exitCode, status, taskOutput)
+	}
+
+	events := decodeAWSApplyLogEvents(t, output.String())
+	terminalEvents := awsApplyLogEvents(events, "aws_rds_apply_audit")
+	if len(terminalEvents) != 1 {
+		t.Fatalf("terminal audit events = %d, want exactly one; events=%#v", len(terminalEvents), events)
+	}
+	event := terminalEvents[0]
+	if event["task_id"] != float64(42) || event["task_type_id"] != float64(4) || event["task_status"] != float64(awsApplyTaskStatusSuccess) || event["task_exit_code"] != float64(awsApplyExitSuccess) {
+		t.Fatalf("terminal audit correlation/status = %#v", event)
+	}
+	audit, ok := event["audit"].(map[string]interface{})
+	if !ok || audit["schema_version"] != float64(awsrds.ApplyAuditSchemaVersion) {
+		t.Fatalf("terminal audit = %#v, want schema version %d", event["audit"], awsrds.ApplyAuditSchemaVersion)
+	}
+	if len(awsApplyLogEvents(events, "aws_rds_apply_wait")) != 1 {
+		t.Fatalf("wait events = %#v, want exactly one after modified scope", events)
+	}
+}
+
 func TestVerifyAWSAppliedParameters(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -238,4 +279,14 @@ func awsApplyLogEvent(t *testing.T, events []map[string]interface{}, name string
 	}
 	t.Fatalf("event %q not found in %#v", name, events)
 	return nil
+}
+
+func awsApplyLogEvents(events []map[string]interface{}, name string) []map[string]interface{} {
+	matching := []map[string]interface{}{}
+	for _, event := range events {
+		if event["event"] == name {
+			matching = append(matching, event)
+		}
+	}
+	return matching
 }

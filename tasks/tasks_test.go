@@ -41,7 +41,7 @@ func TestProcessTaskType4AndTaskType5SelectAWSApplyModeOnce(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var modes []AWSApplyMode
-			runAWSRDSApply = func(_ models.MetricsRepeater, _ []models.MetricsGatherer, _ logging.Logger, _ *config.Config, mode AWSApplyMode) (int, int, string) {
+			runAWSRDSApply = func(_ models.MetricsRepeater, _ []models.MetricsGatherer, _ logging.Logger, _ *config.Config, mode AWSApplyMode, _ awsApplyTaskContext) (int, int, string) {
 				modes = append(modes, mode)
 				return awsApplyExitSuccess, awsApplyTaskStatusSuccess, `{"instance":{"applied":[],"skipped":[],"failed":[]},"cluster":{"applied":[],"skipped":[],"failed":[]}}`
 			}
@@ -56,6 +56,31 @@ func TestProcessTaskType4AndTaskType5SelectAWSApplyModeOnce(t *testing.T) {
 				t.Fatalf("task statuses = %#v, want successful final task status", repeater.statuses)
 			}
 		})
+	}
+}
+
+func TestProcessTaskAWSApplyPassesTaskContext(t *testing.T) {
+	originalApply := runAWSRDSApply
+	originalSleep := processTaskSleep
+	processTaskSleep = func(time.Duration) {}
+	t.Cleanup(func() {
+		runAWSRDSApply = originalApply
+		processTaskSleep = originalSleep
+	})
+
+	want := awsApplyTaskContext{TaskID: 42, TaskTypeID: 4}
+	runAWSRDSApply = func(_ models.MetricsRepeater, _ []models.MetricsGatherer, _ logging.Logger, _ *config.Config, _ AWSApplyMode, got awsApplyTaskContext) (int, int, string) {
+		if got != want {
+			t.Fatalf("task context = %#v, want %#v", got, want)
+		}
+		return 0, 1, `{"instance":{"applied":[],"skipped":[],"failed":[]},"cluster":{"applied":[],"skipped":[],"failed":[]},"audit":{"schema_version":1,"topology":{},"parameters":[]}}`
+	}
+	repeater := &taskRepeaterStub{taskPayload: `{"task_id":42,"task_type_id":4}`}
+
+	ProcessTask(repeater, nil, *logging.Init("tasks-test", true, false, io.Discard), &config.Config{InstanceType: "aws/rds"})
+
+	if len(repeater.statuses) != 2 || repeater.statuses[1].ExitCode != 0 || repeater.statuses[1].Status != 1 {
+		t.Fatalf("task statuses = %#v, want successful correlated AWS apply", repeater.statuses)
 	}
 }
 
