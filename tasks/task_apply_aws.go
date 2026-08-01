@@ -99,6 +99,8 @@ var waitForAWSApply awsApplyWaitFunc = defaultWaitForAWSApply
 
 var readAWSAppliedParameters awsApplyReadbackFunc = defaultReadAWSAppliedParameters
 
+var awsApplyReadbackTimeout = 30 * time.Second
+
 // ApplyConfAwsRds obtains one live recommendation snapshot, refreshes AWS
 // topology, routes every eligible value to its owning parameter-group API,
 // and returns the deterministic per-scope result as task output.
@@ -534,7 +536,7 @@ func newAWSApplyPollingError(scope awsrds.Scope, unresolved awsApplyModifiedScop
 	if errors.Is(err, context.DeadlineExceeded) {
 		return newAWSApplyTimeoutErrorForScopes(unresolved)
 	}
-	return &awsApplyWaitError{Scope: scope, Err: err}
+	return &awsApplyWaitError{Scope: scope, Unresolved: unresolved, Err: err}
 }
 
 func recordAWSWaitFailure(result *awsrds.ApplyResult, request awsApplyWaitRequest, err error) {

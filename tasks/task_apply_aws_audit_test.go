@@ -168,6 +168,59 @@ func TestAWSApplyAuditLog(t *testing.T) {
 	}
 }
 
+func TestAWSApplyPollingErrorPreservesUnresolvedScopes(t *testing.T) {
+	want := awsApplyModifiedScopes{Instance: true, Cluster: true}
+	err := newAWSApplyPollingError(awsrds.ScopeInstance, want, errors.New("poll failed"))
+
+	var scoped *awsApplyWaitError
+	if !errors.As(err, &scoped) {
+		t.Fatalf("polling error = %T, want *awsApplyWaitError", err)
+	}
+	if scoped.Unresolved != want {
+		t.Fatalf("unresolved scopes = %#v, want %#v", scoped.Unresolved, want)
+	}
+}
+
+func TestAWSApplyWaitEventReportsPerScopeOutcomes(t *testing.T) {
+	tests := []struct {
+		name       string
+		failed     awsrds.Scope
+		unresolved awsApplyModifiedScopes
+		want       map[string]interface{}
+	}{
+		{
+			name:       "instance completed before cluster failure",
+			failed:     awsrds.ScopeCluster,
+			unresolved: awsApplyModifiedScopes{Cluster: true},
+			want:       map[string]interface{}{"instance": "success", "cluster": "failed"},
+		},
+		{
+			name:       "cluster completed before instance failure",
+			failed:     awsrds.ScopeInstance,
+			unresolved: awsApplyModifiedScopes{Instance: true},
+			want:       map[string]interface{}{"instance": "failed", "cluster": "success"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := *logging.Init("task-apply-aws-wait-outcome-test", false, false, &output)
+			err := newAWSApplyPollingError(tt.failed, tt.unresolved, errors.New("poll failed"))
+			logAWSApplyEvent(logger, "aws_rds_apply_wait", awsApplyWaitEventFields(
+				awsApplyModifiedScopes{Instance: true, Cluster: true},
+				err,
+				awsApplyTaskContext{TaskID: 42, TaskTypeID: 4},
+			))
+
+			event := awsApplyLogEvent(t, decodeAWSApplyLogEvents(t, output.String()), "aws_rds_apply_wait")
+			if !reflect.DeepEqual(event["scope_outcomes"], tt.want) {
+				t.Fatalf("scope outcomes = %#v, want %#v; event=%#v", event["scope_outcomes"], tt.want, event)
+			}
+		})
+	}
+}
+
 func TestVerifyAWSAppliedParameters(t *testing.T) {
 	tests := []struct {
 		name         string

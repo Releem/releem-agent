@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
@@ -974,7 +975,7 @@ func TestApplyConfAwsRdsRepeatedPendingRebootUsesCanonicalAWSValuesForBothScopes
 	}
 }
 
-func TestApplyConfAwsRdsReadbackFailureDoesNotFailTask(t *testing.T) {
+func TestApplyConfAwsRdsReadbackDeadlineDoesNotFailTask(t *testing.T) {
 	client := mysqlApplyClient("instance-custom")
 	parameter := modifiableAWSParameter("max_connections", "dynamic")
 	parameter.ParameterValue = aws.String("100")
@@ -984,27 +985,59 @@ func TestApplyConfAwsRdsReadbackFailureDoesNotFailTask(t *testing.T) {
 	installAWSApplyTestDependencies(t, client, nil)
 
 	originalReadback := readAWSAppliedParameters
-	readAWSAppliedParameters = func(context.Context, awsrds.ParameterReader, awsrds.Scope, awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error) {
-		return nil, errors.New("unavailable")
+	originalReadbackTimeout := awsApplyReadbackTimeout
+	awsApplyReadbackTimeout = 20 * time.Millisecond
+	releaseReadback := make(chan struct{})
+	released := false
+	readAWSAppliedParameters = func(ctx context.Context, _ awsrds.ParameterReader, _ awsrds.Scope, _ awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-releaseReadback:
+			return nil, errors.New("test readback released")
+		}
 	}
 	t.Cleanup(func() {
+		if !released {
+			close(releaseReadback)
+		}
 		readAWSAppliedParameters = originalReadback
+		awsApplyReadbackTimeout = originalReadbackTimeout
 	})
 
 	var logOutput strings.Builder
 	logger := *logging.Init("task-apply-aws-readback-test", false, false, &logOutput)
-	exitCode, status, output := ApplyConfAwsRds(
-		&awsApplyRepeater{recommendations: `{"max_connections":"200"}`},
-		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"max_connections": "100"}}},
-		logger,
-		awsApplyConfig("instance-custom", ""),
-		AWSApplyAll,
-	)
-
-	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
-		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want successful task", exitCode, status, output)
+	type applyReturn struct {
+		exitCode int
+		status   int
+		output   string
 	}
-	result := decodeAWSApplyResult(t, output)
+	completed := make(chan applyReturn, 1)
+	go func() {
+		exitCode, status, output := ApplyConfAwsRds(
+			&awsApplyRepeater{recommendations: `{"max_connections":"200"}`},
+			[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"max_connections": "100"}}},
+			logger,
+			awsApplyConfig("instance-custom", ""),
+			AWSApplyAll,
+		)
+		completed <- applyReturn{exitCode: exitCode, status: status, output: output}
+	}()
+
+	var applied applyReturn
+	select {
+	case applied = <-completed:
+	case <-time.After(time.Second):
+		close(releaseReadback)
+		released = true
+		<-completed
+		t.Fatal("ApplyConfAwsRds() did not return after the bounded optional readback")
+	}
+
+	if applied.exitCode != awsApplyExitSuccess || applied.status != awsApplyTaskStatusSuccess {
+		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want successful task", applied.exitCode, applied.status, applied.output)
+	}
+	result := decodeAWSApplyResult(t, applied.output)
 	record := auditRecord(t, &result.Audit, awsrds.ScopeInstance, "max_connections")
 	if record.VerificationStatus != awsrds.VerificationUnavailable || record.Reason != awsrds.ReasonReadbackFailed {
 		t.Fatalf("readback failure audit = status %q reason %q, want unavailable/readback-failed", record.VerificationStatus, record.Reason)

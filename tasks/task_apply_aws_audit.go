@@ -3,6 +3,7 @@ package tasks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -67,6 +68,7 @@ func awsApplyWaitEventFields(modified awsApplyModifiedScopes, err error, task aw
 		"task_id":         task.TaskID,
 		"task_type_id":    task.TaskTypeID,
 		"modified_scopes": modified,
+		"scope_outcomes":  awsApplyWaitScopeOutcomes(modified, err),
 		"outcome":         "success",
 	}
 	if err != nil {
@@ -74,6 +76,37 @@ func awsApplyWaitEventFields(modified awsApplyModifiedScopes, err error, task aw
 		fields["error"] = awsApplySafeErrorCode(err)
 	}
 	return fields
+}
+
+func awsApplyWaitScopeOutcomes(modified awsApplyModifiedScopes, err error) map[string]string {
+	outcomes := map[string]string{}
+	if modified.Instance {
+		outcomes[string(awsrds.ScopeInstance)] = "success"
+	}
+	if modified.Cluster {
+		outcomes[string(awsrds.ScopeCluster)] = "success"
+	}
+	if err == nil {
+		return outcomes
+	}
+
+	var scoped *awsApplyWaitError
+	if !errors.As(err, &scoped) {
+		for scope := range outcomes {
+			outcomes[scope] = "failed"
+		}
+		return outcomes
+	}
+	if modified.Instance && scoped.Unresolved.Instance {
+		outcomes[string(awsrds.ScopeInstance)] = "unresolved"
+	}
+	if modified.Cluster && scoped.Unresolved.Cluster {
+		outcomes[string(awsrds.ScopeCluster)] = "unresolved"
+	}
+	if _, modifiedScope := outcomes[string(scoped.Scope)]; modifiedScope {
+		outcomes[string(scoped.Scope)] = "failed"
+	}
+	return outcomes
 }
 
 func markAWSAuditBatch(audit *awsrds.ApplyAudit, scope awsrds.Scope, parameters []types.Parameter, batch int, outcome awsrds.ApplyOutcome, reason, errorCode string) {
@@ -127,7 +160,9 @@ func verifyAWSAppliedScope(ctx context.Context, client awsrds.ParameterReader, s
 		return
 	}
 
-	readback, err := readAWSAppliedParameters(ctx, client, scope, plan)
+	readbackCtx, cancel := context.WithTimeout(ctx, awsApplyReadbackTimeout)
+	defer cancel()
+	readback, err := readAWSAppliedParameters(readbackCtx, client, scope, plan)
 	if err != nil {
 		for _, parameter := range plan.Parameters {
 			markAWSAuditReadbackUnavailable(audit, scope, aws.ToString(parameter.ParameterName), awsrds.ReasonReadbackFailed)
