@@ -1,6 +1,16 @@
 Releem releases
 ---
 
+Releem 1.24.0, 2026-06-30 ([What's New At Releem | June 2026](https://releem.com/blog/whats-new-at-releem-june-2026))
+- Added safe automation for index recommendations with guarded validation, backup, dry-run, and apply flow. (#522)
+- Improved setup with a multi-step Installation Wizard and local password entry for Linux and Windows installation flows.
+- Expanded PostgreSQL configuration recommendations for autovacuum, memory, storage, parallel query execution, and idle transactions.
+- Added a Show just changes view for Recommended Configuration.
+- Added reports for invited users on shared servers.
+- Removed an irrelevant symlink security check for cloud-managed MySQL and MariaDB.
+- Fixed deadlock analysis for quoted database and table names with special characters.
+- Fixed an error when adding two servers at the same time. Closes #515.
+
 Releem 1.23.6, 2026-05-31 ([What's New At Releem | May 2026](https://releem.com/blog/whats-new-at-releem-may-2026))
 - Added PostgreSQL support.
 - Added Azure MySQL support. Closes #265.
