@@ -129,6 +129,69 @@ func (f *awsApplyClientFake) ModifyDBClusterParameterGroup(_ context.Context, in
 	return &rds.ModifyDBClusterParameterGroupOutput{}, nil
 }
 
+func TestApplyConfAwsRdsRequiresInstanceParameterGroupInSync(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    string
+		wantExit  int
+		wantLists bool
+	}{
+		{name: "in sync", status: "in-sync", wantExit: awsApplyExitSuccess, wantLists: true},
+		{name: "applying", status: "applying", wantExit: awsApplyExitParameterGroupNotInSync},
+		{name: "pending reboot", status: "pending-reboot", wantExit: awsApplyExitParameterGroupNotInSync},
+		{name: "missing status", status: "", wantExit: awsApplyExitParameterGroupNotInSync},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := auroraApplyClient(true, "instance-custom", "cluster-custom")
+			client.instanceOutput.DBInstances[0].DBParameterGroups[0].ParameterApplyStatus = aws.String(tt.status)
+			client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+				Parameters: []types.Parameter{modifiableAWSParameter("instance_value", "dynamic")},
+			}}
+			client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
+				Parameters: []types.Parameter{modifiableAWSParameter("cluster_value", "dynamic")},
+			}}
+			installAWSApplyTestDependencies(t, client, nil)
+
+			exitCode, taskStatus, output := ApplyConfAwsRds(
+				&awsApplyRepeater{recommendations: `{"instance_value":"2","cluster_value":"3"}`},
+				[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{
+					"instance_value": "1",
+					"cluster_value":  "1",
+				}}},
+				testAWSApplyLogger(),
+				awsApplyConfig("instance-custom", "cluster-custom"),
+				AWSApplyAll,
+			)
+
+			if exitCode != tt.wantExit {
+				t.Fatalf("ApplyConfAwsRds() exit = %d, want %d; output %s", exitCode, tt.wantExit, output)
+			}
+			if tt.wantLists {
+				if taskStatus != awsApplyTaskStatusSuccess || len(client.instanceDescribeGroups) != 1 || len(client.clusterDescribeGroups) != 1 {
+					t.Fatalf("ready apply status/lists = %d/%#v/%#v", taskStatus, client.instanceDescribeGroups, client.clusterDescribeGroups)
+				}
+				if len(client.instanceModifyCalls) != 1 || len(client.clusterModifyCalls) != 1 {
+					t.Fatalf("ready modify calls = instance %d cluster %d, want 1 each", len(client.instanceModifyCalls), len(client.clusterModifyCalls))
+				}
+				return
+			}
+
+			if taskStatus != awsApplyTaskStatusFailure {
+				t.Fatalf("blocked task status = %d, want %d", taskStatus, awsApplyTaskStatusFailure)
+			}
+			if len(client.instanceDescribeGroups) != 0 || len(client.clusterDescribeGroups) != 0 || len(client.instanceModifyCalls) != 0 || len(client.clusterModifyCalls) != 0 {
+				t.Fatalf("blocked apply reached parameter APIs: instance lists %#v, cluster lists %#v, instance modifies %d, cluster modifies %d", client.instanceDescribeGroups, client.clusterDescribeGroups, len(client.instanceModifyCalls), len(client.clusterModifyCalls))
+			}
+			result := decodeAWSApplyResult(t, output)
+			if len(result.Instance.Failed) != 1 || len(result.Cluster.Failed) != 0 {
+				t.Fatalf("blocked result = %#v, want one instance-scope failure", result)
+			}
+		})
+	}
+}
+
 func TestApplyConfAwsRdsRefreshesDiscoveryRoutesScopesAndBatchesTwentyPlusOne(t *testing.T) {
 	instanceParameters := make([]types.Parameter, 0, 21)
 	recommendations := make(map[string]string, 22)

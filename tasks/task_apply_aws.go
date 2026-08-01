@@ -31,11 +31,12 @@ const (
 // apply failure, and 9 identifies AccessDenied. Group mismatches are safe
 // per-scope skips and use exit code 0.
 const (
-	awsApplyExitSuccess             = 0
-	awsApplyExitInstanceUnavailable = 1
-	awsApplyExitTimeout             = 6
-	awsApplyExitFailure             = 8
-	awsApplyExitAccessDenied        = 9
+	awsApplyExitSuccess                 = 0
+	awsApplyExitInstanceUnavailable     = 1
+	awsApplyExitParameterGroupNotInSync = 2
+	awsApplyExitTimeout                 = 6
+	awsApplyExitFailure                 = 8
+	awsApplyExitAccessDenied            = 9
 
 	awsApplyTaskStatusSuccess = 1
 	awsApplyTaskStatusFailure = 4
@@ -145,6 +146,17 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		err = fmt.Errorf("DB instance %q status %q is not available", metadata.DBInstanceIdentifier, metadata.InstanceStatus)
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
 		return fail(awsApplyExitInstanceUnavailable)
+	}
+	if metadata.DBParameterGroupStatus != "in-sync" {
+		err = fmt.Errorf(
+			"DB instance %q parameter group %q status %q is not in-sync",
+			metadata.DBInstanceIdentifier,
+			metadata.DBParameterGroup,
+			metadata.DBParameterGroupStatus,
+		)
+		logger.Error(err)
+		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
+		return fail(awsApplyExitParameterGroupNotInSync)
 	}
 
 	groupValidation := validateAWSGroups(logger, metadata, configuration)
