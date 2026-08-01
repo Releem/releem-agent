@@ -27,11 +27,12 @@ Agent-produced audit visible in Platform logs.
   existing waiter.
 - Preserve existing task output fields and accept task statuses from older
   Agents that do not send the new audit object.
-- Avoid adding a database migration or a new persistent audit store.
+- Reuse the existing ClickHouse event-details persistence without adding a
+  database migration or a separate audit store.
 
 ## Non-goals
 
-- Persisting task output or audit data in the Platform database.
+- Adding a new audit table, column, or dedicated persistence path.
 - Adding a new API, UI, or audit-history screen.
 - Changing recommendation generation, instance/cluster classification,
   Serverless-managed exclusions, batching limits, or parameter conversion.
@@ -47,9 +48,10 @@ result objects unchanged for backward compatibility. The complete JSON remains
 in `Task.Output`, is sent through the existing task-status request, and is
 logged as a structured audit event by both Agent and Platform.
 
-Audit data is intentionally transient. It is retained only according to the
-retention of Agent and Platform logs; Platform does not store it in the
-`tasks` table or any new table.
+Platform keeps the existing persistence behavior for completed task events:
+the full task payload, including `task_output.audit`, is stored in the existing
+ClickHouse `event_details.event_body` record. The MySQL `tasks` table remains
+unchanged, and no new table, column, or write path is introduced.
 
 ## Task Output Contract
 
@@ -192,7 +194,9 @@ types 4 and 5:
 The existing full generic task dump is suppressed for AWS task types 4 and 5
 to avoid duplicate full-value events inside Platform. Logging behavior for
 other task types is unchanged. Platform neither enriches nor rewrites the
-Agent audit and performs no new database write.
+Agent audit. The unchanged full task payload continues through the existing
+`SetChEventsDetail` path, so ClickHouse retains the complete output without a
+new database write mechanism.
 
 ## Error and Compatibility Semantics
 
@@ -238,7 +242,9 @@ Implementation follows test-driven development.
 - Verify malformed task output or audit produces a warning but still updates
   task status.
 - Verify AWS task summaries do not duplicate the full audit payload.
-- Verify no schema, migration, or database-write contract changes are needed.
+- Verify both task-status entry paths pass the unchanged full task payload,
+  including audit, to `SetChEventsDetail`.
+- Verify no schema, migration, or new database-write contract is needed.
 
 ## Verification
 
