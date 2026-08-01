@@ -888,6 +888,7 @@ func TestParameterApplyResultSortsAndSerializesWithoutValues(t *testing.T) {
 	t.Parallel()
 
 	result := ApplyResult{
+		Audit: NewApplyAudit(Metadata{}),
 		Instance: ScopeResult{
 			Group:   "orders-instance-custom",
 			Applied: []string{"z_parameter", "a_parameter"},
@@ -908,7 +909,7 @@ func TestParameterApplyResultSortsAndSerializesWithoutValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
-	const want = `{"instance":{"group":"orders-instance-custom","applied":["a_parameter","z_parameter"],"skipped":[{"name":"a_skip","reason":"unmodifiable"},{"name":"z_skip","reason":"absent"}],"failed":[{"parameters":["a_failed","z_failed"],"error":"second"},{"parameters":["m_failed"],"error":"first"}]},"cluster":{"applied":[],"skipped":[],"failed":[]}}`
+	const want = `{"instance":{"group":"orders-instance-custom","applied":["a_parameter","z_parameter"],"skipped":[{"name":"a_skip","reason":"unmodifiable"},{"name":"z_skip","reason":"absent"}],"failed":[{"parameters":["a_failed","z_failed"],"error":"second"},{"parameters":["m_failed"],"error":"first"}]},"cluster":{"applied":[],"skipped":[],"failed":[]},"audit":{"schema_version":1,"topology":{"is_cluster_writer":false,"is_serverless_v2":false},"parameters":[]}}`
 	if string(serialized) != want {
 		t.Fatalf("json.Marshal(sorted result) = %s, want %s", serialized, want)
 	}

@@ -144,6 +144,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
 		return fail(awsApplyExitCode(err))
 	}
+	awsrds.PopulateAuditTopology(&result.Audit, metadata)
 	if metadata.InstanceStatus != "available" {
 		err = fmt.Errorf("DB instance %q status %q is not available", metadata.DBInstanceIdentifier, metadata.InstanceStatus)
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
@@ -441,6 +442,7 @@ func newAWSApplyResult(configuration *config.Config) awsrds.ApplyResult {
 	return awsrds.ApplyResult{
 		Instance: newAWSApplyScopeResult(instanceGroup),
 		Cluster:  newAWSApplyScopeResult(clusterGroup),
+		Audit:    awsrds.NewApplyAudit(awsrds.Metadata{}),
 	}
 }
 

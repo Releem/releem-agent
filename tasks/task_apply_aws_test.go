@@ -390,7 +390,7 @@ func TestApplyConfAwsRdsReportsEachGroupMismatchOnceAtScopeLevel(t *testing.T) {
 	cfg.MysqlPassword = "password-must-not-leak"
 
 	exitCode, status, output := ApplyConfAwsRds(
-		&awsApplyRepeater{recommendations: `{"instance_one":"recommendation-one-must-not-leak","instance_two":"recommendation-two-must-not-leak"}`},
+		&awsApplyRepeater{recommendations: `{"instance_one":"recommended-instance-one","instance_two":"recommended-instance-two"}`},
 		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{}}},
 		testAWSApplyLogger(),
 		cfg,
@@ -442,10 +442,22 @@ func TestApplyConfAwsRdsReportsEachGroupMismatchOnceAtScopeLevel(t *testing.T) {
 	if len(structured.Cluster.Skipped) != 0 {
 		t.Fatalf("cluster skips = %#v, want no synthetic variable skip", structured.Cluster.Skipped)
 	}
-	for _, secret := range []string{cfg.ApiKey, cfg.MysqlPassword, "recommendation-one-must-not-leak", "recommendation-two-must-not-leak"} {
+	for _, secret := range []string{cfg.ApiKey, cfg.MysqlPassword} {
 		if strings.Contains(output, secret) {
 			t.Fatalf("mismatch output leaked %q: %s", secret, output)
 		}
+	}
+	result := decodeAWSApplyResult(t, output)
+	gotRecommendations := map[string]string{}
+	for _, record := range result.Audit.Parameters {
+		gotRecommendations[record.Name] = record.RecommendedValue
+	}
+	wantRecommendations := map[string]string{
+		"instance_one": "recommended-instance-one",
+		"instance_two": "recommended-instance-two",
+	}
+	if !reflect.DeepEqual(gotRecommendations, wantRecommendations) {
+		t.Fatalf("audit recommendations = %#v, want %#v", gotRecommendations, wantRecommendations)
 	}
 }
 

@@ -114,6 +114,7 @@ type ScopeResult struct {
 type ApplyResult struct {
 	Instance ScopeResult `json:"instance"`
 	Cluster  ScopeResult `json:"cluster"`
+	Audit    ApplyAudit  `json:"audit"`
 }
 
 // Sort normalizes empty slices and orders all result records for stable task
@@ -124,6 +125,7 @@ func (result *ApplyResult) Sort() {
 	}
 	sortScopeResult(&result.Instance)
 	sortScopeResult(&result.Cluster)
+	sortApplyAudit(&result.Audit)
 }
 
 // BuildApplyPlanInput contains only discovered/live state and current and
@@ -248,6 +250,7 @@ func BuildApplyPlan(input BuildApplyPlanInput) (ApplyPlan, ApplyResult) {
 	result := ApplyResult{
 		Instance: emptyScopeResult(input.ConfiguredInstanceGroup),
 		Cluster:  emptyScopeResult(input.ConfiguredClusterGroup),
+		Audit:    NewApplyAudit(input.Metadata),
 	}
 
 	names := make([]string, 0, len(input.Recommendations))
@@ -259,7 +262,9 @@ func BuildApplyPlan(input BuildApplyPlanInput) (ApplyPlan, ApplyResult) {
 	for _, name := range names {
 		parameter, inInstance := input.InstanceParameters[name]
 		if inInstance {
-			buildScopeParameter(input, name, parameter, ScopeInstance, &plan.Instance, &result.Instance)
+			record := newParameterAudit(input, name, parameter, ScopeInstance, plan.Instance.Group)
+			buildScopeParameter(input, name, parameter, ScopeInstance, &plan.Instance, &result.Instance, &record)
+			result.Audit.Parameters = append(result.Audit.Parameters, record)
 			continue
 		}
 		if input.InstanceMembershipUnknown {
@@ -268,52 +273,67 @@ func BuildApplyPlan(input BuildApplyPlanInput) (ApplyPlan, ApplyResult) {
 				skip = SkippedVariable{Name: name, Reason: SkipAbsent}
 			}
 			result.Instance.Skipped = append(result.Instance.Skipped, skip)
+			record := newParameterAudit(input, name, ParameterInfo{}, ScopeInstance, plan.Instance.Group)
+			completeSkippedParameterAudit(&record, skip.Reason)
+			result.Audit.Parameters = append(result.Audit.Parameters, record)
 			continue
 		}
 
 		parameter, inCluster := input.ClusterParameters[name]
 		if inCluster {
-			buildScopeParameter(input, name, parameter, ScopeCluster, &plan.Cluster, &result.Cluster)
+			record := newParameterAudit(input, name, parameter, ScopeCluster, plan.Cluster.Group)
+			buildScopeParameter(input, name, parameter, ScopeCluster, &plan.Cluster, &result.Cluster, &record)
+			result.Audit.Parameters = append(result.Audit.Parameters, record)
 			continue
 		}
 
-		result.Instance.Skipped = append(result.Instance.Skipped, SkippedVariable{
+		skip := SkippedVariable{
 			Name:   name,
 			Reason: SkipAbsent,
-		})
+		}
+		result.Instance.Skipped = append(result.Instance.Skipped, skip)
+		record := newParameterAudit(input, name, ParameterInfo{}, ScopeInstance, plan.Instance.Group)
+		completeSkippedParameterAudit(&record, skip.Reason)
+		result.Audit.Parameters = append(result.Audit.Parameters, record)
 	}
 
 	result.Sort()
 	return plan, result
 }
 
-func buildScopeParameter(input BuildApplyPlanInput, name string, parameter ParameterInfo, scope Scope, plan *ScopePlan, result *ScopeResult) {
+func buildScopeParameter(input BuildApplyPlanInput, name string, parameter ParameterInfo, scope Scope, plan *ScopePlan, result *ScopeResult, record *ParameterAudit) {
 	if skip, rejected := groupSkip(input, name, scope); rejected {
 		result.Skipped = append(result.Skipped, skip)
+		completeSkippedParameterAudit(record, skip.Reason)
 		return
 	}
 	if !parameter.IsModifiable {
 		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnmodifiable})
+		completeSkippedParameterAudit(record, SkipUnmodifiable)
 		return
 	}
 	if !supportsEngineMode(parameter.SupportedEngineModes, input.Metadata.EngineMode) {
 		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnsupportedEngineMode})
+		completeSkippedParameterAudit(record, SkipUnsupportedEngineMode)
 		return
 	}
 	if isServerlessManaged(input.Metadata, name) {
 		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipServerlessManaged})
+		completeSkippedParameterAudit(record, SkipServerlessManaged)
 		return
 	}
 
 	value, err := normalizeAWSRecommendationValue(input.Metadata, name, input.Recommendations[name])
 	if err != nil {
 		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})
+		completeSkippedParameterAudit(record, SkipInvalidValue)
 		return
 	}
 	current, currentExists := input.CurrentValues[name]
 	if parameter.HasParameterValue {
 		if currentValue, currentErr := normalizeParameterValue(name, parameter.ParameterValue); currentErr == nil && currentValue == value {
 			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnchanged})
+			completeSkippedParameterAudit(record, SkipUnchanged)
 			return
 		}
 	} else if currentExists {
@@ -321,10 +341,12 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 		if currentErr != nil {
 			if usesPostgreSQLAWSNativeUnit(input.Metadata, name) {
 				result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})
+				completeSkippedParameterAudit(record, SkipInvalidValue)
 				return
 			}
 		} else if currentValue == value {
 			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnchanged})
+			completeSkippedParameterAudit(record, SkipUnchanged)
 			return
 		}
 	}
@@ -334,6 +356,7 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 	case "dynamic":
 		if input.PendingRebootOnly {
 			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipPendingRebootOnly})
+			completeSkippedParameterAudit(record, SkipPendingRebootOnly)
 			return
 		}
 		applyMethod = types.ApplyMethodImmediate
@@ -341,6 +364,7 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 		applyMethod = types.ApplyMethodPendingReboot
 	default:
 		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnsupportedApplyType})
+		completeSkippedParameterAudit(record, SkipUnsupportedApplyType)
 		return
 	}
 
@@ -353,6 +377,11 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 		ParameterValue: aws.String(value),
 		ApplyMethod:    applyMethod,
 	})
+	record.SubmittedValue = aws.String(value)
+	record.ApplyMethod = string(applyMethod)
+	record.Outcome = OutcomeNotAttempted
+	record.Reason = ReasonNotSubmitted
+	record.VerificationStatus = VerificationNotApplicable
 }
 
 func groupSkip(input BuildApplyPlanInput, name string, scope Scope) (SkippedVariable, bool) {
