@@ -973,6 +973,46 @@ func TestApplyConfAwsRdsRepeatedPendingRebootUsesCanonicalAWSValuesForBothScopes
 	}
 }
 
+func TestApplyConfAwsRdsReadbackFailureDoesNotFailTask(t *testing.T) {
+	client := mysqlApplyClient("instance-custom")
+	parameter := modifiableAWSParameter("max_connections", "dynamic")
+	parameter.ParameterValue = aws.String("100")
+	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+		Parameters: []types.Parameter{parameter},
+	}}
+	installAWSApplyTestDependencies(t, client, nil)
+
+	originalReadback := readAWSAppliedParameters
+	readAWSAppliedParameters = func(context.Context, awsrds.ParameterReader, awsrds.Scope, awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error) {
+		return nil, errors.New("unavailable")
+	}
+	t.Cleanup(func() {
+		readAWSAppliedParameters = originalReadback
+	})
+
+	var logOutput strings.Builder
+	logger := *logging.Init("task-apply-aws-readback-test", false, false, &logOutput)
+	exitCode, status, output := ApplyConfAwsRds(
+		&awsApplyRepeater{recommendations: `{"max_connections":"200"}`},
+		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"max_connections": "100"}}},
+		logger,
+		awsApplyConfig("instance-custom", ""),
+		AWSApplyAll,
+	)
+
+	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want successful task", exitCode, status, output)
+	}
+	result := decodeAWSApplyResult(t, output)
+	record := auditRecord(t, &result.Audit, awsrds.ScopeInstance, "max_connections")
+	if record.VerificationStatus != awsrds.VerificationUnavailable || record.Reason != awsrds.ReasonReadbackFailed {
+		t.Fatalf("readback failure audit = status %q reason %q, want unavailable/readback-failed", record.VerificationStatus, record.Reason)
+	}
+	if !strings.Contains(logOutput.String(), "AWS parameter readback unavailable") {
+		t.Fatalf("readback failure log = %q, want warning", logOutput.String())
+	}
+}
+
 func TestAWSApplyWaiterAcceptsPendingRebootAndPollsOnlyModifiedScopes(t *testing.T) {
 	tests := []struct {
 		name                  string
@@ -1212,6 +1252,7 @@ func installAWSApplyTestDependencies(t *testing.T, client awsrds.Client, onWait 
 	t.Helper()
 	originalFactory := newAWSRDSClient
 	originalWaiter := waitForAWSApply
+	originalReadback := readAWSAppliedParameters
 	newAWSRDSClient = func(context.Context, *config.Config) (awsrds.Client, error) {
 		return client, nil
 	}
@@ -1221,9 +1262,22 @@ func installAWSApplyTestDependencies(t *testing.T, client awsrds.Client, onWait 
 		}
 		return nil
 	}
+	readAWSAppliedParameters = func(_ context.Context, _ awsrds.ParameterReader, _ awsrds.Scope, plan awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error) {
+		readback := make(map[string]awsrds.ParameterInfo, len(plan.Parameters))
+		for _, parameter := range plan.Parameters {
+			name := aws.ToString(parameter.ParameterName)
+			readback[name] = awsrds.ParameterInfo{
+				Name:              name,
+				ParameterValue:    aws.ToString(parameter.ParameterValue),
+				HasParameterValue: true,
+			}
+		}
+		return readback, nil
+	}
 	t.Cleanup(func() {
 		newAWSRDSClient = originalFactory
 		waitForAWSApply = originalWaiter
+		readAWSAppliedParameters = originalReadback
 	})
 }
 

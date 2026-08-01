@@ -85,6 +85,8 @@ type awsRDSClientFactory func(context.Context, *config.Config) (awsrds.Client, e
 
 type awsApplyWaitFunc func(context.Context, awsrds.Client, awsApplyWaitRequest) error
 
+type awsApplyReadbackFunc func(context.Context, awsrds.ParameterReader, awsrds.Scope, awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error)
+
 var newAWSRDSClient awsRDSClientFactory = func(ctx context.Context, configuration *config.Config) (awsrds.Client, error) {
 	cfg, err := configaws.LoadDefaultConfig(ctx, configaws.WithRegion(configuration.AwsRegion))
 	if err != nil {
@@ -94,6 +96,8 @@ var newAWSRDSClient awsRDSClientFactory = func(ctx context.Context, configuratio
 }
 
 var waitForAWSApply awsApplyWaitFunc = defaultWaitForAWSApply
+
+var readAWSAppliedParameters awsApplyReadbackFunc = defaultReadAWSAppliedParameters
 
 // ApplyConfAwsRds obtains one live recommendation snapshot, refreshes AWS
 // topology, routes every eligible value to its owning parameter-group API,
@@ -270,6 +274,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 				applyErr = waitErr
 			}
 		}
+		verifyAWSAppliedParameters(ctx, client, waitRequest, &result.Audit, logger)
 	}
 	if applyErr != nil {
 		logger.Errorf("AWS parameter apply failed: %v", applyErr)
@@ -650,6 +655,10 @@ func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request a
 		case <-timer.C:
 		}
 	}
+}
+
+func defaultReadAWSAppliedParameters(ctx context.Context, client awsrds.ParameterReader, scope awsrds.Scope, plan awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error) {
+	return awsrds.ListParameters(ctx, client, plan.Group, scope)
 }
 
 func awsApplyScopeReady(ctx context.Context, client awsrds.Client, metadata awsrds.Metadata, scope awsrds.Scope, plan awsrds.ScopePlan) (bool, error) {

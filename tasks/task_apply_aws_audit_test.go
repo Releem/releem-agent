@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -123,6 +124,80 @@ func TestAWSApplyPlanAndBatchLogsOmitValues(t *testing.T) {
 	}
 	if strings.Contains(output.String(), "submitted-secret") || strings.Contains(output.String(), "another-submitted-secret") {
 		t.Fatalf("structured AWS apply events leaked submitted values: %q", output.String())
+	}
+}
+
+func TestVerifyAWSAppliedParameters(t *testing.T) {
+	tests := []struct {
+		name         string
+		applyMethod  types.ApplyMethod
+		readback     map[string]awsrds.ParameterInfo
+		readbackErr  error
+		wantObserved *string
+		wantStatus   awsrds.VerificationStatus
+		wantReason   string
+	}{
+		{"immediate match", types.ApplyMethodImmediate, parameterMap("p", "200"), nil, aws.String("200"), awsrds.VerificationMatched, ""},
+		{"mismatch", types.ApplyMethodImmediate, parameterMap("p", "199"), nil, aws.String("199"), awsrds.VerificationMismatched, ""},
+		{"static match", types.ApplyMethodPendingReboot, parameterMap("p", "200"), nil, aws.String("200"), awsrds.VerificationPendingReboot, ""},
+		{"API failure", types.ApplyMethodImmediate, nil, errors.New("unavailable"), nil, awsrds.VerificationUnavailable, awsrds.ReasonReadbackFailed},
+		{"missing parameter", types.ApplyMethodImmediate, map[string]awsrds.ParameterInfo{}, nil, nil, awsrds.VerificationUnavailable, awsrds.ReasonReadbackParameterMissing},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalReadback := readAWSAppliedParameters
+			readbackCalls := 0
+			readAWSAppliedParameters = func(_ context.Context, _ awsrds.ParameterReader, scope awsrds.Scope, plan awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error) {
+				readbackCalls++
+				if scope != awsrds.ScopeInstance || plan.Group != "instance-group" {
+					t.Fatalf("readback scope/group = %q/%q, want instance/instance-group", scope, plan.Group)
+				}
+				return tt.readback, tt.readbackErr
+			}
+			t.Cleanup(func() {
+				readAWSAppliedParameters = originalReadback
+			})
+
+			request := awsApplyWaitRequest{
+				Instance: awsrds.ScopePlan{
+					Group: "instance-group",
+					Parameters: []types.Parameter{{
+						ParameterName:  aws.String("p"),
+						ParameterValue: aws.String("200"),
+						ApplyMethod:    tt.applyMethod,
+					}},
+				},
+			}
+			audit := awsrds.ApplyAudit{Parameters: []awsrds.ParameterAudit{{
+				Scope:              awsrds.ScopeInstance,
+				Name:               "p",
+				Group:              "instance-group",
+				SubmittedValue:     aws.String("200"),
+				ApplyMethod:        string(tt.applyMethod),
+				Outcome:            awsrds.OutcomeApplied,
+				VerificationStatus: awsrds.VerificationNotApplicable,
+			}}}
+
+			verifyAWSAppliedParameters(
+				context.Background(), mysqlApplyClient("instance-group"), request,
+				&audit, testAWSApplyLogger(),
+			)
+
+			record := auditRecord(t, &audit, awsrds.ScopeInstance, "p")
+			if !reflect.DeepEqual(record.ObservedAfter, tt.wantObserved) || record.VerificationStatus != tt.wantStatus || record.Reason != tt.wantReason {
+				t.Fatalf("verification = observed %#v status %q reason %q, want %#v/%q/%q", record.ObservedAfter, record.VerificationStatus, record.Reason, tt.wantObserved, tt.wantStatus, tt.wantReason)
+			}
+			if readbackCalls != 1 {
+				t.Fatalf("readback calls = %d, want one for the modified scope", readbackCalls)
+			}
+		})
+	}
+}
+
+func parameterMap(name, value string) map[string]awsrds.ParameterInfo {
+	return map[string]awsrds.ParameterInfo{
+		name: {Name: name, ParameterValue: value, HasParameterValue: true},
 	}
 }
 
