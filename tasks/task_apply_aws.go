@@ -260,7 +260,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 	result = plannedResult
 	recordAWSGroupMismatchDiagnostics(&result, groupValidation, metadata, configuration)
 
-	waitRequest, applyErr := applyAWSPlan(ctx, client, plan, &result)
+	waitRequest, applyErr := applyAWSPlan(ctx, client, plan, &result, logger, awsApplyTaskContext{})
 	waitRequest.Metadata = metadata
 	modified := waitRequest.modifiedScopes()
 	if modified.Instance || modified.Cluster {
@@ -364,19 +364,21 @@ func awsCurrentParameterValues(values models.MetricGroupValue) map[string]interf
 	return current
 }
 
-func applyAWSPlan(ctx context.Context, client awsrds.Client, plan awsrds.ApplyPlan, result *awsrds.ApplyResult) (awsApplyWaitRequest, error) {
+func applyAWSPlan(ctx context.Context, client awsrds.Client, plan awsrds.ApplyPlan, result *awsrds.ApplyResult, logger logging.Logger, task awsApplyTaskContext) (awsApplyWaitRequest, error) {
 	waitRequest := awsApplyWaitRequest{
 		Instance: awsrds.ScopePlan{Group: plan.Instance.Group, Parameters: []types.Parameter{}},
 		Cluster:  awsrds.ScopePlan{Group: plan.Cluster.Group, Parameters: []types.Parameter{}},
 	}
+	logAWSApplyEvent(logger, "aws_rds_apply_plan", awsApplyPlanEventFields(plan, task))
 
-	instanceApplied, err := applyAWSScopeBatches(ctx, client, awsrds.ScopeInstance, plan.Instance, &result.Instance)
+	instanceApplied, err := applyAWSScopeBatches(ctx, client, awsrds.ScopeInstance, plan.Instance, &result.Instance, &result.Audit, logger, task)
 	waitRequest.Instance.Parameters = instanceApplied
 	if err != nil {
+		markAWSAuditRemaining(&result.Audit, awsrds.ScopeCluster, plan.Cluster.Parameters, awsrds.ReasonPriorScopeFailure)
 		return waitRequest, err
 	}
 
-	clusterApplied, err := applyAWSScopeBatches(ctx, client, awsrds.ScopeCluster, plan.Cluster, &result.Cluster)
+	clusterApplied, err := applyAWSScopeBatches(ctx, client, awsrds.ScopeCluster, plan.Cluster, &result.Cluster, &result.Audit, logger, task)
 	waitRequest.Cluster.Parameters = clusterApplied
 	if err != nil {
 		return waitRequest, err
@@ -385,7 +387,7 @@ func applyAWSPlan(ctx context.Context, client awsrds.Client, plan awsrds.ApplyPl
 	return waitRequest, nil
 }
 
-func applyAWSScopeBatches(ctx context.Context, client awsrds.Client, scope awsrds.Scope, plan awsrds.ScopePlan, result *awsrds.ScopeResult) ([]types.Parameter, error) {
+func applyAWSScopeBatches(ctx context.Context, client awsrds.Client, scope awsrds.Scope, plan awsrds.ScopePlan, result *awsrds.ScopeResult, audit *awsrds.ApplyAudit, logger logging.Logger, task awsApplyTaskContext) ([]types.Parameter, error) {
 	applied := []types.Parameter{}
 	for start := 0; start < len(plan.Parameters); start += awsApplyBatchSize {
 		end := start + awsApplyBatchSize
@@ -411,16 +413,23 @@ func applyAWSScopeBatches(ctx context.Context, client awsrds.Client, scope awsrd
 			err = fmt.Errorf("unsupported AWS parameter scope %q", scope)
 		}
 
+		batchNumber := start/awsApplyBatchSize + 1
 		if err != nil {
+			errorCode := awsApplySafeErrorCode(err)
 			result.Failed = append(result.Failed, awsrds.FailedBatch{
 				Parameters: names,
-				Error:      awsApplySafeErrorCode(err),
+				Error:      errorCode,
 			})
+			markAWSAuditBatch(audit, scope, batch, batchNumber, awsrds.OutcomeFailed, "", errorCode)
+			markAWSAuditRemaining(audit, scope, plan.Parameters[end:], awsrds.ReasonPriorBatchFailure)
+			logAWSApplyEvent(logger, "aws_rds_apply_batch", awsApplyBatchEventFields(scope, plan.Group, batchNumber, names, awsrds.OutcomeFailed, errorCode, task))
 			return applied, fmt.Errorf("modify %s parameter group %q for parameters %s: %w", scope, plan.Group, strings.Join(names, ","), err)
 		}
 
 		applied = append(applied, batch...)
 		result.Applied = append(result.Applied, names...)
+		markAWSAuditBatch(audit, scope, batch, batchNumber, awsrds.OutcomeApplied, "", "")
+		logAWSApplyEvent(logger, "aws_rds_apply_batch", awsApplyBatchEventFields(scope, plan.Group, batchNumber, names, awsrds.OutcomeApplied, "", task))
 	}
 	return applied, nil
 }
