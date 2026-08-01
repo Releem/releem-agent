@@ -77,7 +77,7 @@ func TestDiscoverInstance(t *testing.T) {
 				DBInstanceIdentifier: aws.String(mysqlID),
 				DbiResourceId:        aws.String("db-resource-mysql"),
 				DBInstanceClass:      aws.String("db.m7g.large"),
-				Endpoint:             &types.Endpoint{Address: aws.String("orders-mysql.example")},
+				Endpoint:             &types.Endpoint{Address: aws.String("orders-mysql.example"), Port: aws.Int32(3307)},
 				Engine:               aws.String("mysql"),
 				DBClusterIdentifier:  aws.String("ordinary-multi-az-cluster"),
 				DBInstanceStatus:     aws.String("available"),
@@ -91,6 +91,7 @@ func TestDiscoverInstance(t *testing.T) {
 				DBInstanceResourceID:   "db-resource-mysql",
 				DBInstanceClass:        "db.m7g.large",
 				Endpoint:               "orders-mysql.example",
+				EndpointPort:           3307,
 				Engine:                 "mysql",
 				DBParameterGroup:       "mysql-custom",
 				DBParameterGroupStatus: "in-sync",
@@ -146,7 +147,7 @@ func TestDiscoverInstance(t *testing.T) {
 				DBInstanceIdentifier: aws.String(readerID),
 				DbiResourceId:        aws.String("db-resource-reader"),
 				DBInstanceClass:      aws.String("db.serverless"),
-				Endpoint:             &types.Endpoint{Address: aws.String("reader.example")},
+				Endpoint:             &types.Endpoint{Address: aws.String("reader.example"), Port: aws.Int32(5433)},
 				Engine:               aws.String("aurora-postgresql"),
 				DBClusterIdentifier:  aws.String(analyticsID),
 				DBInstanceStatus:     aws.String("backing-up"),
@@ -169,6 +170,7 @@ func TestDiscoverInstance(t *testing.T) {
 				DBInstanceResourceID:    "db-resource-reader",
 				DBInstanceClass:         "db.serverless",
 				Endpoint:                "reader.example",
+				EndpointPort:            5433,
 				Engine:                  "aurora-postgresql",
 				EngineMode:              "provisioned",
 				DBParameterGroup:        "aurora-pg-instance",
@@ -316,12 +318,14 @@ func TestMetadataHelpers(t *testing.T) {
 		wantDatabaseType string
 		wantMysqlHost    string
 		wantPgHost       string
+		wantMysqlPort    string
+		wantPgPort       string
 	}{
-		{name: "ordinary MySQL", metadata: Metadata{Engine: "mysql", Endpoint: "mysql.example"}, wantDatabaseType: "mysql", wantMysqlHost: "mysql.example", wantPgHost: "keep-pg"},
+		{name: "ordinary MySQL", metadata: Metadata{Engine: "mysql", Endpoint: "mysql.example", EndpointPort: 3307}, wantDatabaseType: "mysql", wantMysqlHost: "mysql.example", wantPgHost: "keep-pg", wantMysqlPort: "3307"},
 		{name: "ordinary MariaDB", metadata: Metadata{Engine: "mariadb", Endpoint: "maria.example"}, wantDatabaseType: "mysql", wantMysqlHost: "maria.example", wantPgHost: "keep-pg"},
 		{name: "Aurora MySQL", metadata: Metadata{Engine: "aurora-mysql", Endpoint: "aurora-mysql.example"}, wantAurora: true, wantDatabaseType: "mysql", wantMysqlHost: "aurora-mysql.example", wantPgHost: "keep-pg"},
 		{name: "legacy Aurora engine", metadata: Metadata{Engine: "aurora", Endpoint: "aurora.example"}, wantAurora: true, wantDatabaseType: "mysql", wantMysqlHost: "aurora.example", wantPgHost: "keep-pg"},
-		{name: "ordinary PostgreSQL", metadata: Metadata{Engine: "postgres", Endpoint: "postgres.example"}, wantDatabaseType: "postgresql", wantMysqlHost: "keep-mysql", wantPgHost: "postgres.example"},
+		{name: "ordinary PostgreSQL", metadata: Metadata{Engine: "postgres", Endpoint: "postgres.example", EndpointPort: 5433}, wantDatabaseType: "postgresql", wantMysqlHost: "keep-mysql", wantPgHost: "postgres.example", wantPgPort: "5433"},
 		{name: "Aurora PostgreSQL", metadata: Metadata{Engine: "aurora-postgresql", Endpoint: "aurora-pg.example"}, wantAurora: true, wantDatabaseType: "postgresql", wantMysqlHost: "keep-mysql", wantPgHost: "aurora-pg.example"},
 		{name: "unsupported engine", metadata: Metadata{Engine: "oracle-ee", Endpoint: "oracle.example"}, wantMysqlHost: "keep-mysql", wantPgHost: "keep-pg"},
 	}
@@ -337,10 +341,26 @@ func TestMetadataHelpers(t *testing.T) {
 				t.Fatalf("Metadata.DatabaseType() = %q, want %q", got, tt.wantDatabaseType)
 			}
 
-			cfg := &config.Config{MysqlHost: "keep-mysql", PgHost: "keep-pg"}
+			wantMysqlPort := tt.wantMysqlPort
+			if wantMysqlPort == "" {
+				wantMysqlPort = "keep-mysql-port"
+			}
+			wantPgPort := tt.wantPgPort
+			if wantPgPort == "" {
+				wantPgPort = "keep-pg-port"
+			}
+			cfg := &config.Config{
+				MysqlHost: "keep-mysql",
+				MysqlPort: "keep-mysql-port",
+				PgHost:    "keep-pg",
+				PgPort:    "keep-pg-port",
+			}
 			tt.metadata.ApplyEndpoint(cfg)
 			if cfg.MysqlHost != tt.wantMysqlHost || cfg.PgHost != tt.wantPgHost {
 				t.Fatalf("Metadata.ApplyEndpoint() hosts = (%q, %q), want (%q, %q)", cfg.MysqlHost, cfg.PgHost, tt.wantMysqlHost, tt.wantPgHost)
+			}
+			if cfg.MysqlPort != wantMysqlPort || cfg.PgPort != wantPgPort {
+				t.Fatalf("Metadata.ApplyEndpoint() ports = (%q, %q), want (%q, %q)", cfg.MysqlPort, cfg.PgPort, wantMysqlPort, wantPgPort)
 			}
 		})
 	}

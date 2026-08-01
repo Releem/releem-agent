@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -44,9 +45,10 @@ const (
 )
 
 const (
-	awsApplyErrorTimeout      = "timeout"
-	awsApplyErrorAccessDenied = "access-denied"
-	awsApplyErrorAWSAPI       = "aws-api-error"
+	awsApplyErrorTimeout                 = "timeout"
+	awsApplyErrorAccessDenied            = "access-denied"
+	awsApplyErrorAWSAPI                  = "aws-api-error"
+	awsApplyErrorParameterGroupNotInSync = "parameter-group-not-in-sync"
 )
 
 var errAWSApplyWaitTimeout = errors.New("timed out waiting for AWS parameter apply")
@@ -155,7 +157,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 			metadata.DBParameterGroupStatus,
 		)
 		logger.Error(err)
-		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
+		recordAWSParameterGroupReadinessFailure(&result, metadata)
 		return fail(awsApplyExitParameterGroupNotInSync)
 	}
 
@@ -282,6 +284,13 @@ func decodeAWSRecommendations(raw string) (map[string]interface{}, error) {
 	var recommendations map[string]interface{}
 	if err := decoder.Decode(&recommendations); err != nil {
 		return nil, fmt.Errorf("decode AWS RDS recommendations: %w", err)
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("decode AWS RDS recommendations: multiple JSON values")
+		}
+		return nil, fmt.Errorf("decode AWS RDS recommendations: trailing data: %w", err)
 	}
 	if recommendations == nil {
 		recommendations = map[string]interface{}{}
@@ -454,6 +463,16 @@ func recordAWSApplyFailure(result *awsrds.ApplyResult, scope awsrds.Scope, param
 		return
 	}
 	result.Instance.Failed = append(result.Instance.Failed, failure)
+}
+
+func recordAWSParameterGroupReadinessFailure(result *awsrds.ApplyResult, metadata awsrds.Metadata) {
+	result.Instance.Failed = append(result.Instance.Failed, awsrds.FailedBatch{
+		Parameters:           []string{},
+		Error:                awsApplyErrorParameterGroupNotInSync,
+		DBInstanceIdentifier: &metadata.DBInstanceIdentifier,
+		ParameterGroup:       &metadata.DBParameterGroup,
+		ParameterGroupStatus: &metadata.DBParameterGroupStatus,
+	})
 }
 
 type awsApplyWaitError struct {

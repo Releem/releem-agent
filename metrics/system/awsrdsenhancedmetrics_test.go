@@ -309,6 +309,43 @@ func TestAWSRDSEnhancedMetricsDiscoveryFallbackKeepsCollectionAlive(t *testing.T
 	}
 }
 
+func TestAWSRDSEnhancedMetricsDiscoveryTimeoutUsesCachedMetadata(t *testing.T) {
+	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_writer.json")
+	if err != nil {
+		t.Fatalf("read enhanced-monitoring fixture: %v", err)
+	}
+	client, requestedStream := testCloudWatchLogsClient(t, fixture)
+	logger := *logging.Init("aws-rds-discovery-timeout-test", false, false, io.Discard)
+	configuration := &config.Config{}
+	initial := testRDSMetadata("orders-1", "db-resource-cached", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", true)
+	discoveryResult := make(chan error, 1)
+	gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, client, configuration, initial, func(ctx context.Context) (awsrds.Metadata, error) {
+		<-ctx.Done()
+		discoveryResult <- ctx.Err()
+		return awsrds.Metadata{}, ctx.Err()
+	})
+	gatherer.metadataDiscoveryTimeout = 20 * time.Millisecond
+
+	started := time.Now()
+	metrics := &models.Metrics{}
+	if err := gatherer.GetMetrics(metrics); err != nil {
+		t.Fatalf("GetMetrics() error = %v, want cached-metadata report", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("GetMetrics() elapsed = %v, want bounded discovery fallback", elapsed)
+	}
+	if err := <-discoveryResult; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("discovery context error = %v, want deadline exceeded", err)
+	}
+	if got := <-requestedStream; got != initial.DBInstanceResourceID {
+		t.Fatalf("CloudWatch stream = %q, want cached %q", got, initial.DBInstanceResourceID)
+	}
+	host := metrics.System.Info["Host"].(models.MetricGroupValue)
+	if host["DBInstanceResourceID"] != initial.DBInstanceResourceID {
+		t.Fatalf("Host DBInstanceResourceID = %#v, want cached %q", host["DBInstanceResourceID"], initial.DBInstanceResourceID)
+	}
+}
+
 func TestAWSRDSEnhancedMetricsMetadataCacheIsConcurrentSafe(t *testing.T) {
 	logger := *logging.Init("aws-rds-metadata-cache-race-test", false, false, io.Discard)
 	initial := awsrds.Metadata{DBInstanceResourceID: "initial"}

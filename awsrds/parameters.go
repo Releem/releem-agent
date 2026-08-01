@@ -86,8 +86,11 @@ type SkippedVariable struct {
 // FailedBatch is populated by the apply service when one AWS modification
 // batch fails. Scope and group are represented by the containing ScopeResult.
 type FailedBatch struct {
-	Parameters []string `json:"parameters"`
-	Error      string   `json:"error"`
+	Parameters           []string `json:"parameters"`
+	Error                string   `json:"error"`
+	DBInstanceIdentifier *string  `json:"db_instance_identifier,omitempty"`
+	ParameterGroup       *string  `json:"parameter_group,omitempty"`
+	ParameterGroupStatus *string  `json:"parameter_group_status,omitempty"`
 }
 
 // ScopeDiagnostic records one scope-wide safety condition without repeating
@@ -314,7 +317,7 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 			return
 		}
 	} else if currentExists {
-		currentValue, currentErr := normalizeAWSRecommendationValue(input.Metadata, name, current)
+		currentValue, currentErr := normalizeParameterValue(name, current)
 		if currentErr != nil {
 			if usesPostgreSQLAWSNativeUnit(input.Metadata, name) {
 				result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})

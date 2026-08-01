@@ -18,18 +18,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 )
 
-const rdsMetricsLogGroupName = "RDSOSMetrics"
+const (
+	rdsMetricsLogGroupName         = "RDSOSMetrics"
+	awsRDSMetadataDiscoveryTimeout = 30 * time.Second
+)
 
 type RDSMetadataDiscoverer func(context.Context) (awsrds.Metadata, error)
 
 type AWSRDSEnhancedMetricsGatherer struct {
-	logger           logging.Logger
-	debug            bool
-	cwlogsclient     *cloudwatchlogs.Client
-	configuration    *config.Config
-	discoverMetadata RDSMetadataDiscoverer
-	metadataMu       sync.RWMutex
-	metadata         awsrds.Metadata
+	logger                   logging.Logger
+	debug                    bool
+	cwlogsclient             *cloudwatchlogs.Client
+	configuration            *config.Config
+	discoverMetadata         RDSMetadataDiscoverer
+	metadataDiscoveryTimeout time.Duration
+	metadataMu               sync.RWMutex
+	metadata                 awsrds.Metadata
 }
 
 type osMetrics struct {
@@ -193,17 +197,21 @@ func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, cwlogsclient *cloud
 	configuration *config.Config, initialMetadata awsrds.Metadata,
 	discoverMetadata RDSMetadataDiscoverer) *AWSRDSEnhancedMetricsGatherer {
 	return &AWSRDSEnhancedMetricsGatherer{
-		logger:           logger,
-		debug:            configuration.Debug,
-		cwlogsclient:     cwlogsclient,
-		configuration:    configuration,
-		discoverMetadata: discoverMetadata,
-		metadata:         initialMetadata,
+		logger:                   logger,
+		debug:                    configuration.Debug,
+		cwlogsclient:             cwlogsclient,
+		configuration:            configuration,
+		discoverMetadata:         discoverMetadata,
+		metadataDiscoveryTimeout: awsRDSMetadataDiscoveryTimeout,
+		metadata:                 initialMetadata,
 	}
 }
 
 func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ctx context.Context) awsrds.Metadata {
-	metadata, err := awsrdsenhancedmetrics.discoverMetadata(ctx)
+	discoveryCtx, cancel := context.WithTimeout(ctx, awsrdsenhancedmetrics.metadataDiscoveryTimeout)
+	defer cancel()
+
+	metadata, err := awsrdsenhancedmetrics.discoverMetadata(discoveryCtx)
 	if err != nil {
 		awsrdsenhancedmetrics.logger.Errorf("Failed to refresh AWS RDS metadata, using last known metadata: %v", err)
 		awsrdsenhancedmetrics.metadataMu.RLock()

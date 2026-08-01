@@ -623,15 +623,15 @@ func TestBuildApplyPlanPostgreSQLCurrentValueUnitSources(t *testing.T) {
 			wantSkip: SkipUnchanged,
 		},
 		{
-			name:      "DB metrics fallback remains byte-valued",
+			name:      "DB metrics fallback is already AWS native",
 			parameter: liveParameter("work_mem", "dynamic", true, ScopeInstance),
-			current:   json.Number("4194304"),
+			current:   json.Number("4096"),
 			wantSkip:  SkipUnchanged,
 		},
 		{
 			name:      "unsafe DB metrics fallback fails closed",
 			parameter: liveParameter("work_mem", "dynamic", true, ScopeInstance),
-			current:   json.Number("4194305"),
+			current:   []byte("4096"),
 			wantSkip:  SkipInvalidValue,
 		},
 	}

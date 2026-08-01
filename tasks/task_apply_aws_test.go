@@ -129,6 +129,28 @@ func (f *awsApplyClientFake) ModifyDBClusterParameterGroup(_ context.Context, in
 	return &rds.ModifyDBClusterParameterGroupOutput{}, nil
 }
 
+func TestDecodeAWSRecommendationsRequiresSingleJSONDocument(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "trailing junk", raw: `{"max_connections":"200"} garbage`},
+		{name: "second JSON value", raw: `{"max_connections":"200"}{"work_mem":"4096"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if recommendations, err := decodeAWSRecommendations(tt.raw); err == nil {
+				t.Fatalf("decodeAWSRecommendations(%q) = %#v, nil; want trailing-data error", tt.raw, recommendations)
+			}
+		})
+	}
+
+	if recommendations, err := decodeAWSRecommendations("  {\"max_connections\":\"200\"} \n\t"); err != nil || recommendations["max_connections"] != "200" {
+		t.Fatalf("decodeAWSRecommendations(valid whitespace) = %#v, %v", recommendations, err)
+	}
+}
+
 func TestApplyConfAwsRdsRequiresInstanceParameterGroupInSync(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -187,6 +209,13 @@ func TestApplyConfAwsRdsRequiresInstanceParameterGroupInSync(t *testing.T) {
 			result := decodeAWSApplyResult(t, output)
 			if len(result.Instance.Failed) != 1 || len(result.Cluster.Failed) != 0 {
 				t.Fatalf("blocked result = %#v, want one instance-scope failure", result)
+			}
+			failure := result.Instance.Failed[0]
+			if failure.Error != "parameter-group-not-in-sync" ||
+				failure.DBInstanceIdentifier == nil || *failure.DBInstanceIdentifier != "orders-1" ||
+				failure.ParameterGroup == nil || *failure.ParameterGroup != "instance-custom" ||
+				failure.ParameterGroupStatus == nil || *failure.ParameterGroupStatus != tt.status {
+				t.Fatalf("blocked readiness diagnostic = %#v, want instance=%q group=%q status=%q", failure, "orders-1", "instance-custom", tt.status)
 			}
 		})
 	}
@@ -747,6 +776,66 @@ func TestApplyConfAwsRdsUsesDBMetricsOnlyWhenAWSOmitsParameterValue(t *testing.T
 	}
 	if !reflect.DeepEqual(result.Instance.Skipped, []awsrds.SkippedVariable{{Name: "missing_value", Reason: awsrds.SkipUnchanged}}) {
 		t.Fatalf("skipped = %#v, want missing_value unchanged from nested DB metrics", result.Instance.Skipped)
+	}
+}
+
+func TestApplyConfAwsRdsTreatsPostgreSQLDBMetricsFallbackAsAWSNative(t *testing.T) {
+	client := mysqlApplyClient("instance-custom")
+	client.instanceOutput.DBInstances[0].Engine = aws.String("postgres")
+	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+		Parameters: []types.Parameter{
+			modifiableAWSParameter("work_mem", "dynamic"),
+			modifiableAWSParameter("wal_buffers", "dynamic"),
+		},
+	}}
+	installAWSApplyTestDependencies(t, client, nil)
+
+	exitCode, status, output := ApplyConfAwsRds(
+		&awsApplyRepeater{recommendations: `{"work_mem":4194304,"wal_buffers":16777216}`},
+		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{
+			"work_mem": models.MetricGroupValue{
+				"setting":         "4096",
+				"unit":            "kB",
+				"vartype":         "integer",
+				"source":          "configuration file",
+				"sourcefile":      "/etc/postgresql/postgresql.conf",
+				"sourceline":      "120",
+				"min_val":         "64",
+				"max_val":         "2147483647",
+				"enumvals":        "NULL",
+				"pending_restart": false,
+			},
+			"wal_buffers": models.MetricGroupValue{
+				"setting":         "2048",
+				"unit":            "8kB",
+				"vartype":         "integer",
+				"source":          "configuration file",
+				"sourcefile":      "/etc/postgresql/postgresql.conf",
+				"sourceline":      "121",
+				"min_val":         "-1",
+				"max_val":         "262143",
+				"enumvals":        "NULL",
+				"pending_restart": false,
+			},
+		}}},
+		testAWSApplyLogger(),
+		awsApplyConfig("instance-custom", ""),
+		AWSApplyAll,
+	)
+
+	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s", exitCode, status, output)
+	}
+	if len(client.instanceModifyCalls) != 0 {
+		t.Fatalf("instance modify calls = %#v, want unchanged PostgreSQL settings", client.instanceModifyCalls)
+	}
+	result := decodeAWSApplyResult(t, output)
+	wantSkipped := []awsrds.SkippedVariable{
+		{Name: "wal_buffers", Reason: awsrds.SkipUnchanged},
+		{Name: "work_mem", Reason: awsrds.SkipUnchanged},
+	}
+	if !reflect.DeepEqual(result.Instance.Skipped, wantSkipped) {
+		t.Fatalf("instance skips = %#v, want native DB-metrics values unchanged", result.Instance.Skipped)
 	}
 }
 

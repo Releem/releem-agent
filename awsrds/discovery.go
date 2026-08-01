@@ -3,6 +3,7 @@ package awsrds
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/Releem/mysqlconfigurer/config"
@@ -18,6 +19,7 @@ type Metadata struct {
 	DBInstanceResourceID    string
 	DBInstanceClass         string
 	Endpoint                string
+	EndpointPort            int32
 	Engine                  string
 	EngineMode              string
 	DBParameterGroup        string
@@ -116,8 +118,8 @@ func (m Metadata) DatabaseType() string {
 	}
 }
 
-// ApplyEndpoint assigns the discovered endpoint only to the host field for the
-// matching database engine.
+// ApplyEndpoint assigns the discovered endpoint to the host and, when AWS
+// supplies one, port fields for the matching database engine.
 func (m Metadata) ApplyEndpoint(configuration *config.Config) {
 	if configuration == nil {
 		return
@@ -126,8 +128,14 @@ func (m Metadata) ApplyEndpoint(configuration *config.Config) {
 	switch m.DatabaseType() {
 	case "mysql":
 		configuration.MysqlHost = m.Endpoint
+		if m.EndpointPort > 0 {
+			configuration.MysqlPort = strconv.FormatInt(int64(m.EndpointPort), 10)
+		}
 	case "postgresql":
 		configuration.PgHost = m.Endpoint
+		if m.EndpointPort > 0 {
+			configuration.PgPort = strconv.FormatInt(int64(m.EndpointPort), 10)
+		}
 	}
 }
 
@@ -142,6 +150,7 @@ func metadataFromInstance(instance types.DBInstance) Metadata {
 	}
 	if instance.Endpoint != nil {
 		metadata.Endpoint = aws.ToString(instance.Endpoint.Address)
+		metadata.EndpointPort = aws.ToInt32(instance.Endpoint.Port)
 	}
 	if len(instance.DBParameterGroups) > 0 {
 		metadata.DBParameterGroup = aws.ToString(instance.DBParameterGroups[0].DBParameterGroupName)
