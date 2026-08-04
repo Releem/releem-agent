@@ -85,7 +85,8 @@ cd tests
 1. Bump the version everywhere: `config/config.go` (`ReleemAgentVersion`),
    `install.sh` (header + `install_script_version`), `mysqlconfigurer.sh`
    (header + `VERSION`), `windows/mysqlconfigurer.ps1` (`$ScriptVersion`),
-   related tests (e.g. `tests/windows/test_05_update_delegation.ps1`), and
+   related tests (e.g. `tests/mysqlconfigurer.bats`,
+   `tests/windows/test_05_update_delegation.ps1`), and
    `current_version_agent`. Do not edit built binaries.
 2. Add a new `## X.Y.Z` section to `RELEASE_NOTES.md` with the changes in that
    release.
