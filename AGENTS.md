@@ -79,3 +79,15 @@ cd tests
 - Are built binaries, secrets, and local configs untouched?
 - Is the relevant OS/DB behavior covered by Go, Bats, or e2e tests?
 - Are failure messages actionable for users installing the agent manually?
+
+## Creating a Release
+
+1. Bump the version everywhere: `config/config.go` (`ReleemAgentVersion`),
+   `install.sh` (header + `install_script_version`), `mysqlconfigurer.sh`
+   (header + `VERSION`), `windows/mysqlconfigurer.ps1` (`$ScriptVersion`),
+   related tests (e.g. `tests/windows/test_05_update_delegation.ps1`), and
+   `current_version_agent`. Do not edit built binaries.
+2. Add a new `## X.Y.Z` section to `RELEASE_NOTES.md` with the changes in that
+   release.
+3. Commit the version bump and release notes.
+4. Tag that commit `X.Y.Z` and push the branch and tag to `origin`.

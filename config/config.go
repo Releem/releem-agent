@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	ReleemAgentVersion                  = "1.25.0"
+	ReleemAgentVersion                  = "1.25.1"
 	DefaultTableSizeCacheTableThreshold = int64(10000)
 	DefaultTableSizeCacheRAMMultiplier  = int64(4)
 	DefaultTableSizeCacheTTLSeconds     = time.Duration(604800)
