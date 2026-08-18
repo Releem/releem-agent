@@ -114,18 +114,15 @@ func markAWSAuditBatch(audit *awsrds.ApplyAudit, scope awsrds.Scope, parameters 
 		return
 	}
 	for _, name := range awsParameterNames(parameters) {
-		for index := range audit.Parameters {
-			record := &audit.Parameters[index]
-			if record.Scope != scope || record.Name != name {
-				continue
-			}
-			batchCopy := batch
-			record.Batch = &batchCopy
-			record.Outcome = outcome
-			record.Reason = reason
-			record.Error = errorCode
-			break
+		record := findAWSAuditRecord(audit, scope, name)
+		if record == nil {
+			continue
 		}
+		batchCopy := batch
+		record.Batch = &batchCopy
+		record.Outcome = outcome
+		record.Reason = reason
+		record.Error = errorCode
 	}
 }
 
@@ -134,16 +131,13 @@ func markAWSAuditRemaining(audit *awsrds.ApplyAudit, scope awsrds.Scope, paramet
 		return
 	}
 	for _, name := range awsParameterNames(parameters) {
-		for index := range audit.Parameters {
-			record := &audit.Parameters[index]
-			if record.Scope != scope || record.Name != name {
-				continue
-			}
-			record.Outcome = awsrds.OutcomeNotAttempted
-			record.Reason = reason
-			record.Error = ""
-			break
+		record := findAWSAuditRecord(audit, scope, name)
+		if record == nil {
+			continue
 		}
+		record.Outcome = awsrds.OutcomeNotAttempted
+		record.Reason = reason
+		record.Error = ""
 	}
 }
 

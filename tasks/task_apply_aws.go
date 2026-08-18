@@ -59,7 +59,10 @@ type awsAPIError interface {
 }
 
 const (
-	awsApplyWaitTimeout  = 400 * time.Second
+	// awsApplyWaitTimeout preserves the effective wall-clock budget of the
+	// pre-routing waiter, which polled every 3s for up to 400 iterations
+	// (~1200s) rather than 400s.
+	awsApplyWaitTimeout  = 1200 * time.Second
 	awsApplyPollInterval = 3 * time.Second
 )
 
@@ -181,29 +184,18 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 	}
 
 	groupValidation := validateAWSGroups(logger, metadata, configuration)
-	recordAWSGroupMismatchDiagnostics(&result, groupValidation, metadata, configuration)
 
 	instanceParameters := map[string]awsrds.ParameterInfo{}
 	instanceLookupGroup := configuration.AwsRDSParameterGroup
 	instanceClassificationOnly := false
 	instanceMembershipUnknown := false
-	switch {
-	case isDefaultAWSParameterGroup(configuration.AwsRDSParameterGroup):
-		// Default groups cannot be modified, but their attached live membership
-		// remains authoritative for instance priority over a custom cluster group.
-		instanceLookupGroup = metadata.DBParameterGroup
-		instanceClassificationOnly = true
-		instanceMembershipUnknown = instanceLookupGroup == ""
-	case configuration.AwsRDSParameterGroup == "":
-		// An attached group can still classify instance membership when old or
-		// incomplete Agent configuration omits the mutation target.
-		instanceLookupGroup = metadata.DBParameterGroup
-		instanceClassificationOnly = true
-		instanceMembershipUnknown = instanceLookupGroup == ""
-	case groupValidation.InstanceMismatch:
-		// A mismatched configured group is never a mutation target. Read the
-		// attached group only to classify recommendations so BuildApplyPlan can
-		// report the mismatch without blocking the cluster scope.
+	// A default group, an unconfigured group, or a mismatched configured
+	// group is never a mutation target. In each case, read the attached
+	// group only to classify recommendations so BuildApplyPlan can report
+	// the mismatch/absence without blocking the cluster scope.
+	if awsrds.IsDefaultParameterGroup(configuration.AwsRDSParameterGroup) ||
+		configuration.AwsRDSParameterGroup == "" ||
+		groupValidation.InstanceMismatch {
 		instanceLookupGroup = metadata.DBParameterGroup
 		instanceClassificationOnly = true
 		instanceMembershipUnknown = instanceLookupGroup == ""
@@ -232,7 +224,7 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		configuration.AwsRDSClusterParameterGroup,
 	)
 	switch {
-	case isDefaultAWSParameterGroup(configuration.AwsRDSClusterParameterGroup):
+	case awsrds.IsDefaultParameterGroup(configuration.AwsRDSClusterParameterGroup):
 		// Reject default groups before ListParameters; they are never eligible
 		// targets and their metadata is unnecessary for valid instance work.
 		clusterLookup = awsrds.ClusterParameterGroupLookup{}
@@ -245,6 +237,11 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 			Group:              metadata.DBClusterParameterGroup,
 			ClassificationOnly: true,
 		}
+	}
+	if clusterLookup.Group != "" && !metadata.IsClusterWriter {
+		// A reader can never submit cluster-scope changes, so a transient
+		// classification read must not fail the whole apply task.
+		clusterLookup.ClassificationOnly = true
 	}
 	if clusterLookup.Group != "" {
 		clusterParameters, err = awsrds.ListParameters(
@@ -361,10 +358,6 @@ func appendAWSGroupMismatchDiagnostic(result *awsrds.ScopeResult, expected, actu
 		ExpectedGroup: expected,
 		ActualGroup:   actual,
 	})
-}
-
-func isDefaultAWSParameterGroup(group string) bool {
-	return strings.HasPrefix(strings.ToLower(group), "default.")
 }
 
 func awsCurrentParameterValues(values models.MetricGroupValue) map[string]interface{} {

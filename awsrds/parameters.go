@@ -162,42 +162,7 @@ func ListParameters(ctx context.Context, client ParameterReader, group string, s
 		return nil, fmt.Errorf("list %s parameters: RDS client is nil", scope)
 	}
 
-	type page struct {
-		parameters []types.Parameter
-		marker     *string
-	}
-
-	var fetch func(*string) (page, error)
-	switch scope {
-	case ScopeInstance:
-		fetch = func(marker *string) (page, error) {
-			output, err := client.DescribeDBParameters(ctx, &rds.DescribeDBParametersInput{
-				DBParameterGroupName: aws.String(group),
-				Marker:               marker,
-			})
-			if err != nil {
-				return page{}, err
-			}
-			if output == nil {
-				return page{}, fmt.Errorf("DescribeDBParameters returned a nil output")
-			}
-			return page{parameters: output.Parameters, marker: output.Marker}, nil
-		}
-	case ScopeCluster:
-		fetch = func(marker *string) (page, error) {
-			output, err := client.DescribeDBClusterParameters(ctx, &rds.DescribeDBClusterParametersInput{
-				DBClusterParameterGroupName: aws.String(group),
-				Marker:                      marker,
-			})
-			if err != nil {
-				return page{}, err
-			}
-			if output == nil {
-				return page{}, fmt.Errorf("DescribeDBClusterParameters returned a nil output")
-			}
-			return page{parameters: output.Parameters, marker: output.Marker}, nil
-		}
-	default:
+	if scope != ScopeInstance && scope != ScopeCluster {
 		return nil, fmt.Errorf("list parameters: unsupported scope %q", scope)
 	}
 
@@ -205,12 +170,36 @@ func ListParameters(ctx context.Context, client ParameterReader, group string, s
 	seenMarkers := make(map[string]struct{})
 	var marker *string
 	for {
-		currentPage, err := fetch(marker)
-		if err != nil {
-			return nil, fmt.Errorf("list %s parameters for group %q: %w", scope, group, err)
+		var pageParameters []types.Parameter
+		var pageMarker *string
+		switch scope {
+		case ScopeInstance:
+			output, err := client.DescribeDBParameters(ctx, &rds.DescribeDBParametersInput{
+				DBParameterGroupName: aws.String(group),
+				Marker:               marker,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("list %s parameters for group %q: %w", scope, group, err)
+			}
+			if output == nil {
+				return nil, fmt.Errorf("list %s parameters for group %q: DescribeDBParameters returned a nil output", scope, group)
+			}
+			pageParameters, pageMarker = output.Parameters, output.Marker
+		case ScopeCluster:
+			output, err := client.DescribeDBClusterParameters(ctx, &rds.DescribeDBClusterParametersInput{
+				DBClusterParameterGroupName: aws.String(group),
+				Marker:                      marker,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("list %s parameters for group %q: %w", scope, group, err)
+			}
+			if output == nil {
+				return nil, fmt.Errorf("list %s parameters for group %q: DescribeDBClusterParameters returned a nil output", scope, group)
+			}
+			pageParameters, pageMarker = output.Parameters, output.Marker
 		}
 
-		for _, parameter := range currentPage.parameters {
+		for _, parameter := range pageParameters {
 			name := aws.ToString(parameter.ParameterName)
 			if name == "" {
 				continue
@@ -228,7 +217,7 @@ func ListParameters(ctx context.Context, client ParameterReader, group string, s
 			parameters[name] = info
 		}
 
-		nextMarker := aws.ToString(currentPage.marker)
+		nextMarker := aws.ToString(pageMarker)
 		if nextMarker == "" {
 			return parameters, nil
 		}
@@ -301,52 +290,51 @@ func BuildApplyPlan(input BuildApplyPlanInput) (ApplyPlan, ApplyResult) {
 	return plan, result
 }
 
+// skipParameter records a rejected recommendation in both the plan's skip
+// list and its audit trail, keeping the two in sync under one reason value.
+func skipParameter(result *ScopeResult, record *ParameterAudit, name string, reason SkipReason) {
+	result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: reason})
+	completeSkippedParameterAudit(record, reason)
+}
+
 func buildScopeParameter(input BuildApplyPlanInput, name string, parameter ParameterInfo, scope Scope, plan *ScopePlan, result *ScopeResult, record *ParameterAudit) {
 	if skip, rejected := groupSkip(input, name, scope); rejected {
-		result.Skipped = append(result.Skipped, skip)
-		completeSkippedParameterAudit(record, skip.Reason)
+		skipParameter(result, record, name, skip.Reason)
 		return
 	}
 	if !parameter.IsModifiable {
-		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnmodifiable})
-		completeSkippedParameterAudit(record, SkipUnmodifiable)
+		skipParameter(result, record, name, SkipUnmodifiable)
 		return
 	}
 	if !supportsEngineMode(parameter.SupportedEngineModes, input.Metadata.EngineMode) {
-		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnsupportedEngineMode})
-		completeSkippedParameterAudit(record, SkipUnsupportedEngineMode)
+		skipParameter(result, record, name, SkipUnsupportedEngineMode)
 		return
 	}
 	if isServerlessManaged(input.Metadata, name) {
-		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipServerlessManaged})
-		completeSkippedParameterAudit(record, SkipServerlessManaged)
+		skipParameter(result, record, name, SkipServerlessManaged)
 		return
 	}
 
 	value, err := normalizeAWSRecommendationValue(input.Metadata, name, input.Recommendations[name])
 	if err != nil {
-		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})
-		completeSkippedParameterAudit(record, SkipInvalidValue)
+		skipParameter(result, record, name, SkipInvalidValue)
 		return
 	}
 	current, currentExists := input.CurrentValues[name]
 	if parameter.HasParameterValue {
 		if currentValue, currentErr := normalizeParameterValue(name, parameter.ParameterValue); currentErr == nil && currentValue == value {
-			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnchanged})
-			completeSkippedParameterAudit(record, SkipUnchanged)
+			skipParameter(result, record, name, SkipUnchanged)
 			return
 		}
 	} else if currentExists {
 		currentValue, currentErr := normalizeParameterValue(name, current)
 		if currentErr != nil {
 			if usesPostgreSQLAWSNativeUnit(input.Metadata, name) {
-				result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipInvalidValue})
-				completeSkippedParameterAudit(record, SkipInvalidValue)
+				skipParameter(result, record, name, SkipInvalidValue)
 				return
 			}
 		} else if currentValue == value {
-			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnchanged})
-			completeSkippedParameterAudit(record, SkipUnchanged)
+			skipParameter(result, record, name, SkipUnchanged)
 			return
 		}
 	}
@@ -355,16 +343,14 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 	switch strings.ToLower(parameter.ApplyType) {
 	case "dynamic":
 		if input.PendingRebootOnly {
-			result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipPendingRebootOnly})
-			completeSkippedParameterAudit(record, SkipPendingRebootOnly)
+			skipParameter(result, record, name, SkipPendingRebootOnly)
 			return
 		}
 		applyMethod = types.ApplyMethodImmediate
 	case "static":
 		applyMethod = types.ApplyMethodPendingReboot
 	default:
-		result.Skipped = append(result.Skipped, SkippedVariable{Name: name, Reason: SkipUnsupportedApplyType})
-		completeSkippedParameterAudit(record, SkipUnsupportedApplyType)
+		skipParameter(result, record, name, SkipUnsupportedApplyType)
 		return
 	}
 
@@ -384,6 +370,12 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 	record.VerificationStatus = VerificationNotApplicable
 }
 
+// IsDefaultParameterGroup reports whether group is an AWS-managed default
+// parameter group, which can never be a mutation target.
+func IsDefaultParameterGroup(group string) bool {
+	return strings.HasPrefix(strings.ToLower(group), "default.")
+}
+
 func groupSkip(input BuildApplyPlanInput, name string, scope Scope) (SkippedVariable, bool) {
 	configured := input.ConfiguredInstanceGroup
 	attached := input.Metadata.DBParameterGroup
@@ -395,7 +387,7 @@ func groupSkip(input BuildApplyPlanInput, name string, scope Scope) (SkippedVari
 	if configured == "" {
 		return SkippedVariable{Name: name, Reason: SkipGroupNotConfigured}, true
 	}
-	if strings.HasPrefix(strings.ToLower(configured), "default.") {
+	if IsDefaultParameterGroup(configured) {
 		return SkippedVariable{Name: name, Reason: SkipDefaultGroup}, true
 	}
 	if configured != attached {

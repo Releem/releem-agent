@@ -107,12 +107,15 @@ func (m Metadata) IsAurora() bool {
 }
 
 // DatabaseType maps an RDS engine to the database type used by the Agent.
+// Aurora classification defers to IsAurora's prefix check so a future Aurora
+// engine identifier is classified consistently by both methods.
 func (m Metadata) DatabaseType() string {
-	switch strings.ToLower(m.Engine) {
-	case "aurora", "aurora-mysql", "mariadb", "mysql":
-		return "mysql"
-	case "aurora-postgresql", "postgres":
+	engine := strings.ToLower(m.Engine)
+	switch {
+	case strings.Contains(engine, "postgres"):
 		return "postgresql"
+	case engine == "mariadb" || engine == "mysql" || m.IsAurora():
+		return "mysql"
 	default:
 		return ""
 	}
