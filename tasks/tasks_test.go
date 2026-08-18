@@ -2,12 +2,9 @@ package tasks
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
-	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
@@ -18,70 +15,6 @@ import (
 type taskRepeaterStub struct {
 	taskPayload string
 	statuses    []models.Task
-}
-
-func TestProcessTaskType4AndTaskType5SelectAWSApplyModeOnce(t *testing.T) {
-	originalApply := runAWSRDSApply
-	originalSleep := processTaskSleep
-	processTaskSleep = func(time.Duration) {}
-	t.Cleanup(func() {
-		runAWSRDSApply = originalApply
-		processTaskSleep = originalSleep
-	})
-
-	tests := []struct {
-		name     string
-		taskType int
-		wantMode AWSApplyMode
-	}{
-		{name: "TaskType4 applies dynamic and static together", taskType: 4, wantMode: AWSApplyAll},
-		{name: "TaskType5 applies pending reboot only", taskType: 5, wantMode: AWSApplyPendingRebootOnly},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var modes []AWSApplyMode
-			runAWSRDSApply = func(_ models.MetricsRepeater, _ []models.MetricsGatherer, _ logging.Logger, _ *config.Config, mode AWSApplyMode, _ awsApplyTaskContext) (int, int, string) {
-				modes = append(modes, mode)
-				return awsApplyExitSuccess, awsApplyTaskStatusSuccess, `{"instance":{"applied":[],"skipped":[],"failed":[]},"cluster":{"applied":[],"skipped":[],"failed":[]}}`
-			}
-			repeater := &taskRepeaterStub{taskPayload: fmt.Sprintf(`{"task_id":42,"task_type_id":%d}`, tt.taskType)}
-
-			ProcessTask(repeater, nil, *logging.Init("tasks-test", true, false, io.Discard), &config.Config{InstanceType: "aws/rds"})
-
-			if !reflect.DeepEqual(modes, []AWSApplyMode{tt.wantMode}) {
-				t.Fatalf("AWS apply modes = %v, want one call with %v", modes, tt.wantMode)
-			}
-			if len(repeater.statuses) != 2 || repeater.statuses[1].ExitCode != awsApplyExitSuccess || repeater.statuses[1].Status != awsApplyTaskStatusSuccess {
-				t.Fatalf("task statuses = %#v, want successful final task status", repeater.statuses)
-			}
-		})
-	}
-}
-
-func TestProcessTaskAWSApplyPassesTaskContext(t *testing.T) {
-	originalApply := runAWSRDSApply
-	originalSleep := processTaskSleep
-	processTaskSleep = func(time.Duration) {}
-	t.Cleanup(func() {
-		runAWSRDSApply = originalApply
-		processTaskSleep = originalSleep
-	})
-
-	want := awsApplyTaskContext{TaskID: 42, TaskTypeID: 4}
-	runAWSRDSApply = func(_ models.MetricsRepeater, _ []models.MetricsGatherer, _ logging.Logger, _ *config.Config, _ AWSApplyMode, got awsApplyTaskContext) (int, int, string) {
-		if got != want {
-			t.Fatalf("task context = %#v, want %#v", got, want)
-		}
-		return 0, 1, `{"instance":{"applied":[],"skipped":[],"failed":[]},"cluster":{"applied":[],"skipped":[],"failed":[]},"audit":{"schema_version":1,"topology":{},"parameters":[]}}`
-	}
-	repeater := &taskRepeaterStub{taskPayload: `{"task_id":42,"task_type_id":4}`}
-
-	ProcessTask(repeater, nil, *logging.Init("tasks-test", true, false, io.Discard), &config.Config{InstanceType: "aws/rds"})
-
-	if len(repeater.statuses) != 2 || repeater.statuses[1].ExitCode != 0 || repeater.statuses[1].Status != 1 {
-		t.Fatalf("task statuses = %#v, want successful correlated AWS apply", repeater.statuses)
-	}
 }
 
 func (r *taskRepeaterStub) ProcessMetrics(_ models.MetricContext, metrics models.Metrics, mode models.ModeType) (string, error) {

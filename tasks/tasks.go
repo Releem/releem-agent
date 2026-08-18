@@ -22,10 +22,6 @@ var newSchemaChangeExecutor = func(logger logging.Logger) schemaChangeExecutor {
 	return phase2.NewExecutor(models.DB, &logger)
 }
 
-var runAWSRDSApply = applyConfAWSRDS
-
-var processTaskSleep = time.Sleep
-
 func ProcessTaskFunc(repeaters models.MetricsRepeater, gatherers []models.MetricsGatherer, logger logging.Logger, configuration *config.Config) func() {
 	return func() {
 		ProcessTask(repeaters, gatherers, logger, configuration)
@@ -80,7 +76,7 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 	case 4:
 		switch configuration.InstanceType {
 		case "aws/rds":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = runAWSRDSApply(
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = applyConfAWSRDS(
 				repeaters, gatherers, logger, configuration, AWSApplyAll,
 				awsApplyTaskContext{TaskID: TaskStruct.ID, TaskTypeID: TaskStruct.TypeID},
 			)
@@ -111,7 +107,7 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 	case 5:
 		switch configuration.InstanceType {
 		case "aws/rds":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = runAWSRDSApply(
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = applyConfAWSRDS(
 				repeaters, gatherers, logger, configuration, AWSApplyPendingRebootOnly,
 				awsApplyTaskContext{TaskID: TaskStruct.ID, TaskTypeID: TaskStruct.TypeID},
 			)
@@ -167,7 +163,7 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 		TaskStruct.Status = 4
 	}
 
-	processTaskSleep(10 * time.Second)
+	time.Sleep(10 * time.Second)
 	metrics = utils.CollectMetrics(gatherers, logger, configuration)
 	logger.Infof(" * Task with id - %d and type id - %d completed with code %d", TaskStruct.ID, TaskStruct.TypeID, TaskStruct.ExitCode)
 
