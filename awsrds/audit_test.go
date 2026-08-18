@@ -20,7 +20,7 @@ func TestBuildApplyPlanBuildsVersionedParameterAudit(t *testing.T) {
 			DBParameterGroup: "instance-pg", DBClusterIdentifier: "orders",
 			DBClusterParameterGroup: "cluster-pg", IsClusterWriter: true,
 			Endpoint: "must-not-appear.example", InstanceStatus: "available",
-			DBParameterGroupStatus: "in-sync",
+			DBParameterGroupStatus: "in-sync", DBClusterParameterGroupStatus: "applying",
 		},
 		ConfiguredInstanceGroup: "instance-pg",
 		ConfiguredClusterGroup:  "cluster-pg",
@@ -42,6 +42,9 @@ func TestBuildApplyPlanBuildsVersionedParameterAudit(t *testing.T) {
 
 	if result.Audit.SchemaVersion != 1 {
 		t.Fatalf("schema = %d, want 1", result.Audit.SchemaVersion)
+	}
+	if result.Audit.Topology.DBClusterParameterGroupStatus != "applying" {
+		t.Fatalf("cluster parameter group status = %q, want applying", result.Audit.Topology.DBClusterParameterGroupStatus)
 	}
 	if got := aws.ToString(plan.Instance.Parameters[0].ParameterValue); got != "8192" {
 		t.Fatalf("submitted = %q, want 8192", got)

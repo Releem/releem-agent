@@ -223,6 +223,73 @@ func TestApplyConfAwsRdsRequiresInstanceParameterGroupInSync(t *testing.T) {
 	}
 }
 
+func TestApplyConfAwsRdsRequiresWriterClusterParameterGroupInSync(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    string
+		wantExit  int
+		wantLists bool
+	}{
+		{name: "in sync", status: "in-sync", wantExit: awsApplyExitSuccess, wantLists: true},
+		{name: "applying", status: "applying", wantExit: awsApplyExitParameterGroupNotInSync},
+		{name: "pending reboot", status: "pending-reboot", wantExit: awsApplyExitParameterGroupNotInSync},
+		{name: "missing status", status: "", wantExit: awsApplyExitParameterGroupNotInSync},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := auroraApplyClient(true, "instance-custom", "cluster-custom")
+			client.clusterOutput.DBClusters[0].DBClusterMembers[0].DBClusterParameterGroupStatus = aws.String(tt.status)
+			client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+				Parameters: []types.Parameter{modifiableAWSParameter("instance_value", "dynamic")},
+			}}
+			client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
+				Parameters: []types.Parameter{modifiableAWSParameter("cluster_value", "dynamic")},
+			}}
+			installAWSApplyTestDependencies(t, client, nil)
+
+			exitCode, taskStatus, output := ApplyConfAwsRds(
+				&awsApplyRepeater{recommendations: `{"instance_value":"2","cluster_value":"3"}`},
+				[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{
+					"instance_value": "1",
+					"cluster_value":  "1",
+				}}},
+				testAWSApplyLogger(),
+				awsApplyConfig("instance-custom", "cluster-custom"),
+				AWSApplyAll,
+			)
+
+			if exitCode != tt.wantExit {
+				t.Fatalf("ApplyConfAwsRds() exit = %d, want %d; output %s", exitCode, tt.wantExit, output)
+			}
+			if tt.wantLists {
+				if taskStatus != awsApplyTaskStatusSuccess || len(client.instanceDescribeGroups) != 1 || len(client.clusterDescribeGroups) != 1 {
+					t.Fatalf("ready apply status/lists = %d/%#v/%#v", taskStatus, client.instanceDescribeGroups, client.clusterDescribeGroups)
+				}
+				return
+			}
+
+			if taskStatus != awsApplyTaskStatusFailure {
+				t.Fatalf("blocked task status = %d, want %d", taskStatus, awsApplyTaskStatusFailure)
+			}
+			if len(client.instanceDescribeGroups) != 0 || len(client.clusterDescribeGroups) != 0 || len(client.instanceModifyCalls) != 0 || len(client.clusterModifyCalls) != 0 {
+				t.Fatalf("blocked apply reached parameter APIs: instance lists %#v, cluster lists %#v, instance modifies %d, cluster modifies %d", client.instanceDescribeGroups, client.clusterDescribeGroups, len(client.instanceModifyCalls), len(client.clusterModifyCalls))
+			}
+			result := decodeAWSApplyResult(t, output)
+			if len(result.Instance.Failed) != 0 || len(result.Cluster.Failed) != 1 {
+				t.Fatalf("blocked result = %#v, want one cluster-scope failure", result)
+			}
+			failure := result.Cluster.Failed[0]
+			if failure.Error != "parameter-group-not-in-sync" ||
+				failure.DBClusterIdentifier == nil || *failure.DBClusterIdentifier != "orders-cluster" ||
+				failure.ParameterGroup == nil || *failure.ParameterGroup != "cluster-custom" ||
+				failure.ParameterGroupStatus == nil || *failure.ParameterGroupStatus != tt.status {
+				t.Fatalf("blocked readiness diagnostic = %#v, want cluster=%q group=%q status=%q", failure, "orders-cluster", "cluster-custom", tt.status)
+			}
+		})
+	}
+}
+
 func TestApplyConfAwsRdsRefreshesDiscoveryRoutesScopesAndBatchesTwentyPlusOne(t *testing.T) {
 	instanceParameters := make([]types.Parameter, 0, 21)
 	recommendations := make(map[string]string, 22)
@@ -477,6 +544,9 @@ func TestApplyConfAwsRdsReaderAndClassificationOnlyClusterGroupsNeverModifyClust
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := auroraApplyClient(tt.writer, "instance-custom", "cluster-custom")
+			if !tt.writer {
+				client.clusterOutput.DBClusters[0].DBClusterMembers[0].DBClusterParameterGroupStatus = aws.String("applying")
+			}
 			client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {}}
 			client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
 				Parameters: []types.Parameter{modifiableAWSParameter("cluster_value", "dynamic")},
@@ -1333,8 +1403,9 @@ func auroraApplyClient(writer bool, instanceGroup, clusterGroup string) *awsAppl
 			EngineMode:              aws.String("provisioned"),
 			Status:                  aws.String("available"),
 			DBClusterMembers: []types.DBClusterMember{{
-				DBInstanceIdentifier: aws.String("orders-1"),
-				IsClusterWriter:      aws.Bool(writer),
+				DBInstanceIdentifier:          aws.String("orders-1"),
+				DBClusterParameterGroupStatus: aws.String("in-sync"),
+				IsClusterWriter:               aws.Bool(writer),
 			}},
 		}}},
 		instancePages:          map[string]*rds.DescribeDBParametersOutput{},

@@ -45,17 +45,18 @@ const (
 )
 
 type AuditTopology struct {
-	DBInstanceIdentifier    string `json:"db_instance_identifier,omitempty"`
-	DBInstanceClass         string `json:"db_instance_class,omitempty"`
-	Engine                  string `json:"engine,omitempty"`
-	EngineMode              string `json:"engine_mode,omitempty"`
-	DBClusterIdentifier     string `json:"db_cluster_identifier,omitempty"`
-	IsClusterWriter         bool   `json:"is_cluster_writer"`
-	IsServerlessV2          bool   `json:"is_serverless_v2"`
-	DBParameterGroup        string `json:"db_parameter_group,omitempty"`
-	DBClusterParameterGroup string `json:"db_cluster_parameter_group,omitempty"`
-	InstanceStatus          string `json:"instance_status,omitempty"`
-	DBParameterGroupStatus  string `json:"db_parameter_group_status,omitempty"`
+	DBInstanceIdentifier          string `json:"db_instance_identifier,omitempty"`
+	DBInstanceClass               string `json:"db_instance_class,omitempty"`
+	Engine                        string `json:"engine,omitempty"`
+	EngineMode                    string `json:"engine_mode,omitempty"`
+	DBClusterIdentifier           string `json:"db_cluster_identifier,omitempty"`
+	IsClusterWriter               bool   `json:"is_cluster_writer"`
+	IsServerlessV2                bool   `json:"is_serverless_v2"`
+	DBParameterGroup              string `json:"db_parameter_group,omitempty"`
+	DBClusterParameterGroup       string `json:"db_cluster_parameter_group,omitempty"`
+	InstanceStatus                string `json:"instance_status,omitempty"`
+	DBParameterGroupStatus        string `json:"db_parameter_group_status,omitempty"`
+	DBClusterParameterGroupStatus string `json:"db_cluster_parameter_group_status,omitempty"`
 }
 
 type ParameterAudit struct {
@@ -98,17 +99,18 @@ func PopulateAuditTopology(audit *ApplyAudit, metadata Metadata) {
 		return
 	}
 	audit.Topology = AuditTopology{
-		DBInstanceIdentifier:    metadata.DBInstanceIdentifier,
-		DBInstanceClass:         metadata.DBInstanceClass,
-		Engine:                  metadata.Engine,
-		EngineMode:              metadata.EngineMode,
-		DBClusterIdentifier:     metadata.DBClusterIdentifier,
-		IsClusterWriter:         metadata.IsClusterWriter,
-		IsServerlessV2:          metadata.IsServerlessV2,
-		DBParameterGroup:        metadata.DBParameterGroup,
-		DBClusterParameterGroup: metadata.DBClusterParameterGroup,
-		InstanceStatus:          metadata.InstanceStatus,
-		DBParameterGroupStatus:  metadata.DBParameterGroupStatus,
+		DBInstanceIdentifier:          metadata.DBInstanceIdentifier,
+		DBInstanceClass:               metadata.DBInstanceClass,
+		Engine:                        metadata.Engine,
+		EngineMode:                    metadata.EngineMode,
+		DBClusterIdentifier:           metadata.DBClusterIdentifier,
+		IsClusterWriter:               metadata.IsClusterWriter,
+		IsServerlessV2:                metadata.IsServerlessV2,
+		DBParameterGroup:              metadata.DBParameterGroup,
+		DBClusterParameterGroup:       metadata.DBClusterParameterGroup,
+		InstanceStatus:                metadata.InstanceStatus,
+		DBParameterGroupStatus:        metadata.DBParameterGroupStatus,
+		DBClusterParameterGroupStatus: metadata.DBClusterParameterGroupStatus,
 	}
 }
 

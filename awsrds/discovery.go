@@ -15,20 +15,21 @@ import (
 // Metadata contains the instance and cluster topology attached to one RDS DB
 // instance.
 type Metadata struct {
-	DBInstanceIdentifier    string
-	DBInstanceResourceID    string
-	DBInstanceClass         string
-	Endpoint                string
-	EndpointPort            int32
-	Engine                  string
-	EngineMode              string
-	DBParameterGroup        string
-	DBParameterGroupStatus  string
-	DBClusterIdentifier     string
-	DBClusterParameterGroup string
-	IsClusterWriter         bool
-	IsServerlessV2          bool
-	InstanceStatus          string
+	DBInstanceIdentifier          string
+	DBInstanceResourceID          string
+	DBInstanceClass               string
+	Endpoint                      string
+	EndpointPort                  int32
+	Engine                        string
+	EngineMode                    string
+	DBParameterGroup              string
+	DBParameterGroupStatus        string
+	DBClusterIdentifier           string
+	DBClusterParameterGroup       string
+	DBClusterParameterGroupStatus string
+	IsClusterWriter               bool
+	IsServerlessV2                bool
+	InstanceStatus                string
 }
 
 // DiscoverInstance looks up one configured DB instance and, for Aurora only,
@@ -95,6 +96,7 @@ func DiscoverInstance(ctx context.Context, client Client, identifier string) (Me
 
 	metadata.EngineMode = aws.ToString(cluster.EngineMode)
 	metadata.DBClusterParameterGroup = aws.ToString(cluster.DBClusterParameterGroup)
+	metadata.DBClusterParameterGroupStatus = aws.ToString(matchingMembers[0].DBClusterParameterGroupStatus)
 	metadata.IsClusterWriter = aws.ToBool(matchingMembers[0].IsClusterWriter)
 
 	return metadata, nil

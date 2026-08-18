@@ -89,6 +89,7 @@ type FailedBatch struct {
 	Parameters           []string `json:"parameters"`
 	Error                string   `json:"error"`
 	DBInstanceIdentifier *string  `json:"db_instance_identifier,omitempty"`
+	DBClusterIdentifier  *string  `json:"db_cluster_identifier,omitempty"`
 	ParameterGroup       *string  `json:"parameter_group,omitempty"`
 	ParameterGroupStatus *string  `json:"parameter_group_status,omitempty"`
 }

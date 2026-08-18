@@ -179,7 +179,19 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 			metadata.DBParameterGroupStatus,
 		)
 		logger.Error(err)
-		recordAWSParameterGroupReadinessFailure(&result, metadata)
+		recordAWSInstanceParameterGroupReadinessFailure(&result, metadata)
+		return finish(awsApplyExitParameterGroupNotInSync, awsApplyTaskStatusFailure)
+	}
+	if metadata.IsAurora() && metadata.IsClusterWriter && metadata.DBClusterParameterGroupStatus != "in-sync" {
+		err = fmt.Errorf(
+			"DB cluster %q parameter group %q status %q is not in-sync for writer instance %q",
+			metadata.DBClusterIdentifier,
+			metadata.DBClusterParameterGroup,
+			metadata.DBClusterParameterGroupStatus,
+			metadata.DBInstanceIdentifier,
+		)
+		logger.Error(err)
+		recordAWSClusterParameterGroupReadinessFailure(&result, metadata)
 		return finish(awsApplyExitParameterGroupNotInSync, awsApplyTaskStatusFailure)
 	}
 
@@ -490,13 +502,23 @@ func recordAWSApplyFailure(result *awsrds.ApplyResult, scope awsrds.Scope, param
 	result.Instance.Failed = append(result.Instance.Failed, failure)
 }
 
-func recordAWSParameterGroupReadinessFailure(result *awsrds.ApplyResult, metadata awsrds.Metadata) {
+func recordAWSInstanceParameterGroupReadinessFailure(result *awsrds.ApplyResult, metadata awsrds.Metadata) {
 	result.Instance.Failed = append(result.Instance.Failed, awsrds.FailedBatch{
 		Parameters:           []string{},
 		Error:                awsApplyErrorParameterGroupNotInSync,
 		DBInstanceIdentifier: &metadata.DBInstanceIdentifier,
 		ParameterGroup:       &metadata.DBParameterGroup,
 		ParameterGroupStatus: &metadata.DBParameterGroupStatus,
+	})
+}
+
+func recordAWSClusterParameterGroupReadinessFailure(result *awsrds.ApplyResult, metadata awsrds.Metadata) {
+	result.Cluster.Failed = append(result.Cluster.Failed, awsrds.FailedBatch{
+		Parameters:           []string{},
+		Error:                awsApplyErrorParameterGroupNotInSync,
+		DBClusterIdentifier:  &metadata.DBClusterIdentifier,
+		ParameterGroup:       &metadata.DBClusterParameterGroup,
+		ParameterGroupStatus: &metadata.DBClusterParameterGroupStatus,
 	})
 }
 
