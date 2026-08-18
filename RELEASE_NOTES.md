@@ -212,3 +212,9 @@
 - Fixed PostgreSQL process and query collection compatibility across server versions
 - Fixed Windows installer system utility resolution
 - Expanded automated coverage for PostgreSQL query optimization, schema collection, installer behavior, and cross-database compatibility
+
+## 1.25.1
+- Cache MySQL/MariaDB table size metrics on large servers to reduce `information_schema` load during collection (closes [#496](https://github.com/Releem/releem-agent/issues/496), #528)
+- Configurable thresholds/TTL: `table_size_cache_table_threshold`, `table_size_cache_ram_multiplier`, `table_size_cache_ttl_seconds`
+- Stale snapshot fallback on refresh failure; AWS RDS physical RAM KiB→bytes for eligibility
+- Bumped agent, installer, configurer, and Windows script versions to 1.25.1

@@ -10,51 +10,57 @@ import (
 )
 
 const (
-	ReleemAgentVersion = "1.25.0"
+	ReleemAgentVersion                  = "1.25.1"
+	DefaultTableSizeCacheTableThreshold = int64(10000)
+	DefaultTableSizeCacheRAMMultiplier  = int64(4)
+	DefaultTableSizeCacheTTLSeconds     = time.Duration(604800)
 )
 
 type Config struct {
-	Debug                       bool          `hcl:"debug"`
-	Env                         string        `hcl:"env"`
-	Hostname                    string        `hcl:"hostname"`
-	ApiKey                      string        `hcl:"apikey"`
-	MetricsPeriod               time.Duration `hcl:"interval_seconds"`
-	ReadConfigPeriod            time.Duration `hcl:"interval_read_config_seconds"`
-	GenerateConfigPeriod        time.Duration `hcl:"interval_generate_config_seconds"`
-	QueryOptimizationPeriod     time.Duration `hcl:"interval_query_optimization_seconds"`
-	CollectSampleQueriesPeriod  time.Duration `hcl:"interval_collect_sample_queries_seconds"`
-	MysqlPassword               string        `hcl:"mysql_password" json:"-"`
-	MysqlUser                   string        `hcl:"mysql_user"`
-	MysqlHost                   string        `hcl:"mysql_host"`
-	MysqlPort                   string        `hcl:"mysql_port"`
-	MysqlSslMode                bool          `hcl:"mysql_ssl_mode"`
-	MysqlConfDir                string        `hcl:"mysql_cnf_dir"`
-	MysqlRestartService         string        `hcl:"mysql_restart_service"`
-	PgPassword                  string        `hcl:"pg_password" json:"-"`
-	PgUser                      string        `hcl:"pg_user"`
-	PgHost                      string        `hcl:"pg_host"`
-	PgPort                      string        `hcl:"pg_port"`
-	PgSslMode                   bool          `hcl:"pg_ssl_mode"`
-	PgConfDir                   string        `hcl:"pg_cnf_dir"`
-	PgRestartService            string        `hcl:"pg_restart_service"`
-	ReleemConfDir               string        `hcl:"releem_cnf_dir"`
-	ReleemDir                   string        `hcl:"releem_dir"`
-	MemoryLimit                 int           `hcl:"memory_limit"`
-	InstanceType                string        `hcl:"instance_type"`
-	AwsRegion                   string        `hcl:"aws_region"`
-	AwsRDSDB                    string        `hcl:"aws_rds_db"`
-	AwsRDSParameterGroup        string        `hcl:"aws_rds_parameter_group"`
+	Debug                        bool          `hcl:"debug"`
+	Env                          string        `hcl:"env"`
+	Hostname                     string        `hcl:"hostname"`
+	ApiKey                       string        `hcl:"apikey"`
+	MetricsPeriod                time.Duration `hcl:"interval_seconds"`
+	ReadConfigPeriod             time.Duration `hcl:"interval_read_config_seconds"`
+	GenerateConfigPeriod         time.Duration `hcl:"interval_generate_config_seconds"`
+	TableSizeCacheTableThreshold int64         `hcl:"table_size_cache_table_threshold"`
+	TableSizeCacheRAMMultiplier  int64         `hcl:"table_size_cache_ram_multiplier"`
+	TableSizeCacheTTL            time.Duration `hcl:"table_size_cache_ttl_seconds"`
+	QueryOptimizationPeriod      time.Duration `hcl:"interval_query_optimization_seconds"`
+	CollectSampleQueriesPeriod   time.Duration `hcl:"interval_collect_sample_queries_seconds"`
+	MysqlPassword                string        `hcl:"mysql_password" json:"-"`
+	MysqlUser                    string        `hcl:"mysql_user"`
+	MysqlHost                    string        `hcl:"mysql_host"`
+	MysqlPort                    string        `hcl:"mysql_port"`
+	MysqlSslMode                 bool          `hcl:"mysql_ssl_mode"`
+	MysqlConfDir                 string        `hcl:"mysql_cnf_dir"`
+	MysqlRestartService          string        `hcl:"mysql_restart_service"`
+	PgPassword                   string        `hcl:"pg_password" json:"-"`
+	PgUser                       string        `hcl:"pg_user"`
+	PgHost                       string        `hcl:"pg_host"`
+	PgPort                       string        `hcl:"pg_port"`
+	PgSslMode                    bool          `hcl:"pg_ssl_mode"`
+	PgConfDir                    string        `hcl:"pg_cnf_dir"`
+	PgRestartService             string        `hcl:"pg_restart_service"`
+	ReleemConfDir                string        `hcl:"releem_cnf_dir"`
+	ReleemDir                    string        `hcl:"releem_dir"`
+	MemoryLimit                  int           `hcl:"memory_limit"`
+	InstanceType                 string        `hcl:"instance_type"`
+	AwsRegion                    string        `hcl:"aws_region"`
+	AwsRDSDB                     string        `hcl:"aws_rds_db"`
+	AwsRDSParameterGroup         string        `hcl:"aws_rds_parameter_group"`
 	AwsRDSClusterParameterGroup string        `hcl:"aws_rds_cluster_parameter_group"`
-	GcpProjectId                string        `hcl:"gcp_project_id"`
-	GcpRegion                   string        `hcl:"gcp_region"`
-	GcpCloudSqlInstance         string        `hcl:"gcp_cloudsql_instance"`
-	GcpCloudSqlPublicConnection bool          `hcl:"gcp_cloudsql_public_connection"`
-	AzureSubscriptionID         string        `hcl:"azure_subscription_id"`
-	AzureResourceGroup          string        `hcl:"azure_resource_group"`
-	AzureMySQLServer            string        `hcl:"azure_mysql_server"`
-	QueryOptimization           bool          `hcl:"query_optimization"`
-	DatabasesQueryOptimization  string        `hcl:"databases_query_optimization"`
-	ReleemRegion                string        `hcl:"releem_region"`
+	GcpProjectId                 string        `hcl:"gcp_project_id"`
+	GcpRegion                    string        `hcl:"gcp_region"`
+	GcpCloudSqlInstance          string        `hcl:"gcp_cloudsql_instance"`
+	GcpCloudSqlPublicConnection  bool          `hcl:"gcp_cloudsql_public_connection"`
+	AzureSubscriptionID          string        `hcl:"azure_subscription_id"`
+	AzureResourceGroup           string        `hcl:"azure_resource_group"`
+	AzureMySQLServer             string        `hcl:"azure_mysql_server"`
+	QueryOptimization            bool          `hcl:"query_optimization"`
+	DatabasesQueryOptimization   string        `hcl:"databases_query_optimization"`
+	ReleemRegion                 string        `hcl:"releem_region"`
 	// Task automator configuration
 	EnableExecDDL       bool    `hcl:"enable_exec_ddl"`
 	BackupDir           string  `hcl:"backup_dir"`
@@ -89,6 +95,15 @@ func LoadConfigFromString(data string, logger logging.Logger) (*Config, error) {
 	}
 	if config.GenerateConfigPeriod == 0 {
 		config.GenerateConfigPeriod = 43200
+	}
+	if config.TableSizeCacheTableThreshold <= 0 {
+		config.TableSizeCacheTableThreshold = DefaultTableSizeCacheTableThreshold
+	}
+	if config.TableSizeCacheRAMMultiplier <= 0 {
+		config.TableSizeCacheRAMMultiplier = DefaultTableSizeCacheRAMMultiplier
+	}
+	if config.TableSizeCacheTTL <= 0 {
+		config.TableSizeCacheTTL = DefaultTableSizeCacheTTLSeconds
 	}
 	if config.QueryOptimizationPeriod == 0 {
 		config.QueryOptimizationPeriod = 3600

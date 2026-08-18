@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 	"time"
 
@@ -295,14 +296,18 @@ func (DBMetrics *DBMetricsGatherer) GetMetrics(metrics *models.Metrics) error {
 }
 
 type DBMetricsConfigGatherer struct {
-	logger        logging.Logger
-	configuration *config.Config
+	logger         logging.Logger
+	configuration  *config.Config
+	tableSizeCache *tableSizeCache
+	now            func() time.Time
 }
 
 func NewDBMetricsConfigGatherer(logger logging.Logger, configuration *config.Config) *DBMetricsConfigGatherer {
 	return &DBMetricsConfigGatherer{
-		logger:        logger,
-		configuration: configuration,
+		logger:         logger,
+		configuration:  configuration,
+		tableSizeCache: &tableSizeCache{},
+		now:            time.Now,
 	}
 }
 
@@ -311,67 +316,120 @@ func (DBMetricsConfig *DBMetricsConfigGatherer) GetMetrics(metrics *models.Metri
 
 	//Stat mysql Engine
 	{
-		var engine_db, engineenabled string
-		var size, count, dsize, isize uint64
-		output := make(map[string]models.MetricGroupValue)
-		engine_elem := make(map[string]models.MetricGroupValue)
-
-		rows, err := models.DB.Query("SELECT ENGINE,SUPPORT FROM information_schema.ENGINES ORDER BY ENGINE ASC")
+		support, err := DBMetricsConfig.collectEngineSupport()
 		if err != nil {
 			DBMetricsConfig.logger.Error(err)
 			return err
 		}
-		for rows.Next() {
-			err := rows.Scan(&engine_db, &engineenabled)
-			if err != nil {
-				DBMetricsConfig.logger.Error(err)
-				return err
-			}
-			output[engine_db] = models.MetricGroupValue{"Enabled": engineenabled}
-			engine_elem[engine_db] = models.MetricGroupValue{"Table Number": uint64(0), "Total Size": uint64(0), "Data Size": uint64(0), "Index Size": uint64(0)}
+
+		ttl := tableSizeCacheTTLFromSeconds(DBMetricsConfig.configuration.TableSizeCacheTTL)
+		result, err := DBMetricsConfig.tableSizeCache.getOrRefresh(
+			tableSizeCacheInput{
+				totalTables:    metrics.DB.Metrics.TotalTables,
+				effectiveRAM:   effectiveTableSizeRAM(metrics),
+				tableThreshold: DBMetricsConfig.configuration.TableSizeCacheTableThreshold,
+				ramMultiplier:  DBMetricsConfig.configuration.TableSizeCacheRAMMultiplier,
+				ttl:            ttl,
+				now:            DBMetricsConfig.now(),
+			},
+			func() (map[string]models.MetricGroupValue, error) {
+				return DBMetricsConfig.collectEngineTableSizes(metrics.DB.Metrics.Databases)
+			},
+		)
+		if err != nil {
+			DBMetricsConfig.logger.Error(err)
+			return err
 		}
-		rows.Close()
-		i := 0
-		for _, database := range metrics.DB.Metrics.Databases {
-			rows, err = models.DB.Query(`SELECT ENGINE, IFNULL(SUM(DATA_LENGTH+INDEX_LENGTH), 0), IFNULL(COUNT(ENGINE), 0), IFNULL(SUM(DATA_LENGTH), 0), IFNULL(SUM(INDEX_LENGTH), 0) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND ENGINE IS NOT NULL  GROUP BY ENGINE ORDER BY ENGINE ASC`, database)
-			if err != nil {
-				DBMetricsConfig.logger.Error(err)
-				return err
-			}
-			for rows.Next() {
-				err := rows.Scan(&engine_db, &size, &count, &dsize, &isize)
-				if err != nil {
-					DBMetricsConfig.logger.Error(err)
-					continue
-				}
-				if engine_elem[engine_db]["Table Number"] == nil {
-					engine_elem[engine_db] = models.MetricGroupValue{"Table Number": uint64(0), "Total Size": uint64(0), "Data Size": uint64(0), "Index Size": uint64(0)}
-				}
-				engine_elem[engine_db]["Table Number"] = engine_elem[engine_db]["Table Number"].(uint64) + count
-				engine_elem[engine_db]["Total Size"] = engine_elem[engine_db]["Total Size"].(uint64) + size
-				engine_elem[engine_db]["Data Size"] = engine_elem[engine_db]["Data Size"].(uint64) + dsize
-				engine_elem[engine_db]["Index Size"] = engine_elem[engine_db]["Index Size"].(uint64) + isize
-			}
-			rows.Close()
-			i += 1
-			if i%25 == 0 {
-				time.Sleep(3 * time.Second)
-			}
-		}
-		for k := range output {
-			output[k] = utils.MapJoin(output[k], engine_elem[k])
+		if result.usedStale {
+			DBMetricsConfig.logger.Warningf("using stale table size metrics after refresh error: %v", result.refreshErr)
 		}
 
-		metrics.DB.Metrics.Engine = output
-		if metrics.DB.Metrics.Engine["MyISAM"] == nil {
+		metrics.DB.Metrics.Engine = mergeEngineMetrics(support, result.engine)
+		myisam := metrics.DB.Metrics.Engine["MyISAM"]
+		if myisam == nil {
 			metrics.DB.Metrics.TotalMyisamIndexes = 0
 		} else {
-			metrics.DB.Metrics.TotalMyisamIndexes = metrics.DB.Metrics.Engine["MyISAM"]["Index Size"].(uint64)
+			metrics.DB.Metrics.TotalMyisamIndexes = tableSizeUint64(myisam["Index Size"])
 		}
 	}
 	DBMetricsConfig.logger.V(5).Info("CollectMetrics DBMetricsConfig ", metrics.DB.Metrics)
 
 	return nil
+}
+
+func (DBMetricsConfig *DBMetricsConfigGatherer) collectEngineSupport() (map[string]models.MetricGroupValue, error) {
+	var engineDB, engineEnabled string
+	output := make(map[string]models.MetricGroupValue)
+
+	rows, err := models.DB.Query("SELECT ENGINE,SUPPORT FROM information_schema.ENGINES ORDER BY ENGINE ASC")
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		err := rows.Scan(&engineDB, &engineEnabled)
+		if err != nil {
+			return nil, errors.Join(err, rows.Err(), rows.Close())
+		}
+		output[engineDB] = models.MetricGroupValue{"Enabled": engineEnabled}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+
+	return output, nil
+}
+
+func (DBMetricsConfig *DBMetricsConfigGatherer) collectEngineTableSizes(databases []string) (map[string]models.MetricGroupValue, error) {
+	var engineDB string
+	var size, count, dataSize, indexSize uint64
+	engineMetrics := make(map[string]models.MetricGroupValue)
+
+	for i, database := range databases {
+		rows, err := models.DB.Query(`SELECT ENGINE, IFNULL(SUM(DATA_LENGTH+INDEX_LENGTH), 0), IFNULL(COUNT(ENGINE), 0), IFNULL(SUM(DATA_LENGTH), 0), IFNULL(SUM(INDEX_LENGTH), 0) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND ENGINE IS NOT NULL  GROUP BY ENGINE ORDER BY ENGINE ASC`, database)
+		if err != nil {
+			return nil, err
+		}
+		// A scan failure must be reported as a refresh error: a partial
+		// snapshot would otherwise be cached for the whole TTL.
+		var firstRowErr error
+		for rows.Next() {
+			err := rows.Scan(&engineDB, &size, &count, &dataSize, &indexSize)
+			if err != nil {
+				DBMetricsConfig.logger.Error(err)
+				if firstRowErr == nil {
+					firstRowErr = err
+				}
+				continue
+			}
+			if engineMetrics[engineDB]["Table Number"] == nil {
+				engineMetrics[engineDB] = models.MetricGroupValue{"Table Number": uint64(0), "Total Size": uint64(0), "Data Size": uint64(0), "Index Size": uint64(0)}
+			}
+			engineMetrics[engineDB]["Table Number"] = engineMetrics[engineDB]["Table Number"].(uint64) + count
+			engineMetrics[engineDB]["Total Size"] = engineMetrics[engineDB]["Total Size"].(uint64) + size
+			engineMetrics[engineDB]["Data Size"] = engineMetrics[engineDB]["Data Size"].(uint64) + dataSize
+			engineMetrics[engineDB]["Index Size"] = engineMetrics[engineDB]["Index Size"].(uint64) + indexSize
+		}
+		if err := errors.Join(firstRowErr, rows.Err(), rows.Close()); err != nil {
+			return nil, err
+		}
+		if (i+1)%25 == 0 {
+			time.Sleep(3 * time.Second)
+		}
+	}
+
+	return engineMetrics, nil
+}
+
+func mergeEngineMetrics(support, sizes map[string]models.MetricGroupValue) map[string]models.MetricGroupValue {
+	output := make(map[string]models.MetricGroupValue, len(support))
+	for engine, supportMetrics := range support {
+		sizeMetrics := sizes[engine]
+		if sizeMetrics == nil {
+			sizeMetrics = models.MetricGroupValue{"Table Number": uint64(0), "Total Size": uint64(0), "Data Size": uint64(0), "Index Size": uint64(0)}
+		}
+		output[engine] = utils.MapJoin(supportMetrics, sizeMetrics)
+	}
+	return output
 }
 
 func str_contains(slice []string, element string) bool {
