@@ -321,8 +321,8 @@ func TestApplyConfAwsRdsRefreshesDiscoveryRoutesScopesAndBatchesTwentyPlusOne(t 
 		AWSApplyAll,
 	)
 
-	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
-		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s", exitCode, status, output)
+	if exitCode != 10 || status != awsApplyTaskStatusFailure {
+		t.Fatalf("ApplyConfAwsRds() = exit %d status %d, want 10/%d; output %s", exitCode, status, awsApplyTaskStatusFailure, output)
 	}
 	if gatherer.calls != 1 || repeater.calls != 1 {
 		t.Fatalf("metrics/recommendation calls = %d/%d, want one collection and one recommendation", gatherer.calls, repeater.calls)
@@ -359,52 +359,36 @@ func TestApplyConfAwsRdsRefreshesDiscoveryRoutesScopesAndBatchesTwentyPlusOne(t 
 	}
 }
 
-func TestApplyConfAwsRdsValidatesGroupMismatchesIndependently(t *testing.T) {
+func TestApplyConfAwsRdsRejectsAnyConfiguredGroupMismatch(t *testing.T) {
 	tests := []struct {
-		name                 string
-		attachedInstance     string
-		attachedCluster      string
-		wantInstanceModifies int
-		wantClusterModifies  int
-		wantScope            awsrds.Scope
-		wantExpected         string
-		wantActual           string
+		name             string
+		attachedInstance string
+		attachedCluster  string
+		wantScope        awsrds.Scope
+		wantExpected     string
+		wantActual       string
 	}{
 		{
-			name:                 "cluster mismatch keeps valid instance scope",
-			attachedInstance:     "instance-custom",
-			attachedCluster:      "other-cluster",
-			wantInstanceModifies: 1,
-			wantScope:            awsrds.ScopeCluster,
-			wantExpected:         "cluster-custom",
-			wantActual:           "other-cluster",
+			name:             "cluster mismatch blocks every scope",
+			attachedInstance: "instance-custom",
+			attachedCluster:  "other-cluster",
+			wantScope:        awsrds.ScopeCluster,
+			wantExpected:     "cluster-custom",
+			wantActual:       "other-cluster",
 		},
 		{
-			name:                "instance mismatch keeps valid cluster scope",
-			attachedInstance:    "other-instance",
-			attachedCluster:     "cluster-custom",
-			wantClusterModifies: 1,
-			wantScope:           awsrds.ScopeInstance,
-			wantExpected:        "instance-custom",
-			wantActual:          "other-instance",
+			name:             "instance mismatch blocks every scope",
+			attachedInstance: "other-instance",
+			attachedCluster:  "cluster-custom",
+			wantScope:        awsrds.ScopeInstance,
+			wantExpected:     "instance-custom",
+			wantActual:       "other-instance",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := auroraApplyClient(true, tt.attachedInstance, tt.attachedCluster)
-			client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
-				Parameters: []types.Parameter{modifiableAWSParameter("instance_value", "dynamic")},
-			}}
-			client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
-				Parameters: []types.Parameter{modifiableAWSParameter("cluster_value", "dynamic")},
-			}}
-			if tt.attachedInstance != "instance-custom" {
-				client.instanceDescribeErrors["instance-custom"] = errors.New("configured instance group does not exist")
-			}
-			if tt.attachedCluster != "cluster-custom" {
-				client.clusterDescribeErrors["cluster-custom"] = errors.New("configured cluster group does not exist")
-			}
 			installAWSApplyTestDependencies(t, client, nil)
 
 			exitCode, status, output := ApplyConfAwsRds(
@@ -415,30 +399,75 @@ func TestApplyConfAwsRdsValidatesGroupMismatchesIndependently(t *testing.T) {
 				AWSApplyAll,
 			)
 
-			if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
-				t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s", exitCode, status, output)
+			if exitCode != 3 || status != awsApplyTaskStatusFailure {
+				t.Fatalf("ApplyConfAwsRds() = exit %d status %d, want 3/%d; output %s", exitCode, status, awsApplyTaskStatusFailure, output)
 			}
-			if len(client.instanceModifyCalls) != tt.wantInstanceModifies || len(client.clusterModifyCalls) != tt.wantClusterModifies {
-				t.Fatalf("modify calls = instance %d cluster %d, want %d/%d", len(client.instanceModifyCalls), len(client.clusterModifyCalls), tt.wantInstanceModifies, tt.wantClusterModifies)
-			}
-			if !reflect.DeepEqual(client.instanceDescribeGroups, []string{tt.attachedInstance}) {
-				t.Fatalf("described instance groups = %v, want attached group %q for mismatch-safe classification", client.instanceDescribeGroups, tt.attachedInstance)
-			}
-			if !reflect.DeepEqual(client.clusterDescribeGroups, []string{tt.attachedCluster}) {
-				t.Fatalf("described cluster groups = %v, want attached group %q for mismatch-safe classification", client.clusterDescribeGroups, tt.attachedCluster)
+			if len(client.instanceDescribeGroups) != 0 || len(client.clusterDescribeGroups) != 0 || len(client.instanceModifyCalls) != 0 || len(client.clusterModifyCalls) != 0 {
+				t.Fatalf("ApplyConfAwsRds() reached parameter APIs after mismatch: instance lists %#v, cluster lists %#v, instance modifies %d, cluster modifies %d", client.instanceDescribeGroups, client.clusterDescribeGroups, len(client.instanceModifyCalls), len(client.clusterModifyCalls))
 			}
 			result := decodeAWSApplyResult(t, output)
-			var scopeResult awsrds.ScopeResult
+			var mismatchResult, matchingResult awsrds.ScopeResult
 			if tt.wantScope == awsrds.ScopeInstance {
-				scopeResult = result.Instance
+				mismatchResult = result.Instance
+				matchingResult = result.Cluster
 			} else {
-				scopeResult = result.Cluster
+				mismatchResult = result.Cluster
+				matchingResult = result.Instance
 			}
-			if len(scopeResult.Skipped) != 1 || scopeResult.Skipped[0].Reason != awsrds.SkipGroupMismatch {
-				t.Fatalf("per-variable mismatch result = %#v, want one group-mismatch skip", scopeResult.Skipped)
+			if len(mismatchResult.Failed) != 1 || mismatchResult.Failed[0].Error != "parameter-group-mismatch" {
+				t.Fatalf("mismatch scope failure = %#v, want parameter-group-mismatch", mismatchResult.Failed)
 			}
-			if len(scopeResult.Diagnostics) != 1 || scopeResult.Diagnostics[0].Reason != awsrds.SkipGroupMismatch || scopeResult.Diagnostics[0].ExpectedGroup != tt.wantExpected || scopeResult.Diagnostics[0].ActualGroup != tt.wantActual {
-				t.Fatalf("scope diagnostics = %#v, want expected %q actual %q", scopeResult.Diagnostics, tt.wantExpected, tt.wantActual)
+			if len(mismatchResult.Diagnostics) != 1 || mismatchResult.Diagnostics[0].Reason != awsrds.SkipGroupMismatch || mismatchResult.Diagnostics[0].ExpectedGroup != tt.wantExpected || mismatchResult.Diagnostics[0].ActualGroup != tt.wantActual {
+				t.Fatalf("mismatch scope diagnostics = %#v, want expected %q actual %q", mismatchResult.Diagnostics, tt.wantExpected, tt.wantActual)
+			}
+			if len(matchingResult.Failed) != 0 || len(matchingResult.Diagnostics) != 0 {
+				t.Fatalf("matching scope result = %#v, want no failure or diagnostic", matchingResult)
+			}
+		})
+	}
+}
+
+func TestApplyConfAwsRdsGroupMismatchPrecedesParameterGroupReadiness(t *testing.T) {
+	tests := []struct {
+		name                string
+		attachedInstance    string
+		attachedCluster     string
+		instanceGroupStatus string
+		clusterGroupStatus  string
+	}{
+		{
+			name:                "instance mismatch takes precedence over applying instance group",
+			attachedInstance:    "other-instance",
+			attachedCluster:     "cluster-custom",
+			instanceGroupStatus: "applying",
+			clusterGroupStatus:  "in-sync",
+		},
+		{
+			name:                "cluster mismatch takes precedence over applying cluster group",
+			attachedInstance:    "instance-custom",
+			attachedCluster:     "other-cluster",
+			instanceGroupStatus: "in-sync",
+			clusterGroupStatus:  "applying",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := auroraApplyClient(true, tt.attachedInstance, tt.attachedCluster)
+			client.instanceOutput.DBInstances[0].DBParameterGroups[0].ParameterApplyStatus = aws.String(tt.instanceGroupStatus)
+			client.clusterOutput.DBClusters[0].DBClusterMembers[0].DBClusterParameterGroupStatus = aws.String(tt.clusterGroupStatus)
+			installAWSApplyTestDependencies(t, client, nil)
+
+			exitCode, status, output := ApplyConfAwsRds(
+				&awsApplyRepeater{recommendations: `{"instance_value":"2","cluster_value":"2"}`},
+				[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{}}},
+				testAWSApplyLogger(),
+				awsApplyConfig("instance-custom", "cluster-custom"),
+				AWSApplyAll,
+			)
+
+			if exitCode != 3 || status != awsApplyTaskStatusFailure {
+				t.Fatalf("ApplyConfAwsRds(instance status %q, cluster status %q) = exit %d status %d, want 3/%d; output %s", tt.instanceGroupStatus, tt.clusterGroupStatus, exitCode, status, awsApplyTaskStatusFailure, output)
 			}
 		})
 	}
@@ -466,11 +495,11 @@ func TestApplyConfAwsRdsReportsEachGroupMismatchOnceAtScopeLevel(t *testing.T) {
 		AWSApplyAll,
 	)
 
-	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
-		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s", exitCode, status, output)
+	if exitCode != 3 || status != awsApplyTaskStatusFailure {
+		t.Fatalf("ApplyConfAwsRds() = exit %d status %d, want 3/%d; output %s", exitCode, status, awsApplyTaskStatusFailure, output)
 	}
-	if len(client.instanceModifyCalls) != 0 || len(client.clusterModifyCalls) != 0 {
-		t.Fatalf("mismatched groups were modified: instance %#v cluster %#v", client.instanceModifyCalls, client.clusterModifyCalls)
+	if len(client.instanceDescribeGroups) != 0 || len(client.clusterDescribeGroups) != 0 || len(client.instanceModifyCalls) != 0 || len(client.clusterModifyCalls) != 0 {
+		t.Fatalf("ApplyConfAwsRds() reached parameter APIs after mismatches: instance lists %#v, cluster lists %#v, instance modifies %d, cluster modifies %d", client.instanceDescribeGroups, client.clusterDescribeGroups, len(client.instanceModifyCalls), len(client.clusterModifyCalls))
 	}
 
 	type scopeOutput struct {
@@ -479,7 +508,7 @@ func TestApplyConfAwsRdsReportsEachGroupMismatchOnceAtScopeLevel(t *testing.T) {
 			ExpectedGroup string            `json:"expected_group"`
 			ActualGroup   string            `json:"actual_group"`
 		} `json:"diagnostics"`
-		Skipped []awsrds.SkippedVariable `json:"skipped"`
+		Failed []awsrds.FailedBatch `json:"failed"`
 	}
 	var structured struct {
 		Instance scopeOutput `json:"instance"`
@@ -500,33 +529,16 @@ func TestApplyConfAwsRdsReportsEachGroupMismatchOnceAtScopeLevel(t *testing.T) {
 	}
 	assertDiagnostic("instance", structured.Instance, "configured-instance", "attached-instance")
 	assertDiagnostic("cluster", structured.Cluster, "configured-cluster", "attached-cluster")
-	if len(structured.Instance.Skipped) != 2 {
-		t.Fatalf("instance skips = %#v, want two rejected variables", structured.Instance.Skipped)
+	if len(structured.Instance.Failed) != 1 || structured.Instance.Failed[0].Error != "parameter-group-mismatch" {
+		t.Fatalf("instance failures = %#v, want one parameter-group-mismatch", structured.Instance.Failed)
 	}
-	for _, skipped := range structured.Instance.Skipped {
-		if skipped.Reason != awsrds.SkipGroupMismatch {
-			t.Fatalf("per-variable mismatch skip = %#v, want group mismatch", skipped)
-		}
-	}
-	if len(structured.Cluster.Skipped) != 0 {
-		t.Fatalf("cluster skips = %#v, want no synthetic variable skip", structured.Cluster.Skipped)
+	if len(structured.Cluster.Failed) != 1 || structured.Cluster.Failed[0].Error != "parameter-group-mismatch" {
+		t.Fatalf("cluster failures = %#v, want one parameter-group-mismatch", structured.Cluster.Failed)
 	}
 	for _, secret := range []string{cfg.ApiKey, cfg.MysqlPassword} {
 		if strings.Contains(output, secret) {
 			t.Fatalf("mismatch output leaked %q: %s", secret, output)
 		}
-	}
-	result := decodeAWSApplyResult(t, output)
-	gotRecommendations := map[string]string{}
-	for _, record := range result.Audit.Parameters {
-		gotRecommendations[record.Name] = record.RecommendedValue
-	}
-	wantRecommendations := map[string]string{
-		"instance_one": "recommended-instance-one",
-		"instance_two": "recommended-instance-two",
-	}
-	if !reflect.DeepEqual(gotRecommendations, wantRecommendations) {
-		t.Fatalf("audit recommendations = %#v, want %#v", gotRecommendations, wantRecommendations)
 	}
 }
 
@@ -592,12 +604,6 @@ func TestApplyConfAwsRdsIneligibleClusterClassificationErrorsDoNotBlockInstance(
 			wantDescribeGroups:   []string{"attached-cluster"},
 		},
 		{
-			name:                   "cluster mismatch makes attached lookup optional",
-			configuredClusterGroup: "missing-cluster",
-			attachedClusterGroup:   "attached-cluster",
-			wantDescribeGroups:     []string{"attached-cluster"},
-		},
-		{
 			name:                   "default cluster group is rejected before lookup",
 			configuredClusterGroup: "default.aurora-mysql8.0",
 			attachedClusterGroup:   "default.aurora-mysql8.0",
@@ -638,12 +644,8 @@ func TestApplyConfAwsRdsIneligibleClusterClassificationErrorsDoNotBlockInstance(
 	}
 }
 
-func TestApplyConfAwsRdsUnknownInstanceClassificationCannotFallThroughToCluster(t *testing.T) {
+func TestApplyConfAwsRdsEmptyInstanceGroupReturnsExitThree(t *testing.T) {
 	client := auroraApplyClient(true, "attached-instance", "cluster-custom")
-	client.instanceDescribeErrors["attached-instance"] = errors.New("instance classification unavailable")
-	client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
-		Parameters: []types.Parameter{modifiableAWSParameter("shared_name", "dynamic")},
-	}}
 	installAWSApplyTestDependencies(t, client, nil)
 
 	exitCode, status, output := ApplyConfAwsRds(
@@ -654,18 +656,83 @@ func TestApplyConfAwsRdsUnknownInstanceClassificationCannotFallThroughToCluster(
 		AWSApplyAll,
 	)
 
-	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
-		t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s, want safe no-op", exitCode, status, output)
+	if exitCode != 3 || status != awsApplyTaskStatusFailure {
+		t.Fatalf("ApplyConfAwsRds(empty instance group) = exit %d status %d, want 3/%d; output %s", exitCode, status, awsApplyTaskStatusFailure, output)
 	}
-	if !reflect.DeepEqual(client.instanceDescribeGroups, []string{"attached-instance"}) {
-		t.Fatalf("instance classification reads = %v, want attached-instance", client.instanceDescribeGroups)
-	}
-	if len(client.clusterModifyCalls) != 0 {
-		t.Fatalf("cluster modify calls = %d, want none when instance membership is unknown", len(client.clusterModifyCalls))
+	if len(client.instanceDescribeGroups) != 0 || len(client.clusterDescribeGroups) != 0 || len(client.instanceModifyCalls) != 0 || len(client.clusterModifyCalls) != 0 {
+		t.Fatalf("ApplyConfAwsRds(empty instance group) reached parameter APIs: instance lists %#v, cluster lists %#v, instance modifies %d, cluster modifies %d", client.instanceDescribeGroups, client.clusterDescribeGroups, len(client.instanceModifyCalls), len(client.clusterModifyCalls))
 	}
 	result := decodeAWSApplyResult(t, output)
-	if len(result.Instance.Skipped) != 1 || result.Instance.Skipped[0].Name != "shared_name" || result.Instance.Skipped[0].Reason != awsrds.SkipGroupNotConfigured {
-		t.Fatalf("instance safety result = %#v, want group-not-configured ownership guard", result.Instance)
+	if len(result.Instance.Failed) != 1 || result.Instance.Failed[0].Error != "parameter-group-mismatch" {
+		t.Fatalf("instance failures = %#v, want one parameter-group-mismatch", result.Instance.Failed)
+	}
+	if len(result.Instance.Diagnostics) != 1 || result.Instance.Diagnostics[0].Reason != awsrds.SkipGroupMismatch || result.Instance.Diagnostics[0].ExpectedGroup != "" || result.Instance.Diagnostics[0].ActualGroup != "attached-instance" {
+		t.Fatalf("instance diagnostics = %#v, want empty configured group and attached-instance", result.Instance.Diagnostics)
+	}
+}
+
+func TestApplyConfAwsRdsPendingRebootReturnsExitTenForEitherScope(t *testing.T) {
+	tests := []struct {
+		name      string
+		client    *awsApplyClientFake
+		config    *config.Config
+		variable  string
+		wantScope awsrds.Scope
+	}{
+		{
+			name:      "instance parameter",
+			client:    mysqlApplyClient("instance-custom"),
+			config:    awsApplyConfig("instance-custom", ""),
+			variable:  "instance_static",
+			wantScope: awsrds.ScopeInstance,
+		},
+		{
+			name:      "cluster parameter",
+			client:    auroraApplyClient(true, "instance-custom", "cluster-custom"),
+			config:    awsApplyConfig("instance-custom", "cluster-custom"),
+			variable:  "cluster_static",
+			wantScope: awsrds.ScopeCluster,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.wantScope == awsrds.ScopeInstance {
+				tt.client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
+					Parameters: []types.Parameter{modifiableAWSParameter(tt.variable, "static")},
+				}}
+			} else {
+				tt.client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {}}
+				tt.client.clusterPages = map[string]*rds.DescribeDBClusterParametersOutput{"": {
+					Parameters: []types.Parameter{modifiableAWSParameter(tt.variable, "static")},
+				}}
+			}
+			installAWSApplyTestDependencies(t, tt.client, nil)
+
+			recommendations := fmt.Sprintf(`{"%s":"2"}`, tt.variable)
+			exitCode, status, output := ApplyConfAwsRds(
+				&awsApplyRepeater{recommendations: recommendations},
+				[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{tt.variable: "1"}}},
+				testAWSApplyLogger(),
+				tt.config,
+				AWSApplyAll,
+			)
+
+			if exitCode != 10 || status != awsApplyTaskStatusFailure {
+				t.Fatalf("ApplyConfAwsRds(%s pending reboot) = exit %d status %d, want 10/%d; output %s", tt.wantScope, exitCode, status, awsApplyTaskStatusFailure, output)
+			}
+			result := decodeAWSApplyResult(t, output)
+			gotApplied := result.Instance.Applied
+			if tt.wantScope == awsrds.ScopeCluster {
+				gotApplied = result.Cluster.Applied
+			}
+			if !reflect.DeepEqual(gotApplied, []string{tt.variable}) {
+				t.Fatalf("ApplyConfAwsRds(%s pending reboot) applied = %#v, want [%s]", tt.wantScope, gotApplied, tt.variable)
+			}
+			if len(result.Audit.Parameters) != 1 || result.Audit.Parameters[0].VerificationStatus != awsrds.VerificationPendingReboot {
+				t.Fatalf("ApplyConfAwsRds(%s pending reboot) audit = %#v, want one pending-reboot record", tt.wantScope, result.Audit.Parameters)
+			}
+		})
 	}
 }
 
@@ -988,8 +1055,8 @@ func TestApplyConfAwsRdsConvertsPostgreSQLByteRecommendationsToAWSNativeUnits(t 
 				AWSApplyAll,
 			)
 
-			if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
-				t.Fatalf("ApplyConfAwsRds() = exit %d status %d output %s", exitCode, status, output)
+			if exitCode != 10 || status != awsApplyTaskStatusFailure {
+				t.Fatalf("ApplyConfAwsRds() = exit %d status %d, want 10/%d; output %s", exitCode, status, awsApplyTaskStatusFailure, output)
 			}
 			if (len(tt.client.instanceModifyCalls) > 0) != tt.wantInstanceModifyCall || (len(tt.client.clusterModifyCalls) > 0) != tt.wantClusterModifyCall {
 				t.Fatalf("modify calls = instance %d cluster %d, want instance=%v cluster=%v", len(tt.client.instanceModifyCalls), len(tt.client.clusterModifyCalls), tt.wantInstanceModifyCall, tt.wantClusterModifyCall)

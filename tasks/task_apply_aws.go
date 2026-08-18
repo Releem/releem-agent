@@ -28,16 +28,18 @@ const (
 )
 
 // These values preserve the public RDS task meanings used before routed
-// parameter application: 6 is a bounded-wait timeout, 8 is a general AWS
-// apply failure, and 9 identifies AccessDenied. Group mismatches are safe
-// per-scope skips and use exit code 0.
+// parameter application: 3 identifies an attached parameter-group mismatch,
+// 6 is a bounded-wait timeout, 8 is a general AWS apply failure, 9 identifies
+// AccessDenied, and 10 reports that an applied change requires a reboot.
 const (
 	awsApplyExitSuccess                 = 0
 	awsApplyExitInstanceUnavailable     = 1
 	awsApplyExitParameterGroupNotInSync = 2
+	awsApplyExitParameterGroupMismatch  = 3
 	awsApplyExitTimeout                 = 6
 	awsApplyExitFailure                 = 8
 	awsApplyExitAccessDenied            = 9
+	awsApplyExitPendingReboot           = 10
 
 	awsApplyTaskStatusSuccess = 1
 	awsApplyTaskStatusFailure = 4
@@ -49,6 +51,7 @@ const (
 	awsApplyErrorAccessDenied            = "access-denied"
 	awsApplyErrorAWSAPI                  = "aws-api-error"
 	awsApplyErrorParameterGroupNotInSync = "parameter-group-not-in-sync"
+	awsApplyErrorParameterGroupMismatch  = "parameter-group-mismatch"
 )
 
 var errAWSApplyWaitTimeout = errors.New("timed out waiting for AWS parameter apply")
@@ -171,6 +174,11 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
 		return finish(awsApplyExitInstanceUnavailable, awsApplyTaskStatusFailure)
 	}
+	groupValidation := validateAWSGroups(logger, metadata, configuration)
+	if groupValidation.InstanceMismatch || groupValidation.ClusterMismatch {
+		recordAWSGroupMismatchFailures(&result, groupValidation, metadata, configuration)
+		return finish(awsApplyExitParameterGroupMismatch, awsApplyTaskStatusFailure)
+	}
 	if metadata.DBParameterGroupStatus != "in-sync" {
 		err = fmt.Errorf(
 			"DB instance %q parameter group %q status %q is not in-sync",
@@ -195,19 +203,14 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		return finish(awsApplyExitParameterGroupNotInSync, awsApplyTaskStatusFailure)
 	}
 
-	groupValidation := validateAWSGroups(logger, metadata, configuration)
-
 	instanceParameters := map[string]awsrds.ParameterInfo{}
 	instanceLookupGroup := configuration.AwsRDSParameterGroup
 	instanceClassificationOnly := false
 	instanceMembershipUnknown := false
-	// A default group, an unconfigured group, or a mismatched configured
-	// group is never a mutation target. In each case, read the attached
-	// group only to classify recommendations so BuildApplyPlan can report
-	// the mismatch/absence without blocking the cluster scope.
+	// A default or unconfigured group is never a mutation target. Read the
+	// attached group only to classify recommendations.
 	if awsrds.IsDefaultParameterGroup(configuration.AwsRDSParameterGroup) ||
-		configuration.AwsRDSParameterGroup == "" ||
-		groupValidation.InstanceMismatch {
+		configuration.AwsRDSParameterGroup == "" {
 		instanceLookupGroup = metadata.DBParameterGroup
 		instanceClassificationOnly = true
 		instanceMembershipUnknown = instanceLookupGroup == ""
@@ -240,15 +243,6 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		// Reject default groups before ListParameters; they are never eligible
 		// targets and their metadata is unnecessary for valid instance work.
 		clusterLookup = awsrds.ClusterParameterGroupLookup{}
-	case groupValidation.ClusterMismatch:
-		// Keep the selector call as the normal lookup contract, but never read
-		// or modify a mismatched configured group. Attached membership is safe
-		// classification data and the original configuration remains the plan
-		// target, so BuildApplyPlan rejects every cluster mutation.
-		clusterLookup = awsrds.ClusterParameterGroupLookup{
-			Group:              metadata.DBClusterParameterGroup,
-			ClassificationOnly: true,
-		}
 	}
 	if clusterLookup.Group != "" && !metadata.IsClusterWriter {
 		// A reader can never submit cluster-scope changes, so a transient
@@ -285,7 +279,6 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		PendingRebootOnly:         mode == AWSApplyPendingRebootOnly,
 	})
 	result = plannedResult
-	recordAWSGroupMismatchDiagnostics(&result, groupValidation, metadata, configuration)
 
 	waitRequest, applyErr := applyAWSPlan(ctx, client, plan, &result, logger, task)
 	waitRequest.Metadata = metadata
@@ -304,6 +297,10 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 	if applyErr != nil {
 		logger.Errorf("AWS parameter apply failed: %s", awsApplySafeErrorCode(applyErr))
 		return finish(awsApplyExitCode(applyErr), awsApplyTaskStatusFailure)
+	}
+	if awsApplyRequiresReboot(waitRequest) {
+		logger.Info("AWS parameter apply completed with pending reboot")
+		return finish(awsApplyExitPendingReboot, awsApplyTaskStatusFailure)
 	}
 
 	return finish(awsApplyExitSuccess, awsApplyTaskStatusSuccess)
@@ -336,9 +333,13 @@ type awsGroupValidation struct {
 
 func validateAWSGroups(logger logging.Logger, metadata awsrds.Metadata, configuration *config.Config) awsGroupValidation {
 	validation := awsGroupValidation{}
-	if configured := configuration.AwsRDSParameterGroup; configured != "" && configured != metadata.DBParameterGroup {
+	configuredInstanceGroup := configuration.AwsRDSParameterGroup
+	if configuredInstanceGroup == "" {
 		validation.InstanceMismatch = true
-		logger.Errorf("Configured DB parameter group %q does not match attached group %q", configured, metadata.DBParameterGroup)
+		logger.Errorf("Configured DB parameter group is empty; attached group is %q", metadata.DBParameterGroup)
+	} else if configuredInstanceGroup != metadata.DBParameterGroup {
+		validation.InstanceMismatch = true
+		logger.Errorf("Configured DB parameter group %q does not match attached group %q", configuredInstanceGroup, metadata.DBParameterGroup)
 	}
 	if configured := configuration.AwsRDSClusterParameterGroup; configured != "" && configured != metadata.DBClusterParameterGroup {
 		validation.ClusterMismatch = true
@@ -347,15 +348,23 @@ func validateAWSGroups(logger logging.Logger, metadata awsrds.Metadata, configur
 	return validation
 }
 
-func recordAWSGroupMismatchDiagnostics(result *awsrds.ApplyResult, validation awsGroupValidation, metadata awsrds.Metadata, configuration *config.Config) {
+func recordAWSGroupMismatchFailures(result *awsrds.ApplyResult, validation awsGroupValidation, metadata awsrds.Metadata, configuration *config.Config) {
 	if result == nil || configuration == nil {
 		return
 	}
 	if validation.InstanceMismatch {
 		appendAWSGroupMismatchDiagnostic(&result.Instance, configuration.AwsRDSParameterGroup, metadata.DBParameterGroup)
+		result.Instance.Failed = append(result.Instance.Failed, awsrds.FailedBatch{
+			Parameters: []string{},
+			Error:      awsApplyErrorParameterGroupMismatch,
+		})
 	}
 	if validation.ClusterMismatch {
 		appendAWSGroupMismatchDiagnostic(&result.Cluster, configuration.AwsRDSClusterParameterGroup, metadata.DBClusterParameterGroup)
+		result.Cluster.Failed = append(result.Cluster.Failed, awsrds.FailedBatch{
+			Parameters: []string{},
+			Error:      awsApplyErrorParameterGroupMismatch,
+		})
 	}
 }
 
@@ -388,6 +397,17 @@ func awsCurrentParameterValues(values models.MetricGroupValue) map[string]interf
 		current[name] = value
 	}
 	return current
+}
+
+func awsApplyRequiresReboot(request awsApplyWaitRequest) bool {
+	for _, plan := range []awsrds.ScopePlan{request.Instance, request.Cluster} {
+		for _, parameter := range plan.Parameters {
+			if parameter.ApplyMethod == types.ApplyMethodPendingReboot {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func applyAWSPlan(ctx context.Context, client awsrds.Client, plan awsrds.ApplyPlan, result *awsrds.ApplyResult, logger logging.Logger, task awsApplyTaskContext) (awsApplyWaitRequest, error) {
