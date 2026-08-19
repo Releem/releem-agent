@@ -41,18 +41,18 @@ type ClusterParameterGroupLookup struct {
 	ClassificationOnly bool
 }
 
-// SelectClusterParameterGroupLookup uses the configured group whenever one is
-// present. If configuration is empty, an attached Aurora cluster group may be
-// read solely to distinguish cluster membership from complete absence.
+// SelectClusterParameterGroupLookup reads the attached Aurora group whenever
+// it is available. A missing, default, or mismatched configured group makes
+// that read classification-only so it can never become a mutation target.
 func SelectClusterParameterGroupLookup(metadata Metadata, configuredGroup string) ClusterParameterGroupLookup {
-	if configuredGroup != "" {
-		return ClusterParameterGroupLookup{Group: configuredGroup}
-	}
 	if metadata.IsAurora() && metadata.DBClusterParameterGroup != "" {
 		return ClusterParameterGroupLookup{
 			Group:              metadata.DBClusterParameterGroup,
-			ClassificationOnly: true,
+			ClassificationOnly: configuredGroup != metadata.DBClusterParameterGroup || IsDefaultParameterGroup(configuredGroup),
 		}
+	}
+	if configuredGroup != "" {
+		return ClusterParameterGroupLookup{Group: configuredGroup}
 	}
 	return ClusterParameterGroupLookup{}
 }
@@ -145,8 +145,9 @@ type BuildApplyPlanInput struct {
 
 // ScopePlan contains the exact group and AWS parameters for one modify API.
 type ScopePlan struct {
-	Group      string
-	Parameters []types.Parameter
+	Group                   string
+	Parameters              []types.Parameter
+	HasApplicableParameters bool
 }
 
 // ApplyPlan separates instance and cluster calls while ApplyResult separately
@@ -299,7 +300,12 @@ func skipParameter(result *ScopeResult, record *ParameterAudit, name string, rea
 }
 
 func buildScopeParameter(input BuildApplyPlanInput, name string, parameter ParameterInfo, scope Scope, plan *ScopePlan, result *ScopeResult, record *ParameterAudit) {
-	if skip, rejected := groupSkip(input, name, scope); rejected {
+	if scope == ScopeInstance {
+		if skip, rejected := groupSkip(input, name, scope); rejected {
+			skipParameter(result, record, name, skip.Reason)
+			return
+		}
+	} else if skip, rejected := clusterTopologySkip(input, name); rejected {
 		skipParameter(result, record, name, skip.Reason)
 		return
 	}
@@ -354,6 +360,13 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 		skipParameter(result, record, name, SkipUnsupportedApplyType)
 		return
 	}
+	if scope == ScopeCluster {
+		plan.HasApplicableParameters = true
+		if skip, rejected := groupSkip(input, name, scope); rejected {
+			skipParameter(result, record, name, skip.Reason)
+			return
+		}
+	}
 
 	parameterName := parameter.Name
 	if parameterName == "" {
@@ -398,13 +411,15 @@ func groupSkip(input BuildApplyPlanInput, name string, scope Scope) (SkippedVari
 		}, true
 	}
 
-	if scope == ScopeCluster {
-		if !input.Metadata.IsAurora() {
-			return SkippedVariable{Name: name, Reason: SkipClusterNotSupported}, true
-		}
-		if !input.Metadata.IsClusterWriter {
-			return SkippedVariable{Name: name, Reason: SkipNotClusterWriter}, true
-		}
+	return SkippedVariable{}, false
+}
+
+func clusterTopologySkip(input BuildApplyPlanInput, name string) (SkippedVariable, bool) {
+	if !input.Metadata.IsAurora() {
+		return SkippedVariable{Name: name, Reason: SkipClusterNotSupported}, true
+	}
+	if !input.Metadata.IsClusterWriter {
+		return SkippedVariable{Name: name, Reason: SkipNotClusterWriter}, true
 	}
 	return SkippedVariable{}, false
 }

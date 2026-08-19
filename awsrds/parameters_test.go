@@ -781,14 +781,15 @@ func TestParameterGroupLookupSelectsConfiguredOrClassificationOnlyClusterGroup(t
 		want       ClusterParameterGroupLookup
 	}{
 		{
-			name: "configured group is the lookup and apply candidate",
+			name: "mismatched configured group uses attached group for classification",
 			metadata: Metadata{
 				Engine:                  "aurora-mysql",
 				DBClusterParameterGroup: "attached-cluster-custom",
 			},
 			configured: "configured-cluster-custom",
 			want: ClusterParameterGroupLookup{
-				Group: "configured-cluster-custom",
+				Group:              "attached-cluster-custom",
+				ClassificationOnly: true,
 			},
 		},
 		{

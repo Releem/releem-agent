@@ -52,6 +52,7 @@ const (
 	awsApplyErrorAWSAPI                  = "aws-api-error"
 	awsApplyErrorParameterGroupNotInSync = "parameter-group-not-in-sync"
 	awsApplyErrorParameterGroupMismatch  = "parameter-group-mismatch"
+	awsApplySerializationFailureOutput   = `{"instance":{"applied":[],"skipped":[],"failed":[{"parameters":[],"error":"serialize AWS apply result"}]},"cluster":{"applied":[],"skipped":[],"failed":[]}}`
 )
 
 var errAWSApplyWaitTimeout = errors.New("timed out waiting for AWS parameter apply")
@@ -80,6 +81,11 @@ type awsApplyWaitRequest struct {
 	Cluster  awsrds.ScopePlan
 }
 
+type awsApplyGroupStatuses struct {
+	Instance string
+	Cluster  string
+}
+
 func (request awsApplyWaitRequest) modifiedScopes() awsApplyModifiedScopes {
 	return awsApplyModifiedScopes{
 		Instance: len(request.Instance.Parameters) > 0,
@@ -89,9 +95,11 @@ func (request awsApplyWaitRequest) modifiedScopes() awsApplyModifiedScopes {
 
 type awsRDSClientFactory func(context.Context, *config.Config) (awsrds.Client, error)
 
-type awsApplyWaitFunc func(context.Context, awsrds.Client, awsApplyWaitRequest) error
+type awsApplyWaitFunc func(context.Context, awsrds.Client, awsApplyWaitRequest) (awsApplyGroupStatuses, error)
 
 type awsApplyReadbackFunc func(context.Context, awsrds.ParameterReader, awsrds.Scope, awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error)
+
+type awsApplyResultEncoder func(*awsrds.ApplyResult) ([]byte, error)
 
 var newAWSRDSClient awsRDSClientFactory = func(ctx context.Context, configuration *config.Config) (awsrds.Client, error) {
 	cfg, err := configaws.LoadDefaultConfig(ctx, configaws.WithRegion(configuration.AwsRegion))
@@ -104,6 +112,10 @@ var newAWSRDSClient awsRDSClientFactory = func(ctx context.Context, configuratio
 var waitForAWSApply awsApplyWaitFunc = defaultWaitForAWSApply
 
 var readAWSAppliedParameters awsApplyReadbackFunc = defaultReadAWSAppliedParameters
+
+var encodeAWSApplyResult awsApplyResultEncoder = func(result *awsrds.ApplyResult) ([]byte, error) {
+	return json.Marshal(result)
+}
 
 var awsApplyReadbackTimeout = 30 * time.Second
 
@@ -119,7 +131,14 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 	logger logging.Logger, configuration *config.Config, mode AWSApplyMode, task awsApplyTaskContext) (int, int, string) {
 	result := newAWSApplyResult(configuration)
 	finish := func(exitCode, status int) (int, int, string) {
-		output := marshalAWSApplyResult(&result)
+		output, encodeErr := encodeAWSApplyOutput(&result)
+		if encodeErr != nil {
+			logger.Errorf("AWS apply result serialization failed: %s", awsApplySafeErrorCode(encodeErr))
+			if exitCode == awsApplyExitSuccess {
+				exitCode = awsApplyExitFailure
+				status = awsApplyTaskStatusFailure
+			}
+		}
 		logAWSApplyEvent(logger, "aws_rds_apply_audit", map[string]interface{}{
 			"task_id":        task.TaskID,
 			"task_type_id":   task.TaskTypeID,
@@ -143,13 +162,18 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, fmt.Errorf("collect current metrics: no metrics returned"))
 		return finish(awsApplyExitFailure, awsApplyTaskStatusFailure)
 	}
-	recommendationJSON := utils.ProcessRepeaters(
+	recommendationJSON, err := utils.ProcessRepeatersWithError(
 		metrics,
 		repeaters,
 		configuration,
 		logger,
 		models.ModeType{Name: "Configurations", Type: "GetJson"},
 	)
+	if err != nil {
+		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
+		logger.Errorf("AWS recommendation request failed: %s", awsApplySafeErrorCode(err))
+		return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
+	}
 	recommendations, err := decodeAWSRecommendations(recommendationJSON)
 	if err != nil {
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
@@ -174,8 +198,8 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
 		return finish(awsApplyExitInstanceUnavailable, awsApplyTaskStatusFailure)
 	}
-	groupValidation := validateAWSGroups(logger, metadata, configuration)
-	if groupValidation.InstanceMismatch || groupValidation.ClusterMismatch {
+	groupValidation := validateAWSInstanceGroup(logger, metadata, configuration)
+	if groupValidation.InstanceMismatch {
 		recordAWSGroupMismatchFailures(&result, groupValidation, metadata, configuration)
 		return finish(awsApplyExitParameterGroupMismatch, awsApplyTaskStatusFailure)
 	}
@@ -190,19 +214,6 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		recordAWSInstanceParameterGroupReadinessFailure(&result, metadata)
 		return finish(awsApplyExitParameterGroupNotInSync, awsApplyTaskStatusFailure)
 	}
-	if metadata.IsAurora() && metadata.IsClusterWriter && metadata.DBClusterParameterGroupStatus != "in-sync" {
-		err = fmt.Errorf(
-			"DB cluster %q parameter group %q status %q is not in-sync for writer instance %q",
-			metadata.DBClusterIdentifier,
-			metadata.DBClusterParameterGroup,
-			metadata.DBClusterParameterGroupStatus,
-			metadata.DBInstanceIdentifier,
-		)
-		logger.Error(err)
-		recordAWSClusterParameterGroupReadinessFailure(&result, metadata)
-		return finish(awsApplyExitParameterGroupNotInSync, awsApplyTaskStatusFailure)
-	}
-
 	instanceParameters := map[string]awsrds.ParameterInfo{}
 	instanceLookupGroup := configuration.AwsRDSParameterGroup
 	instanceClassificationOnly := false
@@ -238,10 +249,8 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		metadata,
 		configuration.AwsRDSClusterParameterGroup,
 	)
-	switch {
-	case awsrds.IsDefaultParameterGroup(configuration.AwsRDSClusterParameterGroup):
-		// Reject default groups before ListParameters; they are never eligible
-		// targets and their metadata is unnecessary for valid instance work.
+	clusterClassificationNeeded := awsClusterClassificationNeeded(recommendations, instanceParameters, instanceMembershipUnknown)
+	if !clusterClassificationNeeded {
 		clusterLookup = awsrds.ClusterParameterGroupLookup{}
 	}
 	if clusterLookup.Group != "" && !metadata.IsClusterWriter {
@@ -257,7 +266,8 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 			awsrds.ScopeCluster,
 		)
 		if err != nil {
-			if !clusterLookup.ClassificationOnly {
+			classificationRequired := clusterClassificationNeeded && metadata.IsClusterWriter
+			if !clusterLookup.ClassificationOnly || classificationRequired {
 				recordAWSApplyFailure(&result, awsrds.ScopeCluster, nil, err)
 				return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
 			}
@@ -279,12 +289,35 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		PendingRebootOnly:         mode == AWSApplyPendingRebootOnly,
 	})
 	result = plannedResult
+	if plan.Cluster.HasApplicableParameters {
+		groupValidation = validateAWSClusterGroup(logger, metadata, configuration)
+		if groupValidation.ClusterMismatch {
+			recordAWSGroupMismatchFailures(&result, groupValidation, metadata, configuration)
+			return finish(awsApplyExitParameterGroupMismatch, awsApplyTaskStatusFailure)
+		}
+	}
+	if len(plan.Cluster.Parameters) > 0 && metadata.DBClusterParameterGroupStatus != "in-sync" {
+		err = fmt.Errorf(
+			"DB cluster %q parameter group %q status %q is not in-sync for writer instance %q",
+			metadata.DBClusterIdentifier,
+			metadata.DBClusterParameterGroup,
+			metadata.DBClusterParameterGroupStatus,
+			metadata.DBInstanceIdentifier,
+		)
+		logger.Error(err)
+		recordAWSClusterParameterGroupReadinessFailure(&result, metadata)
+		return finish(awsApplyExitParameterGroupNotInSync, awsApplyTaskStatusFailure)
+	}
 
 	waitRequest, applyErr := applyAWSPlan(ctx, client, plan, &result, logger, task)
 	waitRequest.Metadata = metadata
 	modified := waitRequest.modifiedScopes()
+	var (
+		groupStatuses awsApplyGroupStatuses
+		waitErr       error
+	)
 	if modified.Instance || modified.Cluster {
-		waitErr := waitForAWSApply(ctx, client, waitRequest)
+		groupStatuses, waitErr = waitForAWSApply(ctx, client, waitRequest)
 		logAWSApplyEvent(logger, "aws_rds_apply_wait", awsApplyWaitEventFields(modified, waitErr, task))
 		if waitErr != nil {
 			recordAWSWaitFailure(&result, waitRequest, waitErr)
@@ -298,7 +331,7 @@ func applyConfAWSRDS(repeaters models.MetricsRepeater, gatherers []models.Metric
 		logger.Errorf("AWS parameter apply failed: %s", awsApplySafeErrorCode(applyErr))
 		return finish(awsApplyExitCode(applyErr), awsApplyTaskStatusFailure)
 	}
-	if awsApplyRequiresReboot(waitRequest) {
+	if awsApplyRequiresReboot(modified, groupStatuses) {
 		logger.Info("AWS parameter apply completed with pending reboot")
 		return finish(awsApplyExitPendingReboot, awsApplyTaskStatusFailure)
 	}
@@ -331,7 +364,7 @@ type awsGroupValidation struct {
 	ClusterMismatch  bool
 }
 
-func validateAWSGroups(logger logging.Logger, metadata awsrds.Metadata, configuration *config.Config) awsGroupValidation {
+func validateAWSInstanceGroup(logger logging.Logger, metadata awsrds.Metadata, configuration *config.Config) awsGroupValidation {
 	validation := awsGroupValidation{}
 	configuredInstanceGroup := configuration.AwsRDSParameterGroup
 	if configuredInstanceGroup == "" {
@@ -341,11 +374,35 @@ func validateAWSGroups(logger logging.Logger, metadata awsrds.Metadata, configur
 		validation.InstanceMismatch = true
 		logger.Errorf("Configured DB parameter group %q does not match attached group %q", configuredInstanceGroup, metadata.DBParameterGroup)
 	}
-	if configured := configuration.AwsRDSClusterParameterGroup; configured != "" && configured != metadata.DBClusterParameterGroup {
+	return validation
+}
+
+func validateAWSClusterGroup(logger logging.Logger, metadata awsrds.Metadata, configuration *config.Config) awsGroupValidation {
+	validation := awsGroupValidation{}
+	configured := configuration.AwsRDSClusterParameterGroup
+	if configured == "" {
+		validation.ClusterMismatch = true
+		logger.Errorf("Configured DB cluster parameter group is empty; attached group is %q", metadata.DBClusterParameterGroup)
+	} else if awsrds.IsDefaultParameterGroup(configured) {
+		validation.ClusterMismatch = true
+		logger.Errorf("Configured DB cluster parameter group %q is AWS-managed and cannot be modified", configured)
+	} else if configured != metadata.DBClusterParameterGroup {
 		validation.ClusterMismatch = true
 		logger.Errorf("Configured DB cluster parameter group %q does not match attached group %q", configured, metadata.DBClusterParameterGroup)
 	}
 	return validation
+}
+
+func awsClusterClassificationNeeded(recommendations map[string]interface{}, instanceParameters map[string]awsrds.ParameterInfo, instanceMembershipUnknown bool) bool {
+	if instanceMembershipUnknown {
+		return false
+	}
+	for name := range recommendations {
+		if _, exists := instanceParameters[name]; !exists {
+			return true
+		}
+	}
+	return false
 }
 
 func recordAWSGroupMismatchFailures(result *awsrds.ApplyResult, validation awsGroupValidation, metadata awsrds.Metadata, configuration *config.Config) {
@@ -399,15 +456,9 @@ func awsCurrentParameterValues(values models.MetricGroupValue) map[string]interf
 	return current
 }
 
-func awsApplyRequiresReboot(request awsApplyWaitRequest) bool {
-	for _, plan := range []awsrds.ScopePlan{request.Instance, request.Cluster} {
-		for _, parameter := range plan.Parameters {
-			if parameter.ApplyMethod == types.ApplyMethodPendingReboot {
-				return true
-			}
-		}
-	}
-	return false
+func awsApplyRequiresReboot(modified awsApplyModifiedScopes, statuses awsApplyGroupStatuses) bool {
+	return modified.Instance && statuses.Instance == "pending-reboot" ||
+		modified.Cluster && statuses.Cluster == "pending-reboot"
 }
 
 func applyAWSPlan(ctx context.Context, client awsrds.Client, plan awsrds.ApplyPlan, result *awsrds.ApplyResult, logger logging.Logger, task awsApplyTaskContext) (awsApplyWaitRequest, error) {
@@ -600,12 +651,17 @@ func recordAWSWaitFailure(result *awsrds.ApplyResult, request awsApplyWaitReques
 }
 
 func marshalAWSApplyResult(result *awsrds.ApplyResult) string {
+	output, _ := encodeAWSApplyOutput(result)
+	return output
+}
+
+func encodeAWSApplyOutput(result *awsrds.ApplyResult) (string, error) {
 	result.Sort()
-	encoded, err := json.Marshal(result)
+	encoded, err := encodeAWSApplyResult(result)
 	if err != nil {
-		return `{"instance":{"applied":[],"skipped":[],"failed":[{"parameters":[],"error":"serialize AWS apply result"}]},"cluster":{"applied":[],"skipped":[],"failed":[]}}`
+		return awsApplySerializationFailureOutput, err
 	}
-	return string(encoded)
+	return string(encoded), nil
 }
 
 func awsApplyExitCode(err error) int {
@@ -659,10 +715,11 @@ func isSafeAWSAPIErrorCode(code string) bool {
 	return true
 }
 
-func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request awsApplyWaitRequest) error {
+func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request awsApplyWaitRequest) (awsApplyGroupStatuses, error) {
 	scopes := request.modifiedScopes()
+	var statuses awsApplyGroupStatuses
 	if !scopes.Instance && !scopes.Cluster {
-		return nil
+		return statuses, nil
 	}
 
 	waitContext, cancel := context.WithTimeout(ctx, awsApplyWaitTimeout)
@@ -672,34 +729,40 @@ func defaultWaitForAWSApply(ctx context.Context, client awsrds.Client, request a
 	clusterReady := !scopes.Cluster
 	for {
 		if !instanceReady {
-			ready, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeInstance, request.Instance)
+			ready, status, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeInstance, request.Instance)
 			if err != nil {
-				return newAWSApplyPollingError(awsrds.ScopeInstance, awsApplyModifiedScopes{
+				return statuses, newAWSApplyPollingError(awsrds.ScopeInstance, awsApplyModifiedScopes{
 					Instance: scopes.Instance && !instanceReady,
 					Cluster:  scopes.Cluster && !clusterReady,
 				}, err)
 			}
 			instanceReady = ready
+			if ready {
+				statuses.Instance = status
+			}
 		}
 		if !clusterReady {
-			ready, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeCluster, request.Cluster)
+			ready, status, err := awsApplyScopeReady(waitContext, client, request.Metadata, awsrds.ScopeCluster, request.Cluster)
 			if err != nil {
-				return newAWSApplyPollingError(awsrds.ScopeCluster, awsApplyModifiedScopes{
+				return statuses, newAWSApplyPollingError(awsrds.ScopeCluster, awsApplyModifiedScopes{
 					Instance: scopes.Instance && !instanceReady,
 					Cluster:  scopes.Cluster && !clusterReady,
 				}, err)
 			}
 			clusterReady = ready
+			if ready {
+				statuses.Cluster = status
+			}
 		}
 		if instanceReady && clusterReady {
-			return nil
+			return statuses, nil
 		}
 
 		timer := time.NewTimer(awsApplyPollInterval)
 		select {
 		case <-waitContext.Done():
 			timer.Stop()
-			return newAWSApplyTimeoutErrorForScopes(awsApplyModifiedScopes{
+			return statuses, newAWSApplyTimeoutErrorForScopes(awsApplyModifiedScopes{
 				Instance: scopes.Instance && !instanceReady,
 				Cluster:  scopes.Cluster && !clusterReady,
 			})
@@ -712,10 +775,10 @@ func defaultReadAWSAppliedParameters(ctx context.Context, client awsrds.Paramete
 	return awsrds.ListParameters(ctx, client, plan.Group, scope)
 }
 
-func awsApplyScopeReady(ctx context.Context, client awsrds.Client, metadata awsrds.Metadata, scope awsrds.Scope, plan awsrds.ScopePlan) (bool, error) {
+func awsApplyScopeReady(ctx context.Context, client awsrds.Client, metadata awsrds.Metadata, scope awsrds.Scope, plan awsrds.ScopePlan) (bool, string, error) {
 	observed, err := awsAppliedParametersObserved(ctx, client, scope, plan)
 	if err != nil || !observed {
-		return false, err
+		return false, "", err
 	}
 
 	switch scope {
@@ -724,14 +787,14 @@ func awsApplyScopeReady(ctx context.Context, client awsrds.Client, metadata awsr
 			DBInstanceIdentifier: aws.String(metadata.DBInstanceIdentifier),
 		})
 		if err != nil {
-			return false, fmt.Errorf("poll DB instance %q: %w", metadata.DBInstanceIdentifier, err)
+			return false, "", fmt.Errorf("poll DB instance %q: %w", metadata.DBInstanceIdentifier, err)
 		}
 		if output == nil || len(output.DBInstances) != 1 {
-			return false, fmt.Errorf("poll DB instance %q: expected one result", metadata.DBInstanceIdentifier)
+			return false, "", fmt.Errorf("poll DB instance %q: expected one result", metadata.DBInstanceIdentifier)
 		}
 		instance := output.DBInstances[0]
 		if aws.ToString(instance.DBInstanceStatus) != "available" {
-			return false, nil
+			return false, "", nil
 		}
 		applyStatus := ""
 		for _, group := range instance.DBParameterGroups {
@@ -741,30 +804,44 @@ func awsApplyScopeReady(ctx context.Context, client awsrds.Client, metadata awsr
 			}
 		}
 		if applyStatus == "" {
-			return false, fmt.Errorf("poll DB instance %q: no status for parameter group %q", metadata.DBInstanceIdentifier, plan.Group)
+			return false, "", fmt.Errorf("poll DB instance %q: no status for parameter group %q", metadata.DBInstanceIdentifier, plan.Group)
 		}
 		if applyStatus != "in-sync" && applyStatus != "pending-reboot" {
-			return false, nil
+			return false, applyStatus, nil
 		}
-		return true, nil
+		return true, applyStatus, nil
 
 	case awsrds.ScopeCluster:
 		output, err := client.DescribeDBClusters(ctx, &rds.DescribeDBClustersInput{
 			DBClusterIdentifier: aws.String(metadata.DBClusterIdentifier),
 		})
 		if err != nil {
-			return false, fmt.Errorf("poll DB cluster %q: %w", metadata.DBClusterIdentifier, err)
+			return false, "", fmt.Errorf("poll DB cluster %q: %w", metadata.DBClusterIdentifier, err)
 		}
 		if output == nil || len(output.DBClusters) != 1 {
-			return false, fmt.Errorf("poll DB cluster %q: expected one result", metadata.DBClusterIdentifier)
+			return false, "", fmt.Errorf("poll DB cluster %q: expected one result", metadata.DBClusterIdentifier)
 		}
-		if aws.ToString(output.DBClusters[0].Status) != "available" {
-			return false, nil
+		cluster := output.DBClusters[0]
+		if aws.ToString(cluster.Status) != "available" {
+			return false, "", nil
 		}
-		return true, nil
+		if aws.ToString(cluster.DBClusterParameterGroup) != plan.Group {
+			return false, "", fmt.Errorf("poll DB cluster %q: attached parameter group does not match %q", metadata.DBClusterIdentifier, plan.Group)
+		}
+		for _, member := range cluster.DBClusterMembers {
+			if aws.ToString(member.DBInstanceIdentifier) != metadata.DBInstanceIdentifier {
+				continue
+			}
+			applyStatus := aws.ToString(member.DBClusterParameterGroupStatus)
+			if applyStatus != "in-sync" && applyStatus != "pending-reboot" {
+				return false, applyStatus, nil
+			}
+			return true, applyStatus, nil
+		}
+		return false, "", fmt.Errorf("poll DB cluster %q: no parameter group status for DB instance %q", metadata.DBClusterIdentifier, metadata.DBInstanceIdentifier)
 
 	default:
-		return false, fmt.Errorf("unsupported AWS parameter scope %q", scope)
+		return false, "", fmt.Errorf("unsupported AWS parameter scope %q", scope)
 	}
 }
 
