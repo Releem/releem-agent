@@ -72,7 +72,6 @@ const (
 	SkipUnsupportedEngineMode SkipReason = "unsupported-engine-mode"
 	SkipServerlessManaged     SkipReason = "serverless-managed"
 	SkipUnsupportedApplyType  SkipReason = "unsupported-apply-type"
-	SkipPendingRebootOnly     SkipReason = "pending-only"
 	SkipUnchanged             SkipReason = "unchanged"
 	SkipInvalidValue          SkipReason = "invalid-value"
 )
@@ -349,11 +348,10 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 	var applyMethod types.ApplyMethod
 	switch strings.ToLower(parameter.ApplyType) {
 	case "dynamic":
-		if input.PendingRebootOnly {
-			skipParameter(result, record, name, SkipPendingRebootOnly)
-			return
-		}
 		applyMethod = types.ApplyMethodImmediate
+		if input.PendingRebootOnly {
+			applyMethod = types.ApplyMethodPendingReboot
+		}
 	case "static":
 		applyMethod = types.ApplyMethodPendingReboot
 	default:

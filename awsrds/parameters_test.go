@@ -443,7 +443,7 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			}},
 		},
 		{
-			name: "pending-reboot-only mode omits dynamic parameters",
+			name: "pending-reboot-only mode defers dynamic and static parameters",
 			input: func() BuildApplyPlanInput {
 				input := planInput(
 					map[string]ParameterInfo{
@@ -456,12 +456,10 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				input.PendingRebootOnly = true
 				return input
 			}(),
-			wantInstance: []simpleParameter{{
-				name: "static_parameter", value: "2", method: types.ApplyMethodPendingReboot,
-			}},
-			wantInstanceSkipped: []SkippedVariable{{
-				Name: "dynamic_parameter", Reason: SkipPendingRebootOnly,
-			}},
+			wantInstance: []simpleParameter{
+				{name: "dynamic_parameter", value: "1", method: types.ApplyMethodPendingReboot},
+				{name: "static_parameter", value: "2", method: types.ApplyMethodPendingReboot},
+			},
 		},
 		{
 			name: "unchanged values compare after safe normalization",
