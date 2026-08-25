@@ -1125,7 +1125,7 @@ promptedpwd"
     [[ "$output" == *"Couldn't find mysqladmin/mariadb-admin"* ]]
 }
 
-@test "aws/rds mode writes aws keys and releem_dir to releem.conf" {
+@test "Aurora aws/rds mode writes both required parameter groups to releem.conf" {
     prepare_common_install_mocks
     local workdir="${TEST_TMPDIR}/workdir"
     local conf="${workdir}/releem.conf"
@@ -1156,7 +1156,7 @@ promptedpwd"
     [[ "$output" == *'aws_rds_cluster_parameter_group="aurora-cluster-custom"'* ]]
 }
 
-@test "aws/rds mode does not require an Aurora cluster parameter group" {
+@test "ordinary non-Aurora RDS mode does not write a cluster parameter group" {
     prepare_common_install_mocks
     local workdir="${TEST_TMPDIR}/workdir"
     local conf="${workdir}/releem.conf"

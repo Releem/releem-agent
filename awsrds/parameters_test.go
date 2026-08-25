@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -45,6 +46,22 @@ func (f *parameterClientFake) DescribeDBClusterParameters(_ context.Context, inp
 		marker: marker,
 	})
 	return f.clusterPages[marker], f.clusterErrs[marker]
+}
+
+func (f *parameterClientFake) DescribeDBInstances(context.Context, *rds.DescribeDBInstancesInput, ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+	return nil, errors.New("parameterClientFake: DescribeDBInstances not implemented")
+}
+
+func (f *parameterClientFake) DescribeDBClusters(context.Context, *rds.DescribeDBClustersInput, ...func(*rds.Options)) (*rds.DescribeDBClustersOutput, error) {
+	return nil, errors.New("parameterClientFake: DescribeDBClusters not implemented")
+}
+
+func (f *parameterClientFake) ModifyDBParameterGroup(context.Context, *rds.ModifyDBParameterGroupInput, ...func(*rds.Options)) (*rds.ModifyDBParameterGroupOutput, error) {
+	return nil, errors.New("parameterClientFake: ModifyDBParameterGroup not implemented")
+}
+
+func (f *parameterClientFake) ModifyDBClusterParameterGroup(context.Context, *rds.ModifyDBClusterParameterGroupInput, ...func(*rds.Options)) (*rds.ModifyDBClusterParameterGroupOutput, error) {
+	return nil, errors.New("parameterClientFake: ModifyDBClusterParameterGroup not implemented")
 }
 
 func TestListParametersPaginatesAndIndexesLiveFields(t *testing.T) {
@@ -222,31 +239,6 @@ type simpleParameter struct {
 	method types.ApplyMethod
 }
 
-func TestBuildApplyPlanUnknownInstanceMembershipFailsClosed(t *testing.T) {
-	input := BuildApplyPlanInput{
-		Metadata: Metadata{
-			Engine: "aurora-mysql", IsClusterWriter: true,
-			DBParameterGroup:        "default.aurora-mysql8.0",
-			DBClusterParameterGroup: "cluster-custom",
-		},
-		ConfiguredInstanceGroup:   "default.aurora-mysql8.0",
-		ConfiguredClusterGroup:    "cluster-custom",
-		InstanceMembershipUnknown: true,
-		ClusterParameters: map[string]ParameterInfo{
-			"cluster_only": {Name: "cluster_only", ApplyType: "dynamic", IsModifiable: true},
-		},
-		Recommendations: map[string]interface{}{"cluster_only": "1"},
-	}
-	plan, result := BuildApplyPlan(input)
-	if len(plan.Cluster.Parameters) != 0 {
-		t.Fatalf("cluster plan = %#v, want fail-closed empty plan", plan.Cluster)
-	}
-	if len(result.Instance.Skipped) != 1 ||
-		result.Instance.Skipped[0].Reason != SkipDefaultGroup {
-		t.Fatalf("instance result = %#v, want default-group skip", result.Instance)
-	}
-}
-
 func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 	t.Parallel()
 
@@ -300,7 +292,11 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			}},
 		},
 		{
-			name: "missing configured cluster group skips cluster-only parameter",
+			// BuildApplyPlan no longer validates ConfiguredClusterGroup itself
+			// (that precondition now lives solely in the caller); an
+			// unconfigured group no longer skips an otherwise-eligible
+			// cluster-only parameter.
+			name: "missing configured cluster group does not skip cluster-only parameter",
 			input: func() BuildApplyPlanInput {
 				input := planInput(nil, map[string]ParameterInfo{
 					"binlog_format": liveParameter("binlog_format", "dynamic", true, ScopeCluster),
@@ -308,8 +304,8 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				input.ConfiguredClusterGroup = ""
 				return input
 			}(),
-			wantClusterSkipped: []SkippedVariable{{
-				Name: "binlog_format", Reason: SkipGroupNotConfigured,
+			wantCluster: []simpleParameter{{
+				name: "binlog_format", value: "ROW", method: types.ApplyMethodImmediate,
 			}},
 		},
 		{
@@ -337,7 +333,11 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			}},
 		},
 		{
-			name: "default instance and cluster groups are rejected independently",
+			// BuildApplyPlan no longer rejects a default (AWS-managed)
+			// configured group itself; that precondition now lives solely in
+			// the caller (task_apply_aws.go's validateAWS*Group), which
+			// already blocks a default group before BuildApplyPlan runs.
+			name: "default instance and cluster groups are not rejected by BuildApplyPlan itself",
 			input: func() BuildApplyPlanInput {
 				input := planInput(
 					map[string]ParameterInfo{
@@ -354,11 +354,11 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				input.Metadata.DBClusterParameterGroup = input.ConfiguredClusterGroup
 				return input
 			}(),
-			wantInstanceSkipped: []SkippedVariable{{
-				Name: "max_connections", Reason: SkipDefaultGroup,
+			wantInstance: []simpleParameter{{
+				name: "max_connections", value: "250", method: types.ApplyMethodImmediate,
 			}},
-			wantClusterSkipped: []SkippedVariable{{
-				Name: "binlog_format", Reason: SkipDefaultGroup,
+			wantCluster: []simpleParameter{{
+				name: "binlog_format", value: "ROW", method: types.ApplyMethodImmediate,
 			}},
 		},
 		{
@@ -388,7 +388,11 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			}},
 		},
 		{
-			name: "Aurora MySQL Serverless safeguards are exact",
+			// BuildApplyPlan no longer excludes Aurora Serverless v2
+			// self-managed parameters (isServerlessManaged was removed): the
+			// platform's recommendation engine is responsible for not
+			// recommending them for a serverless instance.
+			name: "Aurora MySQL Serverless instance submits every eligible parameter",
 			input: func() BuildApplyPlanInput {
 				input := planInput(
 					map[string]ParameterInfo{
@@ -410,18 +414,18 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				input.Metadata.IsServerlessV2 = true
 				return input
 			}(),
-			wantInstance: []simpleParameter{{
-				name: "thread_cache_size", value: "100", method: types.ApplyMethodImmediate,
-			}},
-			wantInstanceSkipped: []SkippedVariable{
-				{Name: "innodb_buffer_pool_size", Reason: SkipServerlessManaged},
-				{Name: "innodb_purge_threads", Reason: SkipServerlessManaged},
-				{Name: "table_definition_cache", Reason: SkipServerlessManaged},
-				{Name: "table_open_cache", Reason: SkipServerlessManaged},
+			wantInstance: []simpleParameter{
+				{name: "innodb_buffer_pool_size", value: "1073741824", method: types.ApplyMethodImmediate},
+				{name: "innodb_purge_threads", value: "4", method: types.ApplyMethodImmediate},
+				{name: "table_definition_cache", value: "2000", method: types.ApplyMethodImmediate},
+				{name: "table_open_cache", value: "4000", method: types.ApplyMethodImmediate},
+				{name: "thread_cache_size", value: "100", method: types.ApplyMethodImmediate},
 			},
 		},
 		{
-			name: "Aurora PostgreSQL Serverless safeguard excludes shared_buffers only",
+			// Same removal as the Aurora MySQL Serverless case above:
+			// shared_buffers is no longer excluded by BuildApplyPlan itself.
+			name: "Aurora PostgreSQL Serverless instance submits shared_buffers too",
 			input: func() BuildApplyPlanInput {
 				input := planInput(
 					map[string]ParameterInfo{
@@ -435,12 +439,10 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				input.Metadata.IsServerlessV2 = true
 				return input
 			}(),
-			wantInstance: []simpleParameter{{
-				name: "work_mem", value: "4096", method: types.ApplyMethodImmediate,
-			}},
-			wantInstanceSkipped: []SkippedVariable{{
-				Name: "shared_buffers", Reason: SkipServerlessManaged,
-			}},
+			wantInstance: []simpleParameter{
+				{name: "shared_buffers", value: "16384", method: types.ApplyMethodPendingReboot},
+				{name: "work_mem", value: "4096", method: types.ApplyMethodImmediate},
+			},
 		},
 		{
 			name: "pending-reboot-only mode defers dynamic and static parameters",
@@ -508,7 +510,11 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			},
 		},
 		{
-			name: "cluster mismatch does not block valid instance scope",
+			// BuildApplyPlan no longer validates the cluster group itself, so
+			// a mismatched attached group does not skip the parameter either
+			// (see the doc comments above on the other group-validation
+			// subtests in this table).
+			name: "cluster group mismatch is not enforced by BuildApplyPlan itself",
 			input: func() BuildApplyPlanInput {
 				input := planInput(
 					map[string]ParameterInfo{
@@ -525,12 +531,17 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			wantInstance: []simpleParameter{{
 				name: "max_connections", value: "250", method: types.ApplyMethodImmediate,
 			}},
-			wantClusterSkipped: []SkippedVariable{{
-				Name: "binlog_format", Reason: SkipGroupMismatch,
+			wantCluster: []simpleParameter{{
+				name: "binlog_format", value: "ROW", method: types.ApplyMethodImmediate,
 			}},
 		},
 		{
-			name: "instance mismatch does not fall through to matching cluster membership",
+			// Instance scope still wins over cluster scope purely by name
+			// membership (routing priority is unrelated to group
+			// validation), but a mismatched attached instance group no
+			// longer skips the parameter either, for the same reason as
+			// above.
+			name: "instance scope still wins by membership though group mismatch is not enforced",
 			input: func() BuildApplyPlanInput {
 				input := planInput(
 					map[string]ParameterInfo{
@@ -544,8 +555,8 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 				input.Metadata.DBParameterGroup = "attached-instance-custom"
 				return input
 			}(),
-			wantInstanceSkipped: []SkippedVariable{{
-				Name: "max_connections", Reason: SkipGroupMismatch,
+			wantInstance: []simpleParameter{{
+				name: "max_connections", value: "250", method: types.ApplyMethodImmediate,
 			}},
 		},
 		{
@@ -603,10 +614,11 @@ func TestBuildApplyPlanPostgreSQLCurrentValueUnitSources(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		parameter ParameterInfo
-		current   interface{}
-		wantSkip  SkipReason
+		name           string
+		parameter      ParameterInfo
+		current        interface{}
+		wantParameters []simpleParameter
+		wantSkipped    []SkippedVariable
 	}{
 		{
 			name: "live AWS value is already native",
@@ -617,20 +629,20 @@ func TestBuildApplyPlanPostgreSQLCurrentValueUnitSources(t *testing.T) {
 				ParameterValue:    "4096",
 				HasParameterValue: true,
 			},
-			current:  json.Number("4096"),
-			wantSkip: SkipUnchanged,
+			current:     json.Number("4096"),
+			wantSkipped: []SkippedVariable{{Name: "work_mem", Reason: SkipUnchanged}},
 		},
 		{
-			name:      "DB metrics fallback is already AWS native",
-			parameter: liveParameter("work_mem", "dynamic", true, ScopeInstance),
-			current:   json.Number("4096"),
-			wantSkip:  SkipUnchanged,
+			name:        "DB metrics fallback is already AWS native",
+			parameter:   liveParameter("work_mem", "dynamic", true, ScopeInstance),
+			current:     json.Number("4096"),
+			wantSkipped: []SkippedVariable{{Name: "work_mem", Reason: SkipUnchanged}},
 		},
 		{
-			name:      "unsafe DB metrics fallback fails closed",
-			parameter: liveParameter("work_mem", "dynamic", true, ScopeInstance),
-			current:   []byte("4096"),
-			wantSkip:  SkipInvalidValue,
+			name:           "invalid DB metrics fallback does not suppress recommendation",
+			parameter:      liveParameter("work_mem", "dynamic", true, ScopeInstance),
+			current:        []byte("4096"),
+			wantParameters: []simpleParameter{{name: "work_mem", value: "4096", method: types.ApplyMethodImmediate}},
 		},
 	}
 
@@ -649,12 +661,11 @@ func TestBuildApplyPlanPostgreSQLCurrentValueUnitSources(t *testing.T) {
 			input.CurrentValues = map[string]interface{}{"work_mem": tt.current}
 
 			plan, result := BuildApplyPlan(input)
-			if len(plan.Instance.Parameters) != 0 {
-				t.Fatalf("instance parameters = %#v, want fail-closed no-op", simpleParameters(plan.Instance.Parameters))
+			if got := simpleParameters(plan.Instance.Parameters); !reflect.DeepEqual(got, tt.wantParameters) {
+				t.Fatalf("instance parameters = %#v, want %#v", got, tt.wantParameters)
 			}
-			want := []SkippedVariable{{Name: "work_mem", Reason: tt.wantSkip}}
-			if !reflect.DeepEqual(result.Instance.Skipped, want) {
-				t.Fatalf("instance skips = %#v, want %#v", result.Instance.Skipped, want)
+			if !reflect.DeepEqual(result.Instance.Skipped, nonNilSkips(tt.wantSkipped)) {
+				t.Fatalf("instance skips = %#v, want %#v", result.Instance.Skipped, nonNilSkips(tt.wantSkipped))
 			}
 		})
 	}
@@ -769,149 +780,8 @@ func TestBuildApplyPlanPreservesJSONNumberPrecision(t *testing.T) {
 	}
 }
 
-func TestParameterGroupLookupSelectsConfiguredOrClassificationOnlyClusterGroup(t *testing.T) {
+func TestParameterApplyResultSerializesWithoutValues(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
-		name       string
-		metadata   Metadata
-		configured string
-		want       ClusterParameterGroupLookup
-	}{
-		{
-			name: "mismatched configured group uses attached group for classification",
-			metadata: Metadata{
-				Engine:                  "aurora-mysql",
-				DBClusterParameterGroup: "attached-cluster-custom",
-			},
-			configured: "configured-cluster-custom",
-			want: ClusterParameterGroupLookup{
-				Group:              "attached-cluster-custom",
-				ClassificationOnly: true,
-			},
-		},
-		{
-			name: "attached Aurora group is classification-only when configuration is empty",
-			metadata: Metadata{
-				Engine:                  "aurora-postgresql",
-				DBClusterParameterGroup: "attached-cluster-custom",
-			},
-			want: ClusterParameterGroupLookup{
-				Group:              "attached-cluster-custom",
-				ClassificationOnly: true,
-			},
-		},
-		{
-			name: "ordinary RDS never falls back to an attached cluster group",
-			metadata: Metadata{
-				Engine:                  "mysql",
-				DBClusterParameterGroup: "multi-az-cluster-group",
-			},
-			want: ClusterParameterGroupLookup{},
-		},
-		{
-			name:     "Aurora without an attached group has no lookup",
-			metadata: Metadata{Engine: "aurora-mysql"},
-			want:     ClusterParameterGroupLookup{},
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := SelectClusterParameterGroupLookup(tt.metadata, tt.configured); got != tt.want {
-				t.Fatalf("SelectClusterParameterGroupLookup() = %#v, want %#v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestParameterGroupClassificationLookupKeepsEmptyClusterApplyTarget(t *testing.T) {
-	t.Parallel()
-
-	metadata := Metadata{
-		Engine:                  "aurora-mysql",
-		EngineMode:              "provisioned",
-		DBParameterGroup:        "orders-instance-custom",
-		DBClusterParameterGroup: "attached-cluster-custom",
-		IsClusterWriter:         true,
-	}
-	lookup := SelectClusterParameterGroupLookup(metadata, "")
-	client := &parameterClientFake{clusterPages: map[string]*rds.DescribeDBClusterParametersOutput{
-		"": {Parameters: []types.Parameter{{
-			ParameterName: aws.String("cluster_only"),
-			ApplyType:     aws.String("dynamic"),
-			IsModifiable:  aws.Bool(true),
-		}}},
-	}}
-	clusterParameters, err := ListParameters(context.Background(), client, lookup.Group, ScopeCluster)
-	if err != nil {
-		t.Fatalf("ListParameters() error = %v", err)
-	}
-
-	input := BuildApplyPlanInput{
-		Metadata:                metadata,
-		ConfiguredInstanceGroup: "orders-instance-custom",
-		ConfiguredClusterGroup:  "",
-		ClusterParameters:       clusterParameters,
-		Recommendations: map[string]interface{}{
-			"cluster_only": "1",
-			"absent":       "2",
-		},
-		CurrentValues: map[string]interface{}{},
-	}
-	plan, result := BuildApplyPlan(input)
-
-	if !lookup.ClassificationOnly {
-		t.Fatal("lookup is not classification-only")
-	}
-	if len(client.calls) != 1 || client.calls[0].group != metadata.DBClusterParameterGroup {
-		t.Fatalf("describe calls = %#v, want one read from attached group %q", client.calls, metadata.DBClusterParameterGroup)
-	}
-	if plan.Cluster.Group != "" || len(plan.Cluster.Parameters) != 0 {
-		t.Fatalf("cluster apply plan = %#v, want no target and no mutations", plan.Cluster)
-	}
-	wantClusterSkips := []SkippedVariable{{Name: "cluster_only", Reason: SkipGroupNotConfigured}}
-	if !reflect.DeepEqual(result.Cluster.Skipped, wantClusterSkips) {
-		t.Fatalf("cluster skips = %#v, want %#v", result.Cluster.Skipped, wantClusterSkips)
-	}
-	wantInstanceSkips := []SkippedVariable{{Name: "absent", Reason: SkipAbsent}}
-	if !reflect.DeepEqual(result.Instance.Skipped, wantInstanceSkips) {
-		t.Fatalf("instance skips = %#v, want %#v", result.Instance.Skipped, wantInstanceSkips)
-	}
-}
-
-func TestParameterApplyResultSortsAndSerializesWithoutValues(t *testing.T) {
-	t.Parallel()
-
-	result := ApplyResult{
-		Audit: NewApplyAudit(Metadata{}),
-		Instance: ScopeResult{
-			Group:   "orders-instance-custom",
-			Applied: []string{"z_parameter", "a_parameter"},
-			Skipped: []SkippedVariable{
-				{Name: "z_skip", Reason: SkipAbsent},
-				{Name: "a_skip", Reason: SkipUnmodifiable},
-			},
-			Failed: []FailedBatch{
-				{Parameters: []string{"z_failed", "a_failed"}, Error: "second"},
-				{Parameters: []string{"m_failed"}, Error: "first"},
-			},
-		},
-		Cluster: ScopeResult{},
-	}
-
-	result.Sort()
-	serialized, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	const want = `{"instance":{"group":"orders-instance-custom","applied":["a_parameter","z_parameter"],"skipped":[{"name":"a_skip","reason":"unmodifiable"},{"name":"z_skip","reason":"absent"}],"failed":[{"parameters":["a_failed","z_failed"],"error":"second"},{"parameters":["m_failed"],"error":"first"}]},"cluster":{"applied":[],"skipped":[],"failed":[]},"audit":{"schema_version":1,"topology":{"is_cluster_writer":false,"is_serverless_v2":false},"parameters":[]}}`
-	if string(serialized) != want {
-		t.Fatalf("json.Marshal(sorted result) = %s, want %s", serialized, want)
-	}
 
 	_, plannedResult := BuildApplyPlan(planInput(
 		map[string]ParameterInfo{
@@ -929,6 +799,89 @@ func TestParameterApplyResultSortsAndSerializesWithoutValues(t *testing.T) {
 	}
 	if strings.Contains(string(plannedJSON), "super-secret-value") {
 		t.Fatalf("serialized result contains a parameter value: %s", plannedJSON)
+	}
+}
+
+func TestIsDefaultParameterGroup(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		group string
+		want  bool
+	}{
+		{name: "empty group", group: "", want: false},
+		{name: "custom group", group: "orders-default-custom", want: false},
+		{name: "AWS default group", group: "default.aurora-postgresql15", want: true},
+		{name: "AWS default group is case insensitive", group: "DEFAULT.AURORA-MYSQL8.0", want: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsDefaultParameterGroup(tt.group); got != tt.want {
+				t.Fatalf("IsDefaultParameterGroup(%q) = %v, want %v", tt.group, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeParameterValueSupportedTypes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		parameter string
+		value     interface{}
+		want      string
+		wantError bool
+	}{
+		{name: "string", value: "ON", want: "ON"},
+		{name: "JSON integer", value: json.Number("9223372036854775809"), want: "9223372036854775809"},
+		{name: "JSON decimal", value: json.Number("0.1250"), want: "0.1250"},
+		{name: "float64", value: float64(12.5), want: "12.5"},
+		{name: "float32", value: float32(12.5), want: "12.5"},
+		{name: "int", value: int(-1), want: "-1"},
+		{name: "int8", value: int8(-2), want: "-2"},
+		{name: "int16", value: int16(-3), want: "-3"},
+		{name: "int32", value: int32(-4), want: "-4"},
+		{name: "int64", value: int64(-5), want: "-5"},
+		{name: "uint", value: uint(1), want: "1"},
+		{name: "uint8", value: uint8(2), want: "2"},
+		{name: "uint16", value: uint16(3), want: "3"},
+		{name: "uint32", value: uint32(4), want: "4"},
+		{name: "uint64", value: uint64(18446744073709551615), want: "18446744073709551615"},
+		{name: "dirty pages percentage truncates", parameter: "innodb_max_dirty_pages_pct", value: "75.999", want: "75"},
+		{name: "empty JSON number", value: json.Number(""), wantError: true},
+		{name: "JSON number with whitespace", value: json.Number(" 1"), wantError: true},
+		{name: "JSON non-number literal", value: json.Number("true"), wantError: true},
+		{name: "float64 NaN", value: math.NaN(), wantError: true},
+		{name: "float64 infinity", value: math.Inf(1), wantError: true},
+		{name: "float32 NaN", value: float32(math.NaN()), wantError: true},
+		{name: "float32 infinity", value: float32(math.Inf(-1)), wantError: true},
+		{name: "invalid dirty pages percentage", parameter: "innodb_max_dirty_pages_pct", value: "seventy-five", wantError: true},
+		{name: "unsupported type", value: []byte("1"), wantError: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := normalizeParameterValue(tt.parameter, tt.value)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("normalizeParameterValue(%q, %#v) = %q, want error", tt.parameter, tt.value, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeParameterValue(%q, %#v) error = %v", tt.parameter, tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeParameterValue(%q, %#v) = %q, want %q", tt.parameter, tt.value, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -3,10 +3,8 @@ package awsrds
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
-	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
@@ -102,6 +100,26 @@ func DiscoverInstance(ctx context.Context, client Client, identifier string) (Me
 	return metadata, nil
 }
 
+// LogFields returns the discovered topology in a form that is safe to log. It
+// deliberately omits Endpoint, EndpointPort, and DBInstanceResourceID, which
+// name private infrastructure and must never reach agent logs.
+func (m Metadata) LogFields() map[string]interface{} {
+	return map[string]interface{}{
+		"db_instance_identifier":            m.DBInstanceIdentifier,
+		"db_instance_class":                 m.DBInstanceClass,
+		"engine":                            m.Engine,
+		"engine_mode":                       m.EngineMode,
+		"db_parameter_group":                m.DBParameterGroup,
+		"db_parameter_group_status":         m.DBParameterGroupStatus,
+		"db_cluster_identifier":             m.DBClusterIdentifier,
+		"db_cluster_parameter_group":        m.DBClusterParameterGroup,
+		"db_cluster_parameter_group_status": m.DBClusterParameterGroupStatus,
+		"is_cluster_writer":                 m.IsClusterWriter,
+		"is_serverless_v2":                  m.IsServerlessV2,
+		"instance_status":                   m.InstanceStatus,
+	}
+}
+
 // IsAurora reports whether the discovered engine is Aurora-compatible.
 func (m Metadata) IsAurora() bool {
 	engine := strings.ToLower(m.Engine)
@@ -116,31 +134,10 @@ func (m Metadata) DatabaseType() string {
 	switch {
 	case strings.Contains(engine, "postgres"):
 		return "postgresql"
-	case engine == "mariadb" || engine == "mysql" || m.IsAurora():
+	case engine == "aurora" || strings.Contains(engine, "mariadb") || strings.Contains(engine, "mysql"):
 		return "mysql"
 	default:
 		return ""
-	}
-}
-
-// ApplyEndpoint assigns the discovered endpoint to the host and, when AWS
-// supplies one, port fields for the matching database engine.
-func (m Metadata) ApplyEndpoint(configuration *config.Config) {
-	if configuration == nil {
-		return
-	}
-
-	switch m.DatabaseType() {
-	case "mysql":
-		configuration.MysqlHost = m.Endpoint
-		if m.EndpointPort > 0 {
-			configuration.MysqlPort = strconv.FormatInt(int64(m.EndpointPort), 10)
-		}
-	case "postgresql":
-		configuration.PgHost = m.Endpoint
-		if m.EndpointPort > 0 {
-			configuration.PgPort = strconv.FormatInt(int64(m.EndpointPort), 10)
-		}
 	}
 }
 

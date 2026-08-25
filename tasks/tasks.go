@@ -76,10 +76,8 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 	case 4:
 		switch configuration.InstanceType {
 		case "aws/rds":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = applyConfAWSRDS(
-				repeaters, gatherers, logger, configuration, AWSApplyAll,
-				awsApplyTaskContext{TaskID: TaskStruct.ID, TaskTypeID: TaskStruct.TypeID},
-			)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAwsRds(
+				repeaters, gatherers, logger, configuration, AWSApplyAll)
 			TaskStruct.Output = TaskStruct.Output + task_output
 		case "gcp/cloudsql":
 			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration)
@@ -107,10 +105,8 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 	case 5:
 		switch configuration.InstanceType {
 		case "aws/rds":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = applyConfAWSRDS(
-				repeaters, gatherers, logger, configuration, AWSApplyPendingRebootOnly,
-				awsApplyTaskContext{TaskID: TaskStruct.ID, TaskTypeID: TaskStruct.TypeID},
-			)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAwsRds(
+				repeaters, gatherers, logger, configuration, AWSApplyPendingRebootOnly)
 			TaskStruct.Output = TaskStruct.Output + task_output
 		case "gcp/cloudsql":
 			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration)

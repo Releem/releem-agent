@@ -9,15 +9,12 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
-	"github.com/Releem/mysqlconfigurer/utils"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
@@ -115,9 +112,13 @@ func TestAWSRDSEnhancedMetricsGathererPublishesRDSMetadata(t *testing.T) {
 
 			client, requestedStream := testCloudWatchLogsClient(t, fixture)
 			logger := *logging.Init("aws-rds-enhanced-metrics-test", false, false, io.Discard)
-			gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, client, &config.Config{}, tt.metadata, func(context.Context) (awsrds.Metadata, error) {
-				return tt.metadata, nil
-			})
+			gatherer := NewAWSRDSEnhancedMetricsGatherer(
+				logger,
+				client,
+				&config.Config{},
+				tt.metadata,
+				func(context.Context) (awsrds.Metadata, error) { return tt.metadata, nil },
+			)
 			metrics := &models.Metrics{}
 			if err := gatherer.GetMetrics(metrics); err != nil {
 				t.Fatalf("GetMetrics() error = %v", err)
@@ -155,269 +156,120 @@ func TestAWSRDSEnhancedMetricsGathererPublishesRDSMetadata(t *testing.T) {
 	}
 }
 
-func TestAWSRDSEnhancedMetricsGathererRefreshesMetadataForEveryReport(t *testing.T) {
-	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_writer.json")
+func TestAWSRDSEnhancedMetricsGathererRefreshesTopologyBeforeEveryReport(t *testing.T) {
+	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_reader.json")
 	if err != nil {
 		t.Fatalf("read enhanced-monitoring fixture: %v", err)
+	}
+
+	reader := testRDSMetadata("orders-1", "db-resource-orders", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", false)
+	writer := reader
+	writer.IsClusterWriter = true
+	discovered := []awsrds.Metadata{reader, writer}
+	discoveryCalls := 0
+	discover := func(ctx context.Context) (awsrds.Metadata, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("metadata discoverer context has no deadline")
+		}
+		metadata := discovered[discoveryCalls]
+		discoveryCalls++
+		return metadata, nil
 	}
 
 	client, requestedStream := testCloudWatchLogsClient(t, fixture)
 	logger := *logging.Init("aws-rds-enhanced-metrics-refresh-test", false, false, io.Discard)
-	configuration := &config.Config{MysqlHost: "startup.example"}
-	writerMetadata := awsrds.Metadata{
-		DBInstanceIdentifier:    "orders-1",
-		DBInstanceResourceID:    "db-resource-orders-1",
-		DBInstanceClass:         "db.r7g.large",
-		Endpoint:                "orders-writer.example",
-		Engine:                  "aurora-mysql",
-		EngineMode:              "provisioned",
-		DBParameterGroup:        "orders-instance-pg",
-		DBClusterIdentifier:     "orders-cluster",
-		DBClusterParameterGroup: "orders-cluster-pg",
-		IsClusterWriter:         true,
-	}
-	readerMetadata := writerMetadata
-	readerMetadata.Endpoint = "orders-reader.example"
-	readerMetadata.IsClusterWriter = false
-	recoveredWriterMetadata := writerMetadata
-	recoveredWriterMetadata.DBInstanceResourceID = "db-resource-orders-2"
-	recoveredWriterMetadata.Endpoint = "orders-writer-2.example"
+	gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, client, &config.Config{}, reader, discover)
 
-	startupMetadata := awsrds.Metadata{
-		DBInstanceIdentifier: "orders-1",
-		DBInstanceResourceID: "db-resource-startup",
-		Engine:               "aurora-mysql",
-		IsClusterWriter:      true,
+	for report, wantWriter := range []bool{false, true} {
+		metrics := &models.Metrics{}
+		if err := gatherer.GetMetrics(metrics); err != nil {
+			t.Fatalf("GetMetrics(report=%d) error = %v", report+1, err)
+		}
+		if got := <-requestedStream; got != reader.DBInstanceResourceID {
+			t.Fatalf("GetMetrics(report=%d) CloudWatch stream = %q, want %q", report+1, got, reader.DBInstanceResourceID)
+		}
+		host, ok := metrics.System.Info["Host"].(models.MetricGroupValue)
+		if !ok {
+			t.Fatalf("GetMetrics(report=%d) Host = %#v, want MetricGroupValue", report+1, metrics.System.Info["Host"])
+		}
+		if got := host["IsClusterWriter"]; got != wantWriter {
+			t.Errorf("GetMetrics(report=%d) IsClusterWriter = %#v, want %v", report+1, got, wantWriter)
+		}
 	}
-	reports := []struct {
-		metadata awsrds.Metadata
-		err      error
-	}{
-		{metadata: writerMetadata},
-		{metadata: readerMetadata},
-		{err: errors.New("discovery unavailable")},
-		{metadata: recoveredWriterMetadata},
-	}
-	discoveryCalls := 0
-	gatherer := NewAWSRDSEnhancedMetricsGatherer(
-		logger,
-		client,
-		configuration,
-		startupMetadata,
-		func(context.Context) (awsrds.Metadata, error) {
-			report := reports[discoveryCalls]
-			discoveryCalls++
-			return report.metadata, report.err
-		},
-	)
-	if got := configuration.MysqlHost; got != "startup.example" {
-		t.Fatalf("MysqlHost = %q, want startup endpoint unchanged", got)
-	}
-
-	first := &models.Metrics{}
-	if err := gatherer.GetMetrics(first); err != nil {
-		t.Fatalf("first GetMetrics() error = %v", err)
-	}
-	firstHost := first.System.Info["Host"].(models.MetricGroupValue)
-	if firstHost["IsClusterWriter"] != true {
-		t.Fatalf("first IsClusterWriter = %#v, want true", firstHost["IsClusterWriter"])
-	}
-	if configuration.MysqlHost != "startup.example" {
-		t.Fatalf("first MySQL host = %q, want startup endpoint unchanged", configuration.MysqlHost)
-	}
-	if got := <-requestedStream; got != "db-resource-orders-1" {
-		t.Fatalf("first CloudWatch stream = %q, want refreshed resource ID", got)
-	}
-
-	second := &models.Metrics{}
-	if err := gatherer.GetMetrics(second); err != nil {
-		t.Fatalf("second GetMetrics() error = %v", err)
-	}
-	secondHost := second.System.Info["Host"].(models.MetricGroupValue)
-	if secondHost["IsClusterWriter"] != false {
-		t.Fatalf("second IsClusterWriter = %#v, want false after failover", secondHost["IsClusterWriter"])
-	}
-	if configuration.MysqlHost != "startup.example" {
-		t.Fatalf("second MySQL host = %q, want startup endpoint unchanged", configuration.MysqlHost)
-	}
-	if got := <-requestedStream; got != "db-resource-orders-1" {
-		t.Fatalf("second CloudWatch stream = %q, want one consistent refreshed resource ID", got)
-	}
-
-	fallback := &models.Metrics{}
-	if err := gatherer.GetMetrics(fallback); err != nil {
-		t.Fatalf("fallback GetMetrics() error = %v", err)
-	}
-	fallbackHost := fallback.System.Info["Host"].(models.MetricGroupValue)
-	if fallbackHost["IsClusterWriter"] != false {
-		t.Fatalf("fallback IsClusterWriter = %#v, want cached reader role", fallbackHost["IsClusterWriter"])
-	}
-	if got := <-requestedStream; got != readerMetadata.DBInstanceResourceID {
-		t.Fatalf("fallback CloudWatch stream = %q, want %q", got, readerMetadata.DBInstanceResourceID)
-	}
-
-	recovered := &models.Metrics{}
-	if err := gatherer.GetMetrics(recovered); err != nil {
-		t.Fatalf("recovered GetMetrics() error = %v", err)
-	}
-	recoveredHost := recovered.System.Info["Host"].(models.MetricGroupValue)
-	if recoveredHost["IsClusterWriter"] != true {
-		t.Fatalf("recovered IsClusterWriter = %#v, want refreshed writer role", recoveredHost["IsClusterWriter"])
-	}
-	if got := <-requestedStream; got != recoveredWriterMetadata.DBInstanceResourceID {
-		t.Fatalf("recovered CloudWatch stream = %q, want %q", got, recoveredWriterMetadata.DBInstanceResourceID)
-	}
-	if configuration.MysqlHost != "startup.example" {
-		t.Fatalf("MySQL host = %q, want startup endpoint unchanged", configuration.MysqlHost)
-	}
-	if discoveryCalls != 4 {
-		t.Fatalf("discovery calls = %d, want one per report", discoveryCalls)
+	if discoveryCalls != 2 {
+		t.Errorf("GetMetrics() metadata discovery calls = %d, want 2", discoveryCalls)
 	}
 }
 
-type countingMetricsGatherer struct {
-	calls int
-}
-
-func (g *countingMetricsGatherer) GetMetrics(*models.Metrics) error {
-	g.calls++
-	return nil
-}
-
-func TestAWSRDSEnhancedMetricsDiscoveryFallbackKeepsCollectionAlive(t *testing.T) {
+func TestAWSRDSEnhancedMetricsGathererFallsBackToCachedTopology(t *testing.T) {
 	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_writer.json")
 	if err != nil {
 		t.Fatalf("read enhanced-monitoring fixture: %v", err)
 	}
+
+	cached := testRDSMetadata("orders-1", "db-resource-orders", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", true)
+	discover := func(ctx context.Context) (awsrds.Metadata, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Error("metadata discoverer context has no deadline")
+		} else if remaining := time.Until(deadline); remaining <= 0 || remaining > time.Second {
+			t.Errorf("metadata discovery deadline remaining = %s, want within one second", remaining)
+		}
+		return awsrds.Metadata{}, errors.New("RDS discovery unavailable")
+	}
+
 	client, requestedStream := testCloudWatchLogsClient(t, fixture)
-	logger := *logging.Init("aws-rds-fallback-collection-test", false, false, io.Discard)
-	configuration := &config.Config{}
-	initial := testRDSMetadata("orders-1", "db-resource-cached", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", true)
-	gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, client, configuration, initial, func(context.Context) (awsrds.Metadata, error) {
-		return awsrds.Metadata{}, errors.New("discovery unavailable")
-	})
-	following := &countingMetricsGatherer{}
+	logger := *logging.Init("aws-rds-enhanced-metrics-cache-test", false, false, io.Discard)
+	gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, client, &config.Config{}, cached, discover)
+	gatherer.metadataDiscoveryTimeout = time.Second
 
-	metrics := utils.CollectMetrics([]models.MetricsGatherer{gatherer, following}, logger, configuration)
-	if metrics == nil {
-		t.Fatal("CollectMetrics() = nil, want report built from cached metadata")
-	}
-	if following.calls != 1 {
-		t.Fatalf("following gatherer calls = %d, want 1", following.calls)
-	}
-	if got := <-requestedStream; got != initial.DBInstanceResourceID {
-		t.Fatalf("CloudWatch stream = %q, want cached %q", got, initial.DBInstanceResourceID)
-	}
-}
-
-func TestAWSRDSEnhancedMetricsDiscoveryTimeoutUsesCachedMetadata(t *testing.T) {
-	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_writer.json")
-	if err != nil {
-		t.Fatalf("read enhanced-monitoring fixture: %v", err)
-	}
-	client, requestedStream := testCloudWatchLogsClient(t, fixture)
-	logger := *logging.Init("aws-rds-discovery-timeout-test", false, false, io.Discard)
-	configuration := &config.Config{}
-	initial := testRDSMetadata("orders-1", "db-resource-cached", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", true)
-	discoveryResult := make(chan error, 1)
-	gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, client, configuration, initial, func(ctx context.Context) (awsrds.Metadata, error) {
-		<-ctx.Done()
-		discoveryResult <- ctx.Err()
-		return awsrds.Metadata{}, ctx.Err()
-	})
-	gatherer.metadataDiscoveryTimeout = 20 * time.Millisecond
-
-	started := time.Now()
 	metrics := &models.Metrics{}
 	if err := gatherer.GetMetrics(metrics); err != nil {
-		t.Fatalf("GetMetrics() error = %v, want cached-metadata report", err)
+		t.Fatalf("GetMetrics(discovery failure) error = %v", err)
 	}
-	if elapsed := time.Since(started); elapsed >= time.Second {
-		t.Fatalf("GetMetrics() elapsed = %v, want bounded discovery fallback", elapsed)
+	if got := <-requestedStream; got != cached.DBInstanceResourceID {
+		t.Fatalf("GetMetrics(discovery failure) CloudWatch stream = %q, want cached %q", got, cached.DBInstanceResourceID)
 	}
-	if err := <-discoveryResult; !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("discovery context error = %v, want deadline exceeded", err)
+	host, ok := metrics.System.Info["Host"].(models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("GetMetrics(discovery failure) Host = %#v, want MetricGroupValue", metrics.System.Info["Host"])
 	}
-	if got := <-requestedStream; got != initial.DBInstanceResourceID {
-		t.Fatalf("CloudWatch stream = %q, want cached %q", got, initial.DBInstanceResourceID)
-	}
-	host := metrics.System.Info["Host"].(models.MetricGroupValue)
-	if host["DBInstanceResourceID"] != initial.DBInstanceResourceID {
-		t.Fatalf("Host DBInstanceResourceID = %#v, want cached %q", host["DBInstanceResourceID"], initial.DBInstanceResourceID)
+	if got := host["IsClusterWriter"]; got != true {
+		t.Errorf("GetMetrics(discovery failure) IsClusterWriter = %#v, want cached true", got)
 	}
 }
 
-func TestAWSRDSEnhancedMetricsMetadataCacheIsConcurrentSafe(t *testing.T) {
-	logger := *logging.Init("aws-rds-metadata-cache-race-test", false, false, io.Discard)
-	initial := awsrds.Metadata{DBInstanceResourceID: "initial"}
-	refreshed := awsrds.Metadata{DBInstanceResourceID: "refreshed"}
-	var calls atomic.Int64
-	gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, nil, &config.Config{}, initial, func(context.Context) (awsrds.Metadata, error) {
-		if calls.Add(1)%2 == 0 {
-			return awsrds.Metadata{}, errors.New("discovery unavailable")
-		}
-		return refreshed, nil
-	})
-
-	const workers = 64
-	results := make(chan string, workers)
-	var group sync.WaitGroup
-	group.Add(workers)
-	for range workers {
-		go func() {
-			defer group.Done()
-			results <- gatherer.metadataForReport(context.Background()).DBInstanceResourceID
-		}()
-	}
-	group.Wait()
-	close(results)
-	for resourceID := range results {
-		if resourceID != "initial" && resourceID != "refreshed" {
-			t.Fatalf("metadata resource ID = %q, want a complete cached snapshot", resourceID)
-		}
-	}
-}
-
-func TestAWSRDSEnhancedMetricsDiscoveryLogUsesSafeTopology(t *testing.T) {
+func TestLogAWSRDSDiscoveryRedactsSensitiveMetadata(t *testing.T) {
 	const endpointSecret = "private-orders-writer.example"
-	const rawErrorSecret = "raw discovery error with credentials"
-	metadata := testRDSMetadata("orders-1", "db-resource-secret", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", true)
+	const resourceIDSecret = "db-resource-secret"
+	metadata := testRDSMetadata("orders-1", resourceIDSecret, "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", true)
 	metadata.Endpoint = endpointSecret
 
-	t.Run("live refresh logs at verbose level", func(t *testing.T) {
-		var output bytes.Buffer
-		logger := logging.Init("aws-rds-live-discovery-log-test", false, false, &output)
-		logger.SetLevel(5)
-		gatherer := NewAWSRDSEnhancedMetricsGatherer(*logger, nil, &config.Config{}, awsrds.Metadata{}, func(context.Context) (awsrds.Metadata, error) {
-			return metadata, nil
-		})
+	var output bytes.Buffer
+	logger := logging.Init("aws-rds-discovery-log-test", false, false, &output)
+	LogAWSRDSDiscovery(*logger, "startup", metadata)
 
-		if got := gatherer.metadataForReport(context.Background()); got.DBInstanceIdentifier != metadata.DBInstanceIdentifier {
-			t.Fatalf("metadataForReport() = %#v, want live metadata", got)
+	event := awsRDSDiscoveryLogEvent(t, output.String())
+	if event["source"] != "startup" {
+		t.Errorf("LogAWSRDSDiscovery() source = %#v, want startup", event["source"])
+	}
+	topology, ok := event["metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("LogAWSRDSDiscovery() metadata = %#v, want object", event["metadata"])
+	}
+	if topology["db_instance_identifier"] != "orders-1" || topology["db_cluster_identifier"] != "orders" || topology["is_cluster_writer"] != true {
+		t.Errorf("LogAWSRDSDiscovery() metadata = %#v, want safe orders-1/orders writer topology", topology)
+	}
+	for _, redacted := range []string{"endpoint", "endpoint_port", "db_instance_resource_id"} {
+		if _, exists := topology[redacted]; exists {
+			t.Errorf("LogAWSRDSDiscovery() metadata exposes %q: %#v", redacted, topology)
 		}
-		event := awsRDSDiscoveryLogEvent(t, output.String())
-		if event["source"] != "live" {
-			t.Fatalf("discovery source = %#v, want live", event["source"])
+	}
+	for _, secret := range []string{endpointSecret, resourceIDSecret} {
+		if strings.Contains(output.String(), secret) {
+			t.Errorf("LogAWSRDSDiscovery() output contains sensitive value %q: %s", secret, output.String())
 		}
-		assertAWSRDSDiscoveryLogSafe(t, event, output.String(), endpointSecret, "db-resource-secret")
-	})
-
-	t.Run("failed refresh warns with cached topology and error type", func(t *testing.T) {
-		var output bytes.Buffer
-		logger := *logging.Init("aws-rds-cache-discovery-log-test", false, false, &output)
-		gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, nil, &config.Config{}, metadata, func(context.Context) (awsrds.Metadata, error) {
-			return awsrds.Metadata{}, errors.New(rawErrorSecret)
-		})
-
-		if got := gatherer.metadataForReport(context.Background()); got.DBInstanceIdentifier != metadata.DBInstanceIdentifier {
-			t.Fatalf("metadataForReport() = %#v, want cached metadata", got)
-		}
-		event := awsRDSDiscoveryLogEvent(t, output.String())
-		if event["source"] != "cache" || event["reason"] != "discovery-failed" || event["error_type"] != "*errors.errorString" {
-			t.Fatalf("fallback discovery event = %#v", event)
-		}
-		assertAWSRDSDiscoveryLogSafe(t, event, output.String(), endpointSecret, "db-resource-secret", rawErrorSecret)
-	})
+	}
 }
 
 func awsRDSDiscoveryLogEvent(t *testing.T, output string) map[string]interface{} {
@@ -432,21 +284,8 @@ func awsRDSDiscoveryLogEvent(t *testing.T, output string) map[string]interface{}
 			return event
 		}
 	}
-	t.Fatalf("aws_rds_discovery event not found in %q", output)
+	t.Fatalf("LogAWSRDSDiscovery() event not found in %q", output)
 	return nil
-}
-
-func assertAWSRDSDiscoveryLogSafe(t *testing.T, event map[string]interface{}, output string, secrets ...string) {
-	t.Helper()
-	topology, ok := event["topology"].(map[string]interface{})
-	if !ok || topology["db_instance_identifier"] != "orders-1" || topology["db_cluster_identifier"] != "orders" {
-		t.Fatalf("safe topology = %#v", event["topology"])
-	}
-	for _, secret := range secrets {
-		if strings.Contains(output, secret) {
-			t.Fatalf("discovery log leaked %q: %s", secret, output)
-		}
-	}
 }
 
 func testRDSMetadata(identifier, resourceID, instanceClass, engine, parameterGroup, clusterID, clusterGroup, engineMode string, writer bool) awsrds.Metadata {

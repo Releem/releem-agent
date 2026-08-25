@@ -11,36 +11,19 @@ import (
 	"testing"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
-	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 	logging "github.com/google/logger"
 )
 
-func TestApplyAWSPlanUpdatesAuditAcrossPartialFailure(t *testing.T) {
+func TestApplyAWSPlanRecordsPartialFailure(t *testing.T) {
 	parameters := make([]types.Parameter, 0, 21)
-	audit := awsrds.NewApplyAudit(awsrds.Metadata{})
 	for index := 1; index <= 21; index++ {
-		name := fmt.Sprintf("p%02d", index)
 		parameters = append(parameters, types.Parameter{
-			ParameterName:  aws.String(name),
+			ParameterName:  aws.String(fmt.Sprintf("p%02d", index)),
 			ParameterValue: aws.String("submitted-value-must-not-appear-in-events"),
 		})
-		audit.Parameters = append(audit.Parameters, awsrds.ParameterAudit{
-			Scope:          awsrds.ScopeInstance,
-			Name:           name,
-			Group:          "instance-group",
-			SubmittedValue: aws.String("submitted-value-must-not-appear-in-events"),
-		})
 	}
-	audit.Parameters = append(audit.Parameters, awsrds.ParameterAudit{
-		Scope:          awsrds.ScopeCluster,
-		Name:           "cluster_p",
-		Group:          "cluster-group",
-		SubmittedValue: aws.String("submitted-value-must-not-appear-in-events"),
-	})
-
 	plan := awsrds.ApplyPlan{
 		Instance: awsrds.ScopePlan{Group: "instance-group", Parameters: parameters},
 		Cluster: awsrds.ScopePlan{Group: "cluster-group", Parameters: []types.Parameter{{
@@ -48,32 +31,27 @@ func TestApplyAWSPlanUpdatesAuditAcrossPartialFailure(t *testing.T) {
 		}}},
 	}
 	result := awsrds.ApplyResult{
-		Instance: newAWSApplyScopeResult(plan.Instance.Group),
-		Cluster:  newAWSApplyScopeResult(plan.Cluster.Group),
-		Audit:    audit,
+		Instance: awsrds.NewScopeResult(plan.Instance.Group),
+		Cluster:  awsrds.NewScopeResult(plan.Cluster.Group),
 	}
 	client := mysqlApplyClient(plan.Instance.Group)
 	client.instanceModifyErrors = map[int]error{2: errors.New("AWS request failed")}
 
-	_, err := applyAWSPlan(
-		context.Background(), client, plan, &result, testAWSApplyLogger(),
-		awsApplyTaskContext{TaskID: 41, TaskTypeID: 4},
-	)
+	waitRequest, err := applyAWSPlan(context.Background(), client, plan, &result, testAWSApplyLogger())
 	if err == nil {
 		t.Fatal("applyAWSPlan() error = nil, want second instance batch failure")
 	}
-
-	if got := auditRecord(t, &result.Audit, awsrds.ScopeInstance, "p01").Outcome; got != awsrds.OutcomeApplied {
-		t.Fatalf("p01 = %q", got)
+	if got, want := result.Instance.Applied, awsParameterNames(parameters[:20]); !reflect.DeepEqual(got, want) {
+		t.Fatalf("applied parameters = %#v, want %#v", got, want)
 	}
-	if got := auditRecord(t, &result.Audit, awsrds.ScopeInstance, "p21").Outcome; got != awsrds.OutcomeFailed {
-		t.Fatalf("p21 = %q", got)
+	if len(result.Instance.Failed) != 1 || !reflect.DeepEqual(result.Instance.Failed[0].Parameters, []string{"p21"}) {
+		t.Fatalf("instance failures = %#v, want p21 failure", result.Instance.Failed)
 	}
-	if got := auditRecord(t, &result.Audit, awsrds.ScopeCluster, "cluster_p").Reason; got != awsrds.ReasonPriorScopeFailure {
-		t.Fatalf("cluster reason = %q", got)
+	if len(result.Cluster.Applied) != 0 || len(result.Cluster.Failed) != 0 || len(client.clusterModifyCalls) != 0 {
+		t.Fatalf("cluster scope was attempted after instance failure: result=%#v calls=%#v", result.Cluster, client.clusterModifyCalls)
 	}
-	if batch := auditRecord(t, &result.Audit, awsrds.ScopeInstance, "p21").Batch; batch == nil || *batch != 2 {
-		t.Fatalf("batch = %#v", batch)
+	if got, want := awsParameterNames(waitRequest.Instance.Parameters), awsParameterNames(parameters[:20]); !reflect.DeepEqual(got, want) {
+		t.Fatalf("wait request parameters = %#v, want %#v", got, want)
 	}
 }
 
@@ -89,26 +67,16 @@ func TestAWSApplyPlanAndBatchLogsOmitValues(t *testing.T) {
 		}}},
 	}
 	result := awsrds.ApplyResult{
-		Instance: newAWSApplyScopeResult(plan.Instance.Group),
-		Cluster:  newAWSApplyScopeResult(plan.Cluster.Group),
-		Audit: awsrds.ApplyAudit{Parameters: []awsrds.ParameterAudit{
-			{Scope: awsrds.ScopeInstance, Name: "instance_p", Group: plan.Instance.Group, SubmittedValue: aws.String("submitted-secret")},
-			{Scope: awsrds.ScopeCluster, Name: "cluster_p", Group: plan.Cluster.Group, SubmittedValue: aws.String("another-submitted-secret")},
-		}},
+		Instance: awsrds.NewScopeResult(plan.Instance.Group),
+		Cluster:  awsrds.NewScopeResult(plan.Cluster.Group),
 	}
 
-	if _, err := applyAWSPlan(
-		context.Background(), mysqlApplyClient(plan.Instance.Group), plan, &result, logger,
-		awsApplyTaskContext{TaskID: 77, TaskTypeID: 4},
-	); err != nil {
+	if _, err := applyAWSPlan(context.Background(), mysqlApplyClient(plan.Instance.Group), plan, &result, logger); err != nil {
 		t.Fatalf("applyAWSPlan() error = %v", err)
 	}
 
 	events := decodeAWSApplyLogEvents(t, output.String())
 	planEvent := awsApplyLogEvent(t, events, "aws_rds_apply_plan")
-	if planEvent["task_id"] != float64(77) || planEvent["task_type_id"] != float64(4) {
-		t.Fatalf("plan correlation = %#v, want task 77/type 4", planEvent)
-	}
 	if _, ok := planEvent["instance"].(map[string]interface{}); !ok {
 		t.Fatalf("plan instance metadata = %#v, want group/names/count", planEvent["instance"])
 	}
@@ -117,7 +85,7 @@ func TestAWSApplyPlanAndBatchLogsOmitValues(t *testing.T) {
 	}
 
 	batchEvent := awsApplyLogEvent(t, events, "aws_rds_apply_batch")
-	if batchEvent["task_id"] != float64(77) || batchEvent["task_type_id"] != float64(4) || batchEvent["scope"] != string(awsrds.ScopeInstance) || batchEvent["group"] != "instance-group" || batchEvent["batch"] != float64(1) || batchEvent["outcome"] != string(awsrds.OutcomeApplied) {
+	if batchEvent["scope"] != string(awsrds.ScopeInstance) || batchEvent["group"] != "instance-group" || batchEvent["batch"] != float64(1) || batchEvent["outcome"] != string(awsrds.OutcomeApplied) {
 		t.Fatalf("instance batch event = %#v", batchEvent)
 	}
 	names, ok := batchEvent["names"].([]interface{})
@@ -126,45 +94,6 @@ func TestAWSApplyPlanAndBatchLogsOmitValues(t *testing.T) {
 	}
 	if strings.Contains(output.String(), "submitted-secret") || strings.Contains(output.String(), "another-submitted-secret") {
 		t.Fatalf("structured AWS apply events leaked submitted values: %q", output.String())
-	}
-}
-
-func TestAWSApplyAuditLog(t *testing.T) {
-	var output bytes.Buffer
-	logger := *logging.Init("task-apply-aws-audit-test", false, false, &output)
-	client := mysqlApplyClient("instance-custom")
-	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {
-		Parameters: []types.Parameter{modifiableAWSParameter("max_connections", "dynamic")},
-	}}
-	installAWSApplyTestDependencies(t, client, nil)
-
-	exitCode, status, taskOutput := applyConfAWSRDS(
-		&awsApplyRepeater{recommendations: `{"max_connections":"200"}`},
-		[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{"max_connections": "100"}}},
-		logger,
-		awsApplyConfig("instance-custom", ""),
-		AWSApplyAll,
-		awsApplyTaskContext{TaskID: 42, TaskTypeID: 4},
-	)
-	if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
-		t.Fatalf("applyConfAWSRDS() = exit %d status %d output %s", exitCode, status, taskOutput)
-	}
-
-	events := decodeAWSApplyLogEvents(t, output.String())
-	terminalEvents := awsApplyLogEvents(events, "aws_rds_apply_audit")
-	if len(terminalEvents) != 1 {
-		t.Fatalf("terminal audit events = %d, want exactly one; events=%#v", len(terminalEvents), events)
-	}
-	event := terminalEvents[0]
-	if event["task_id"] != float64(42) || event["task_type_id"] != float64(4) || event["task_status"] != float64(awsApplyTaskStatusSuccess) || event["task_exit_code"] != float64(awsApplyExitSuccess) {
-		t.Fatalf("terminal audit correlation/status = %#v", event)
-	}
-	audit, ok := event["audit"].(map[string]interface{})
-	if !ok || audit["schema_version"] != float64(awsrds.ApplyAuditSchemaVersion) {
-		t.Fatalf("terminal audit = %#v, want schema version %d", event["audit"], awsrds.ApplyAuditSchemaVersion)
-	}
-	if len(awsApplyLogEvents(events, "aws_rds_apply_wait")) != 1 {
-		t.Fatalf("wait events = %#v, want exactly one after modified scope", events)
 	}
 }
 
@@ -181,129 +110,36 @@ func TestAWSApplyPollingErrorPreservesUnresolvedScopes(t *testing.T) {
 	}
 }
 
-func TestAWSApplyWaitEventReportsPerScopeOutcomes(t *testing.T) {
+func TestAWSApplyWaitScopeOutcomes(t *testing.T) {
 	tests := []struct {
 		name       string
 		failed     awsrds.Scope
 		unresolved awsApplyModifiedScopes
-		want       map[string]interface{}
+		want       map[string]string
 	}{
 		{
 			name:       "instance completed before cluster failure",
 			failed:     awsrds.ScopeCluster,
 			unresolved: awsApplyModifiedScopes{Cluster: true},
-			want:       map[string]interface{}{"instance": "success", "cluster": "failed"},
+			want:       map[string]string{"instance": "success", "cluster": "failed"},
 		},
 		{
 			name:       "cluster completed before instance failure",
 			failed:     awsrds.ScopeInstance,
 			unresolved: awsApplyModifiedScopes{Instance: true},
-			want:       map[string]interface{}{"instance": "failed", "cluster": "success"},
+			want:       map[string]string{"instance": "failed", "cluster": "success"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var output bytes.Buffer
-			logger := *logging.Init("task-apply-aws-wait-outcome-test", false, false, &output)
 			err := newAWSApplyPollingError(tt.failed, tt.unresolved, errors.New("poll failed"))
-			logAWSApplyEvent(logger, "aws_rds_apply_wait", awsApplyWaitEventFields(
-				awsApplyModifiedScopes{Instance: true, Cluster: true},
-				err,
-				awsApplyTaskContext{TaskID: 42, TaskTypeID: 4},
-			))
-
-			event := awsApplyLogEvent(t, decodeAWSApplyLogEvents(t, output.String()), "aws_rds_apply_wait")
-			if !reflect.DeepEqual(event["scope_outcomes"], tt.want) {
-				t.Fatalf("scope outcomes = %#v, want %#v; event=%#v", event["scope_outcomes"], tt.want, event)
+			got := awsApplyWaitScopeOutcomes(awsApplyModifiedScopes{Instance: true, Cluster: true}, err)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("scope outcomes = %#v, want %#v", got, tt.want)
 			}
 		})
 	}
-}
-
-func TestVerifyAWSAppliedParameters(t *testing.T) {
-	tests := []struct {
-		name         string
-		applyMethod  types.ApplyMethod
-		readback     map[string]awsrds.ParameterInfo
-		readbackErr  error
-		wantObserved *string
-		wantStatus   awsrds.VerificationStatus
-		wantReason   string
-	}{
-		{"immediate match", types.ApplyMethodImmediate, parameterMap("p", "200"), nil, aws.String("200"), awsrds.VerificationMatched, ""},
-		{"mismatch", types.ApplyMethodImmediate, parameterMap("p", "199"), nil, aws.String("199"), awsrds.VerificationMismatched, ""},
-		{"static match", types.ApplyMethodPendingReboot, parameterMap("p", "200"), nil, aws.String("200"), awsrds.VerificationPendingReboot, ""},
-		{"API failure", types.ApplyMethodImmediate, nil, errors.New("unavailable"), nil, awsrds.VerificationUnavailable, awsrds.ReasonReadbackFailed},
-		{"missing parameter", types.ApplyMethodImmediate, map[string]awsrds.ParameterInfo{}, nil, nil, awsrds.VerificationUnavailable, awsrds.ReasonReadbackParameterMissing},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			originalReadback := readAWSAppliedParameters
-			readbackCalls := 0
-			readAWSAppliedParameters = func(_ context.Context, _ awsrds.ParameterReader, scope awsrds.Scope, plan awsrds.ScopePlan) (map[string]awsrds.ParameterInfo, error) {
-				readbackCalls++
-				if scope != awsrds.ScopeInstance || plan.Group != "instance-group" {
-					t.Fatalf("readback scope/group = %q/%q, want instance/instance-group", scope, plan.Group)
-				}
-				return tt.readback, tt.readbackErr
-			}
-			t.Cleanup(func() {
-				readAWSAppliedParameters = originalReadback
-			})
-
-			request := awsApplyWaitRequest{
-				Instance: awsrds.ScopePlan{
-					Group: "instance-group",
-					Parameters: []types.Parameter{{
-						ParameterName:  aws.String("p"),
-						ParameterValue: aws.String("200"),
-						ApplyMethod:    tt.applyMethod,
-					}},
-				},
-			}
-			audit := awsrds.ApplyAudit{Parameters: []awsrds.ParameterAudit{{
-				Scope:              awsrds.ScopeInstance,
-				Name:               "p",
-				Group:              "instance-group",
-				SubmittedValue:     aws.String("200"),
-				ApplyMethod:        string(tt.applyMethod),
-				Outcome:            awsrds.OutcomeApplied,
-				VerificationStatus: awsrds.VerificationNotApplicable,
-			}}}
-
-			verifyAWSAppliedParameters(
-				context.Background(), mysqlApplyClient("instance-group"), request,
-				&audit, testAWSApplyLogger(),
-			)
-
-			record := auditRecord(t, &audit, awsrds.ScopeInstance, "p")
-			if !reflect.DeepEqual(record.ObservedAfter, tt.wantObserved) || record.VerificationStatus != tt.wantStatus || record.Reason != tt.wantReason {
-				t.Fatalf("verification = observed %#v status %q reason %q, want %#v/%q/%q", record.ObservedAfter, record.VerificationStatus, record.Reason, tt.wantObserved, tt.wantStatus, tt.wantReason)
-			}
-			if readbackCalls != 1 {
-				t.Fatalf("readback calls = %d, want one for the modified scope", readbackCalls)
-			}
-		})
-	}
-}
-
-func parameterMap(name, value string) map[string]awsrds.ParameterInfo {
-	return map[string]awsrds.ParameterInfo{
-		name: {Name: name, ParameterValue: value, HasParameterValue: true},
-	}
-}
-
-func auditRecord(t *testing.T, audit *awsrds.ApplyAudit, scope awsrds.Scope, name string) *awsrds.ParameterAudit {
-	t.Helper()
-	for index := range audit.Parameters {
-		if audit.Parameters[index].Scope == scope && audit.Parameters[index].Name == name {
-			return &audit.Parameters[index]
-		}
-	}
-	t.Fatalf("audit record %s/%s not found", scope, name)
-	return nil
 }
 
 func decodeAWSApplyLogEvents(t *testing.T, output string) []map[string]interface{} {

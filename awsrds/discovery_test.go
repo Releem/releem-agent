@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
@@ -326,18 +325,14 @@ func TestMetadataHelpers(t *testing.T) {
 		metadata         Metadata
 		wantAurora       bool
 		wantDatabaseType string
-		wantMysqlHost    string
-		wantPgHost       string
-		wantMysqlPort    string
-		wantPgPort       string
 	}{
-		{name: "ordinary MySQL", metadata: Metadata{Engine: "mysql", Endpoint: "mysql.example", EndpointPort: 3307}, wantDatabaseType: "mysql", wantMysqlHost: "mysql.example", wantPgHost: "keep-pg", wantMysqlPort: "3307"},
-		{name: "ordinary MariaDB", metadata: Metadata{Engine: "mariadb", Endpoint: "maria.example"}, wantDatabaseType: "mysql", wantMysqlHost: "maria.example", wantPgHost: "keep-pg"},
-		{name: "Aurora MySQL", metadata: Metadata{Engine: "aurora-mysql", Endpoint: "aurora-mysql.example"}, wantAurora: true, wantDatabaseType: "mysql", wantMysqlHost: "aurora-mysql.example", wantPgHost: "keep-pg"},
-		{name: "legacy Aurora engine", metadata: Metadata{Engine: "aurora", Endpoint: "aurora.example"}, wantAurora: true, wantDatabaseType: "mysql", wantMysqlHost: "aurora.example", wantPgHost: "keep-pg"},
-		{name: "ordinary PostgreSQL", metadata: Metadata{Engine: "postgres", Endpoint: "postgres.example", EndpointPort: 5433}, wantDatabaseType: "postgresql", wantMysqlHost: "keep-mysql", wantPgHost: "postgres.example", wantPgPort: "5433"},
-		{name: "Aurora PostgreSQL", metadata: Metadata{Engine: "aurora-postgresql", Endpoint: "aurora-pg.example"}, wantAurora: true, wantDatabaseType: "postgresql", wantMysqlHost: "keep-mysql", wantPgHost: "aurora-pg.example"},
-		{name: "unsupported engine", metadata: Metadata{Engine: "oracle-ee", Endpoint: "oracle.example"}, wantMysqlHost: "keep-mysql", wantPgHost: "keep-pg"},
+		{name: "ordinary MySQL", metadata: Metadata{Engine: "mysql", Endpoint: "mysql.example", EndpointPort: 3307}, wantDatabaseType: "mysql"},
+		{name: "ordinary MariaDB", metadata: Metadata{Engine: "mariadb", Endpoint: "maria.example"}, wantDatabaseType: "mysql"},
+		{name: "Aurora MySQL", metadata: Metadata{Engine: "aurora-mysql", Endpoint: "aurora-mysql.example"}, wantAurora: true, wantDatabaseType: "mysql"},
+		{name: "legacy Aurora engine", metadata: Metadata{Engine: "aurora", Endpoint: "aurora.example"}, wantAurora: true, wantDatabaseType: "mysql"},
+		{name: "ordinary PostgreSQL", metadata: Metadata{Engine: "postgres", Endpoint: "postgres.example", EndpointPort: 5433}, wantDatabaseType: "postgresql"},
+		{name: "Aurora PostgreSQL", metadata: Metadata{Engine: "aurora-postgresql", Endpoint: "aurora-pg.example"}, wantAurora: true, wantDatabaseType: "postgresql"},
+		{name: "unsupported engine", metadata: Metadata{Engine: "oracle-ee", Endpoint: "oracle.example"}},
 	}
 
 	for _, tt := range tests {
@@ -350,32 +345,8 @@ func TestMetadataHelpers(t *testing.T) {
 			if got := tt.metadata.DatabaseType(); got != tt.wantDatabaseType {
 				t.Fatalf("Metadata.DatabaseType() = %q, want %q", got, tt.wantDatabaseType)
 			}
-
-			wantMysqlPort := tt.wantMysqlPort
-			if wantMysqlPort == "" {
-				wantMysqlPort = "keep-mysql-port"
-			}
-			wantPgPort := tt.wantPgPort
-			if wantPgPort == "" {
-				wantPgPort = "keep-pg-port"
-			}
-			cfg := &config.Config{
-				MysqlHost: "keep-mysql",
-				MysqlPort: "keep-mysql-port",
-				PgHost:    "keep-pg",
-				PgPort:    "keep-pg-port",
-			}
-			tt.metadata.ApplyEndpoint(cfg)
-			if cfg.MysqlHost != tt.wantMysqlHost || cfg.PgHost != tt.wantPgHost {
-				t.Fatalf("Metadata.ApplyEndpoint() hosts = (%q, %q), want (%q, %q)", cfg.MysqlHost, cfg.PgHost, tt.wantMysqlHost, tt.wantPgHost)
-			}
-			if cfg.MysqlPort != wantMysqlPort || cfg.PgPort != wantPgPort {
-				t.Fatalf("Metadata.ApplyEndpoint() ports = (%q, %q), want (%q, %q)", cfg.MysqlPort, cfg.PgPort, wantMysqlPort, wantPgPort)
-			}
 		})
 	}
-
-	Metadata{Engine: "mysql", Endpoint: "mysql.example"}.ApplyEndpoint(nil)
 }
 
 func equalStrings(got, want []string) bool {

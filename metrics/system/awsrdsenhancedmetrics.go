@@ -256,11 +256,10 @@ func logAWSRDSDiscoveryFallback(logger logging.Logger, metadata awsrds.Metadata,
 }
 
 func marshalAWSRDSDiscoveryEvent(source string, metadata awsrds.Metadata, extra map[string]interface{}) (string, error) {
-	audit := awsrds.NewApplyAudit(metadata)
 	payload := map[string]interface{}{
 		"event":    "aws_rds_discovery",
 		"source":   source,
-		"topology": audit.Topology,
+		"metadata": metadata.LogFields(),
 	}
 	for name, value := range extra {
 		payload[name] = value

@@ -20,30 +20,13 @@ import (
 
 func ProcessRepeaters(metrics *models.Metrics, repeaters models.MetricsRepeater,
 	configuration *config.Config, logger logging.Logger, Mode models.ModeType) string {
-	result, err := ProcessRepeatersWithError(metrics, repeaters, configuration, logger, Mode)
+	defer HandlePanic(configuration, logger)
+
+	result, err := repeaters.ProcessMetrics(configuration, *metrics, Mode)
 	if err != nil {
 		logger.Error("Repeater failed ", err)
 	}
 	return result
-}
-
-// ProcessRepeatersWithError processes one repeater request while preserving
-// panic reporting and returning both ordinary errors and recovered panics.
-func ProcessRepeatersWithError(
-	metrics *models.Metrics,
-	repeaters models.MetricsRepeater,
-	configuration *config.Config,
-	logger logging.Logger,
-	mode models.ModeType,
-) (result string, returnErr error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			reportPanic(configuration, logger, recovered)
-			returnErr = fmt.Errorf("repeater panic: %v", recovered)
-		}
-	}()
-
-	return repeaters.ProcessMetrics(configuration, *metrics, mode)
 }
 
 func CollectMetrics(gatherers []models.MetricsGatherer, logger logging.Logger, configuration *config.Config) *models.Metrics {
@@ -61,15 +44,11 @@ func CollectMetrics(gatherers []models.MetricsGatherer, logger logging.Logger, c
 
 func HandlePanic(configuration *config.Config, logger logging.Logger) {
 	if r := recover(); r != nil {
-		reportPanic(configuration, logger, r)
+		err := errors.WithStack(fmt.Errorf("%v", r))
+		logger.Infof("%+v", err)
+		sender := e.NewReleemErrorsRepeater(configuration, logger)
+		sender.ProcessErrors(fmt.Sprintf("%+v", err))
 	}
-}
-
-func reportPanic(configuration *config.Config, logger logging.Logger, recovered any) {
-	err := errors.WithStack(fmt.Errorf("%v", recovered))
-	logger.Infof("%+v", err)
-	sender := e.NewReleemErrorsRepeater(configuration, logger)
-	sender.ProcessErrors(fmt.Sprintf("%+v", err))
 }
 
 func MapJoin(map1, map2 models.MetricGroupValue) models.MetricGroupValue {

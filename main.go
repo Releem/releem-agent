@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strconv"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Releem/daemon"
@@ -124,7 +125,19 @@ func (programm *Programm) Run() {
 		system.LogAWSRDSDiscovery(logger, "startup", metadata)
 
 		configuration.Hostname = configuration.AwsRDSDB
-		metadata.ApplyEndpoint(configuration)
+		switch metadata.DatabaseType() {
+		case "mysql":
+			configuration.MysqlHost = metadata.Endpoint
+			if metadata.EndpointPort > 0 {
+				configuration.MysqlPort = strconv.FormatInt(int64(metadata.EndpointPort), 10)
+			}
+		case "postgresql":
+			configuration.PgHost = metadata.Endpoint
+			if metadata.EndpointPort > 0 {
+				configuration.PgPort = strconv.FormatInt(int64(metadata.EndpointPort), 10)
+			}
+		}
+
 		gatherers["default"] = append(gatherers["default"], system.NewAWSRDSEnhancedMetricsGatherer(
 			logger,
 			cwlogsclient,

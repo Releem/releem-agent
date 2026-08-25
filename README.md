@@ -63,11 +63,17 @@ To start using Releem just sign up at [https://releem.com](https://releem.com/?u
 ### Aurora parameter groups
 
 Releem supports Amazon Aurora MySQL and Aurora PostgreSQL. Configure one Agent
-for each DB instance endpoint. In the CloudFormation templates,
-`DBClusterParameterGroup` is optional; set it when the Aurora cluster has a
-separate cluster parameter group to auto-apply. Run the Agent that targets the
-writer instance with `rds:ModifyDBClusterParameterGroup` permission so cluster
-parameters can be auto-applied.
+for each DB instance endpoint. Aurora onboarding requires both a custom DB
+parameter group for the instance and a custom DB cluster parameter group for
+the cluster. Their configured names must match the groups attached in AWS, and
+both groups must be ready before the Agent applies recommendations. This is
+required because a recommendation can target either parameter group. Only the
+Agent that targets the writer modifies cluster parameters, so it must have
+`rds:ModifyDBClusterParameterGroup` permission.
+
+For a non-Aurora RDS instance, only the DB parameter group is required; leave
+`DBClusterParameterGroup` empty. AWS-managed default groups cannot be modified
+and are not valid Aurora onboarding targets.
 
 `DatabaseType` defaults to `mysql`, preserving existing RDS and Aurora MySQL
 stacks. Select `postgresql` for Aurora PostgreSQL. The same `DBUser`,

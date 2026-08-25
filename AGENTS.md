@@ -18,6 +18,12 @@ Primary areas include:
 
 - Preserve backward-compatible install and apply behavior. Existing Linux and
   Windows command-line flows are production-sensitive.
+- For Aurora onboarding, require both a custom DB instance parameter group and
+  a custom DB cluster parameter group. Both configured names must match the
+  groups attached in AWS, and both groups must be ready before apply, including
+  on readers. Only a writer may mutate the cluster group. A missing, default,
+  mismatched, or not-ready group is an apply error; do not weaken these checks
+  under the non-Aurora RDS compatibility contract.
 - Do not edit built binaries or generated packages unless the task explicitly
   targets release artifacts: `releem-agent-*` files and on-premise binary copies.
 - Do not edit secrets or local config files unless asked: `.keys/`, `releem.conf`,
@@ -75,6 +81,8 @@ cd tests
 ## Review Checklist
 
 - Does the change preserve existing install/apply flags and output contracts?
+- For Aurora, are both custom parameter groups configured, attached, matched,
+  and ready before apply, while cluster mutation remains writer-only?
 - Are Linux and Windows paths still equivalent where intended?
 - Are built binaries, secrets, and local configs untouched?
 - Is the relevant OS/DB behavior covered by Go, Bats, or e2e tests?

@@ -43,10 +43,10 @@ Parameters:
       - "false"
     Default: "false"
   DBParameterGroup:
-    Description: The Parameter group name.
+    Description: Custom DB parameter group name. Required for RDS and Aurora instance parameters.
     Type: String    
   DBClusterParameterGroup:
-    Description: Optional Aurora DB cluster parameter group name.
+    Description: Custom DB cluster parameter group attached to Aurora. Required for Aurora; leave empty only for non-Aurora RDS.
     Type: String
     Default: ""
   ClusterName:
