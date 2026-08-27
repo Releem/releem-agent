@@ -28,14 +28,17 @@ func (DBInfo *DBInfoGatherer) GetMetrics(metrics *models.Metrics) error {
 		metrics.DB.Info = make(models.MetricGroupValue)
 	}
 
-	if pgHBA := DBInfo.collectPgHBA(); pgHBA != nil {
+	pgHBA := DBInfo.collectPgHBA()
+	if pgHBA != nil {
 		metrics.DB.Info["pg_hba"] = pgHBA
-
 	}
 
 	metrics.DB.Info["Extensions"] = DBInfo.collectExtensions()
 	metrics.DB.Info["Users"] = DBInfo.collectUsers()
-	metrics.DB.Info["UsersSecurityCheck"] = DBInfo.collectUsersSecurityCheck(metrics)
+	// pg_hba entries are handed over directly: reading them back out of the
+	// metrics map made the check silently depend on both the map key and the
+	// order of these calls.
+	metrics.DB.Info["UsersSecurityCheck"] = DBInfo.collectUsersSecurityCheck(metrics, pgHBA)
 	metrics.DB.Info["PublicSchemaPermissions"] = DBInfo.collectPublicSchemaPermissions()
 	metrics.DB.Info["RLS"] = DBInfo.collectRLSInfo()
 
@@ -147,17 +150,16 @@ func (DBInfo *DBInfoGatherer) collectUsers() []models.MetricGroupValue {
 	return output
 }
 
-func (DBInfo *DBInfoGatherer) collectUsersSecurityCheck(metrics *models.Metrics) []models.MetricGroupValue {
+// collectUsersSecurityCheck flags roles that are reachable remotely with
+// superuser rights. pgHBAEntries may be nil when the rules could not be read,
+// in which case no role can be proven remotely reachable and the check reports
+// no finding rather than guessing.
+func (DBInfo *DBInfoGatherer) collectUsersSecurityCheck(metrics *models.Metrics, pgHBAEntries []models.MetricGroupValue) []models.MetricGroupValue {
 	usersCheck := []models.MetricGroupValue{}
 
 	users, ok := metrics.DB.Info["Users"].([]models.MetricGroupValue)
 	if !ok || len(users) == 0 {
 		return usersCheck
-	}
-
-	pgHBAEntries, ok := metrics.DB.Conf.Variables["pg_hba"].([]models.MetricGroupValue)
-	if !ok {
-		pgHBAEntries = []models.MetricGroupValue{}
 	}
 
 	for _, user := range users {
@@ -217,6 +219,20 @@ func (DBInfo *DBInfoGatherer) collectRLSInfo() bool {
 	return enabled
 }
 
+// pgHBARulesUnavailable reports whether pg_hba_file_rules could not be read for
+// an expected reason rather than a fault, so the miss is logged as a warning and
+// the rest of the report is still delivered. Managed providers such as
+// Aurora/RDS own the view with an internal role (rdsadmin) that cannot delegate
+// access to a customer monitoring role, and PostgreSQL below 10 has no such view
+// at all.
+func pgHBARulesUnavailable(err error) bool {
+	const (
+		insufficientPrivilege = "42501"
+		undefinedTable        = "42P01"
+	)
+	return hasPgErrorCode(err, insufficientPrivilege) || hasPgErrorCode(err, undefinedTable)
+}
+
 func (DBInfo *DBInfoGatherer) collectPgHBA() []models.MetricGroupValue {
 	output := []models.MetricGroupValue{}
 
@@ -231,6 +247,9 @@ func (DBInfo *DBInfoGatherer) collectPgHBA() []models.MetricGroupValue {
 		FROM pg_hba_file_rules
 		ORDER BY line_number`)
 	if err != nil {
+		if pgHBARulesUnavailable(err) {
+			return nil
+		}
 		DBInfo.logger.Error(err)
 		return nil
 	}

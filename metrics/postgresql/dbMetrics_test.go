@@ -3,9 +3,12 @@ package postgresql
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 )
 
 type pgDatabaseLifecycleTestConnection struct {
@@ -111,5 +114,71 @@ func TestDbMetricsUsesCapabilityInfoRelation(t *testing.T) {
 	if !strings.Contains(code, "capabilities.PgStatStatementsInfoRelation") ||
 		!strings.Contains(code, `FROM "+capabilities.PgStatStatementsInfoRelation`) {
 		t.Fatal("pg_stat_statements_info query must use the centrally detected extension relation")
+	}
+}
+
+func TestIsPGManagedInternalDatabase(t *testing.T) {
+	tests := []struct {
+		name     string
+		database string
+		want     bool
+	}{
+		{name: "AWS Aurora/RDS maintenance database", database: "rdsadmin", want: true},
+		{name: "GCP Cloud SQL maintenance database", database: "cloudsqladmin", want: true},
+		{name: "Azure maintenance database", database: "azure_maintenance", want: true},
+		{name: "case and padding are ignored", database: "  RDSAdmin ", want: true},
+		{name: "customer database is collected", database: "app", want: false},
+		{name: "default postgres database is collected", database: "postgres", want: false},
+		{name: "similar customer name is not skipped", database: "rdsadmin_reports", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPGManagedInternalDatabase(tt.database); got != tt.want {
+				t.Fatalf("isPGManagedInternalDatabase(%q) = %t, want %t", tt.database, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPgHBARulesUnavailable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "Aurora denies the rdsadmin-owned view",
+			err:  &pq.Error{Code: "42501", Message: `permission denied for view pg_hba_file_rules`},
+			want: true,
+		},
+		{
+			name: "PostgreSQL below 10 has no such view",
+			err:  &pq.Error{Code: "42P01", Message: `relation "pg_hba_file_rules" does not exist`},
+			want: true,
+		},
+		{
+			name: "wrapped permission error is still recognised",
+			err:  fmt.Errorf("collect pg_hba: %w", &pq.Error{Code: "42501"}),
+			want: true,
+		},
+		{
+			name: "a real query fault must stay an error",
+			err:  &pq.Error{Code: "57014", Message: "canceling statement due to statement timeout"},
+			want: false,
+		},
+		{
+			name: "a non-PostgreSQL error must stay an error",
+			err:  errors.New("connection reset by peer"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pgHBARulesUnavailable(tt.err); got != tt.want {
+				t.Fatalf("pgHBARulesUnavailable(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
 	}
 }
