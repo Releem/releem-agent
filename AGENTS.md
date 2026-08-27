@@ -16,14 +16,18 @@ Primary areas include:
 
 ## Working Rules
 
-- Preserve backward-compatible install and apply behavior. Existing Linux and
-  Windows command-line flows are production-sensitive.
-- For Aurora onboarding, require both a custom DB instance parameter group and
-  a custom DB cluster parameter group. Both configured names must match the
-  groups attached in AWS, and both groups must be ready before apply, including
-  on readers. Only a writer may mutate the cluster group. A missing, default,
-  mismatched, or not-ready group is an apply error; do not weaken these checks
-  under the non-Aurora RDS compatibility contract.
+- Preserve documented install and apply behavior. Existing Linux and Windows
+  command-line flows are production-sensitive. AWS apply exit codes are
+  scope-specific: instance parameter-group readiness/mismatch use `2`/`3`, and
+  cluster parameter-group readiness/mismatch use `4`/`5`; keep scope details in
+  the JSON output as well.
+- For Aurora apply, always require the attached DB cluster parameter group to
+  be ready, including for readers and instance-only recommendations. Require
+  the configured DB cluster parameter group to be custom and to match the
+  attached group when cluster classification is needed. Only a writer may
+  mutate the cluster group. Always require the configured DB instance parameter
+  group to be custom, attached, matched, and ready before apply. Keep the
+  non-Aurora RDS path independent from cluster-group validation.
 - Do not edit built binaries or generated packages unless the task explicitly
   targets release artifacts: `releem-agent-*` files and on-premise binary copies.
 - Do not edit secrets or local config files unless asked: `.keys/`, `releem.conf`,
@@ -80,9 +84,12 @@ cd tests
 
 ## Review Checklist
 
-- Does the change preserve existing install/apply flags and output contracts?
-- For Aurora, are both custom parameter groups configured, attached, matched,
-  and ready before apply, while cluster mutation remains writer-only?
+- Does the change preserve documented install/apply flags and scope-specific
+  output contracts, including instance exit codes `2`/`3` and cluster exit
+  codes `4`/`5`?
+- For Aurora, is the attached cluster group always ready; is its configured
+  custom name required and matched when cluster classification is needed; and
+  does cluster mutation remain writer-only?
 - Are Linux and Windows paths still equivalent where intended?
 - Are built binaries, secrets, and local configs untouched?
 - Is the relevant OS/DB behavior covered by Go, Bats, or e2e tests?
