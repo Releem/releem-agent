@@ -102,12 +102,15 @@ func TestBuildTopologyFromFactsDetectsAsyncReplica(t *testing.T) {
 	topology := BuildTopologyFromFacts(TopologyFacts{
 		Variables: map[string]interface{}{
 			"server_uuid":     "replica-uuid",
+			"hostname":        "db-replica.example.com",
+			"port":            "3307",
 			"read_only":       "ON",
 			"super_read_only": "ON",
 		},
 		ReplicaStatus: []map[string]interface{}{
 			{
 				"Source_Host":           "db-primary.example.com",
+				"Source_Port":           "3308",
 				"Source_UUID":           "primary-uuid",
 				"Replica_IO_Running":    "Yes",
 				"Replica_SQL_Running":   "Yes",
@@ -131,6 +134,12 @@ func TestBuildTopologyFromFactsDetectsAsyncReplica(t *testing.T) {
 	if topology["PrimaryHost"] != "db-primary.example.com" {
 		t.Fatalf("expected primary host, got %#v", topology["PrimaryHost"])
 	}
+	if topology["MemberHost"] != "db-replica.example.com" || topology["MemberPort"] != int64(3307) {
+		t.Fatalf("BuildTopologyFromFacts(async) member endpoint = %#v:%#v, want db-replica.example.com:3307", topology["MemberHost"], topology["MemberPort"])
+	}
+	if topology["PrimaryPort"] != int64(3308) {
+		t.Fatalf("BuildTopologyFromFacts(async) PrimaryPort = %#v, want 3308", topology["PrimaryPort"])
+	}
 	if topology["ReplicationLagSeconds"] != int64(3) {
 		t.Fatalf("expected lag 3, got %#v", topology["ReplicationLagSeconds"])
 	}
@@ -139,6 +148,11 @@ func TestBuildTopologyFromFactsDetectsAsyncReplica(t *testing.T) {
 	}
 	if topology["IsWriter"] != false {
 		t.Fatalf("expected replica not to be writer, got %#v", topology["IsWriter"])
+	}
+	facts := topology["Facts"].(models.MetricGroupValue)
+	channels := facts["ReplicaChannels"].([]models.MetricGroupValue)
+	if channels[0]["Source_Port"] != "3308" {
+		t.Fatalf("BuildTopologyFromFacts(async) channel Source_Port = %#v, want 3308", channels[0]["Source_Port"])
 	}
 }
 
@@ -376,10 +390,49 @@ func TestAsyncReplicaGroupKeyUsesFixedLengthDigest(t *testing.T) {
 	}
 }
 
+func TestBuildTopologyFromFactsDistinguishesDuplicateMariaDBServerIDsByEndpoint(t *testing.T) {
+	channels := []map[string]interface{}{
+		{
+			"Master_Server_Id":      "11",
+			"Master_Host":           "db-b.example.com",
+			"Master_Port":           "3307",
+			"Slave_IO_Running":      "Yes",
+			"Slave_SQL_Running":     "Yes",
+			"Seconds_Behind_Master": "0",
+		},
+		{
+			"Master_Server_Id":      "11",
+			"Master_Host":           "db-a.example.com",
+			"Master_Port":           "3306",
+			"Slave_IO_Running":      "Yes",
+			"Slave_SQL_Running":     "Yes",
+			"Seconds_Behind_Master": "0",
+		},
+	}
+
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables:     map[string]interface{}{"server_id": "22"},
+		ReplicaStatus: channels,
+	})
+	reversed := BuildTopologyFromFacts(TopologyFacts{
+		Variables:     map[string]interface{}{"server_id": "22"},
+		ReplicaStatus: []map[string]interface{}{channels[1], channels[0]},
+	})
+
+	if topology["GroupKey"] == "11" || topology["GroupKey"] != reversed["GroupKey"] {
+		t.Fatalf("BuildTopologyFromFacts(duplicate server IDs) GroupKey = %#v, reversed = %#v; want stable multi-source digest", topology["GroupKey"], reversed["GroupKey"])
+	}
+	if topology["PrimaryHost"] != "db-a.example.com" || topology["PrimaryPort"] != int64(3306) {
+		t.Fatalf("BuildTopologyFromFacts(duplicate server IDs) selected endpoint = %#v:%#v, want db-a.example.com:3306", topology["PrimaryHost"], topology["PrimaryPort"])
+	}
+}
+
 func TestBuildTopologyFromFactsDetectsGroupReplicationPrimary(t *testing.T) {
 	topology := BuildTopologyFromFacts(TopologyFacts{
 		Variables: map[string]interface{}{
 			"server_uuid":                           "member-1",
+			"hostname":                              "db1-variable.example.com",
+			"port":                                  "3306",
 			"group_replication_group_name":          "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 			"group_replication_single_primary_mode": "ON",
 			"read_only":                             "OFF",
@@ -387,13 +440,15 @@ func TestBuildTopologyFromFactsDetectsGroupReplicationPrimary(t *testing.T) {
 		GroupMembers: []map[string]interface{}{
 			{
 				"MEMBER_ID":    "member-1",
-				"MEMBER_HOST":  "db1",
+				"MEMBER_HOST":  "db1.example.com",
+				"MEMBER_PORT":  "3307",
 				"MEMBER_STATE": "ONLINE",
 				"MEMBER_ROLE":  "PRIMARY",
 			},
 			{
 				"MEMBER_ID":    "member-2",
 				"MEMBER_HOST":  "db2",
+				"MEMBER_PORT":  "3308",
 				"MEMBER_STATE": "ONLINE",
 				"MEMBER_ROLE":  "SECONDARY",
 			},
@@ -411,6 +466,12 @@ func TestBuildTopologyFromFactsDetectsGroupReplicationPrimary(t *testing.T) {
 	}
 	if topology["PrimaryMemberKey"] != "member-1" {
 		t.Fatalf("expected primary member key, got %#v", topology["PrimaryMemberKey"])
+	}
+	if topology["MemberHost"] != "db1.example.com" || topology["MemberPort"] != int64(3307) {
+		t.Fatalf("BuildTopologyFromFacts(group replication) member endpoint = %#v:%#v, want db1.example.com:3307", topology["MemberHost"], topology["MemberPort"])
+	}
+	if topology["PrimaryHost"] != "db1.example.com" || topology["PrimaryPort"] != int64(3307) {
+		t.Fatalf("BuildTopologyFromFacts(group replication) primary endpoint = %#v:%#v, want db1.example.com:3307", topology["PrimaryHost"], topology["PrimaryPort"])
 	}
 	if topology["IsWriter"] != true {
 		t.Fatalf("expected primary writer, got %#v", topology["IsWriter"])
@@ -446,8 +507,8 @@ func TestBuildTopologyFromFactsInfersGroupReplicationPrimaryWhenMembersUnavailab
 	if topology["IsWriter"] != false {
 		t.Fatalf("expected unknown replication state not to advertise writer availability, got %#v", topology["IsWriter"])
 	}
-	if topology["IsReader"] != true {
-		t.Fatalf("expected inferred group replication primary to serve reads, got %#v", topology["IsReader"])
+	if topology["IsReader"] != false {
+		t.Fatalf("expected unknown replication state not to advertise reader availability, got %#v", topology["IsReader"])
 	}
 }
 
@@ -775,6 +836,8 @@ func TestBuildTopologyFromFactsReturnsStandaloneForNoReplicationFacts(t *testing
 	topology := BuildTopologyFromFacts(TopologyFacts{
 		Variables: map[string]interface{}{
 			"server_uuid": "standalone-uuid",
+			"hostname":    "standalone.example.com",
+			"port":        "3310",
 			"read_only":   "OFF",
 		},
 	})
@@ -787,6 +850,9 @@ func TestBuildTopologyFromFactsReturnsStandaloneForNoReplicationFacts(t *testing
 	}
 	if topology["IsWriter"] != true {
 		t.Fatalf("expected standalone writer, got %#v", topology["IsWriter"])
+	}
+	if topology["MemberHost"] != "standalone.example.com" || topology["MemberPort"] != int64(3310) {
+		t.Fatalf("BuildTopologyFromFacts(standalone) member endpoint = %#v:%#v, want standalone.example.com:3310", topology["MemberHost"], topology["MemberPort"])
 	}
 }
 

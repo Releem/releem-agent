@@ -655,6 +655,7 @@ ORDER BY nspname;"; then
 }
 
 function create_mysql_user() {
+    local mysql_server_version
     printf "\033[37m\n * Configuring the MySQL user for metrics collection.\033[0m\n"
     FLAG_SUCCESS=0
     if [ -n "$RELEEM_MYSQL_PASSWORD" ] && [ -n "$RELEEM_MYSQL_LOGIN" ]; then
@@ -678,12 +679,15 @@ function create_mysql_user() {
             mysql_root_exec "CREATE USER '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}' identified by '${RELEEM_MYSQL_PASSWORD}';"
             mysql_root_exec "GRANT PROCESS ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"
             mysql_root_exec "GRANT REPLICATION CLIENT ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"
-            if mysql_root_exec "GRANT REPLICA MONITOR ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
-            then
-                echo "Successfully GRANT" > /dev/null
-            elif mysql_root_exec "GRANT REPLICATION SLAVE ADMIN ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
-            then
-                echo "Successfully GRANT" > /dev/null
+            mysql_server_version=$(mysql_root_exec "SELECT VERSION();" 2>/dev/null || true)
+            if [[ "${mysql_server_version}" == *MariaDB* ]]; then
+                if mysql_root_exec "GRANT REPLICA MONITOR ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
+                then
+                    echo "Successfully GRANT" > /dev/null
+                elif mysql_root_exec "GRANT REPLICATION SLAVE ADMIN ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
+                then
+                    echo "Successfully GRANT" > /dev/null
+                fi
             fi
             mysql_root_exec "GRANT SHOW VIEW ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"
             mysql_root_exec "GRANT SELECT ON mysql.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"

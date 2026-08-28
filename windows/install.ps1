@@ -555,9 +555,12 @@ if ($env:RELEEM_MYSQL_PASSWORD -and $env:RELEEM_MYSQL_LOGIN) {
         $null = Invoke-MySQLRoot -e "CREATE USER '$ReleemMysqlLogin'$at'$MysqlUserHost' IDENTIFIED BY '$ReleemMysqlPassword';"
         $null = Invoke-MySQLRoot -e "GRANT PROCESS ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         $null = Invoke-MySQLRoot -e "GRANT REPLICATION CLIENT ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        $null = Invoke-MySQLRoot -e "GRANT REPLICA MONITOR ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
-        if ($LASTEXITCODE -ne 0) {
-            $null = Invoke-MySQLRoot -e "GRANT REPLICATION SLAVE ADMIN ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $MysqlServerVersion = Invoke-MySQLRoot -N -s -e 'SELECT VERSION();'
+        if ($LASTEXITCODE -eq 0 -and "$MysqlServerVersion" -match 'MariaDB') {
+            $null = Invoke-MySQLRoot -e "GRANT REPLICA MONITOR ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+            if ($LASTEXITCODE -ne 0) {
+                $null = Invoke-MySQLRoot -e "GRANT REPLICATION SLAVE ADMIN ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+            }
         }
         $null = Invoke-MySQLRoot -e "GRANT SHOW VIEW ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         $null = Invoke-MySQLRoot -e "GRANT SELECT ON mysql.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"

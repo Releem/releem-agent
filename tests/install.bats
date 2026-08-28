@@ -1020,8 +1020,12 @@ exit 0
     load_install_functions
     set -e
     create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
-    create_mock_cmd "mysql" '
+create_mock_cmd "mysql" '
 printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"SELECT VERSION()"* ]]; then
+  echo "10.11.14-MariaDB"
+  exit 0
+fi
 if [[ "$*" == *"GRANT REPLICA MONITOR ON"* ]]; then
   exit 1
 fi
@@ -1043,6 +1047,33 @@ exit 0
     [ "$status" -eq 0 ]
     run grep -F "GRANT REPLICATION SLAVE ADMIN ON *.*" "${TEST_TMPDIR}/mysql.args"
     [ "$status" -eq 0 ]
+}
+
+@test "create_mysql_user does not grant MariaDB replication admin privileges on MySQL" {
+    load_install_functions
+    set -e
+    create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
+    create_mock_cmd "mysql" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"SELECT VERSION()"* ]]; then
+  echo "8.0.44"
+fi
+exit 0
+'
+
+    export MYSQL_ARGS_LOG="${TEST_TMPDIR}/mysql.args"
+    mysqladmincmd="${MOCK_BIN}/mysqladmin"
+    mysqlcmd="${MOCK_BIN}/mysql"
+    root_connection_string="--host=127.0.0.1 --port=3306"
+    connection_string="--host=127.0.0.1 --port=3306"
+    mysql_user_host="127.0.0.1"
+    unset RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_QUERY_OPTIMIZATION
+
+    run create_mysql_user
+
+    [ "$status" -eq 0 ]
+    run grep -E "GRANT (REPLICA MONITOR|REPLICATION SLAVE ADMIN) ON" "${TEST_TMPDIR}/mysql.args"
+    [ "$status" -ne 0 ]
 }
 
 @test "create_mysql_user treats Group Replication membership grant as non-fatal" {

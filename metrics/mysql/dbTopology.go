@@ -34,6 +34,8 @@ type topologyRows interface {
 
 type asyncReplicaChannel struct {
 	primaryHost      string
+	primaryPort      int64
+	primaryPortOK    bool
 	primaryMemberKey string
 	lagValue         int64
 	lagOK            bool
@@ -127,14 +129,19 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		firstString(variables, "server_uuid"),
 		firstString(variables, "server_id"),
 	)
+	memberHost := firstString(variables, "hostname")
+	memberPort, memberPortOK := optionalInt64(firstString(variables, "port"))
 
 	topology := models.MetricGroupValue{
 		"Type":                  "standalone",
 		"Role":                  "primary",
 		"GroupKey":              memberKey,
 		"MemberKey":             memberKey,
+		"MemberHost":            nullableString(memberHost),
+		"MemberPort":            nullableInt64(memberPort, memberPortOK),
 		"PrimaryMemberKey":      nil,
 		"PrimaryHost":           nil,
+		"PrimaryPort":           nil,
 		"IsWriter":              !readOnly && !superReadOnly,
 		"IsReader":              topologyIsReader("healthy"),
 		"ReadOnly":              readOnly,
@@ -196,6 +203,7 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 	topology["GroupKey"] = asyncReplicaGroupKey(channels, firstString(variables, "server_uuid"), selected)
 	topology["PrimaryMemberKey"] = nullableString(selected.primaryMemberKey)
 	topology["PrimaryHost"] = nullableString(selected.primaryHost)
+	topology["PrimaryPort"] = nullableInt64(selected.primaryPort, selected.primaryPortOK)
 	topology["IsWriter"] = false
 	topology["IsReader"] = topologyIsReader(selected.state)
 	if selected.lagOK {
@@ -212,6 +220,7 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 func analyzeAsyncReplicaChannel(replicaStatus map[string]interface{}) asyncReplicaChannel {
 	row := normalizeKeys(replicaStatus)
 	primaryHost := firstNonEmpty(firstString(row, "source_host"), firstString(row, "master_host"))
+	primaryPort, primaryPortOK := optionalInt64(firstNonEmpty(firstString(row, "source_port"), firstString(row, "master_port")))
 	primaryMemberKey := firstNonEmpty(
 		firstString(row, "source_uuid"),
 		firstString(row, "master_uuid"),
@@ -232,16 +241,19 @@ func analyzeAsyncReplicaChannel(replicaStatus map[string]interface{}) asyncRepli
 		state = "stopped"
 	}
 
-	return asyncReplicaChannel{
+	channel := asyncReplicaChannel{
 		primaryHost:      primaryHost,
+		primaryPort:      primaryPort,
+		primaryPortOK:    primaryPortOK,
 		primaryMemberKey: primaryMemberKey,
 		lagValue:         lagValue,
 		lagOK:            lagOK,
 		state:            state,
 		severity:         asyncReplicationStateSeverity(state),
-		sortKey:          firstNonEmpty(primaryMemberKey, primaryHost),
 		facts:            selectReplicaStatusFacts(replicaStatus),
 	}
+	channel.sortKey = asyncSourceIdentity(channel)
+	return channel
 }
 
 func buildGroupReplicationTopology(topology models.MetricGroupValue, variables map[string]string, status map[string]string, members []map[string]interface{}, readOnly bool, superReadOnly bool) models.MetricGroupValue {
@@ -252,18 +264,28 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 	state := "unknown"
 	primaryMemberKey := ""
 	primaryHost := ""
+	var primaryPort int64
+	primaryPortOK := false
 	memberHosts := make(map[string]string, len(members))
+	memberPorts := make(map[string]int64, len(members))
 
 	for _, rawMember := range members {
 		member := normalizeKeys(rawMember)
 		memberID := firstString(member, "member_id")
 		memberRole := strings.ToUpper(firstString(member, "member_role"))
 		memberHosts[memberID] = firstString(member, "member_host")
+		if memberPort, ok := optionalInt64(firstString(member, "member_port")); ok {
+			memberPorts[memberID] = memberPort
+		}
 		if memberRole == "PRIMARY" && primaryMemberKey == "" {
 			primaryMemberKey = memberID
 			primaryHost = memberHosts[memberID]
+			primaryPort, primaryPortOK = memberPorts[memberID]
 		}
 		if memberID == memberKey {
+			topology["MemberHost"] = nullableString(memberHosts[memberID])
+			memberPort, ok := memberPorts[memberID]
+			topology["MemberPort"] = nullableInt64(memberPort, ok)
 			state = groupMemberState(firstString(member, "member_state"))
 			if !singlePrimary || memberRole == "PRIMARY" {
 				role = "primary"
@@ -275,11 +297,13 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 	if singlePrimary && primaryMemberKey == "" {
 		primaryMemberKey = firstString(status, "group_replication_primary_member")
 		primaryHost = memberHosts[primaryMemberKey]
+		primaryPort, primaryPortOK = memberPorts[primaryMemberKey]
 	}
 	if !singlePrimary {
 		role = "multi_primary"
 		primaryMemberKey = ""
 		primaryHost = ""
+		primaryPort, primaryPortOK = 0, false
 	} else if role == "member" {
 		if primaryMemberKey != "" && memberKey == primaryMemberKey {
 			role = "primary"
@@ -289,6 +313,7 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 			role = "primary"
 			primaryMemberKey = memberKey
 			primaryHost = memberHosts[memberKey]
+			primaryPort, primaryPortOK = memberPorts[memberKey]
 		} else {
 			role = "replica"
 		}
@@ -299,6 +324,7 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 	topology["GroupKey"] = groupKey
 	topology["PrimaryMemberKey"] = nullableString(primaryMemberKey)
 	topology["PrimaryHost"] = nullableString(primaryHost)
+	topology["PrimaryPort"] = nullableInt64(primaryPort, primaryPortOK)
 	topology["IsWriter"] = (role == "primary" || role == "multi_primary") && !readOnly && !superReadOnly && state == "healthy"
 	topology["IsReader"] = topologyIsReader(state)
 	topology["ReplicationState"] = state
@@ -421,10 +447,10 @@ func groupMemberState(state string) string {
 
 func topologyIsReader(replicationState string) bool {
 	switch replicationState {
-	case "stopped", "error":
-		return false
-	default:
+	case "healthy", "lagging":
 		return true
+	default:
+		return false
 	}
 }
 
@@ -465,7 +491,7 @@ func asyncReplicaGroupKey(channels []asyncReplicaChannel, serverUUID string, sel
 	keys := make([]string, 0, len(channels))
 	seen := map[string]struct{}{}
 	for _, channel := range channels {
-		key := firstNonEmpty(channel.primaryMemberKey, channel.primaryHost)
+		key := asyncSourceIdentity(channel)
 		if key == "" {
 			continue
 		}
@@ -484,6 +510,28 @@ func asyncReplicaGroupKey(channels []asyncReplicaChannel, serverUUID string, sel
 	}
 	digest := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
 	return fmt.Sprintf("multi-source:%x", digest)
+}
+
+func asyncSourceIdentity(channel asyncReplicaChannel) string {
+	memberKey := strings.TrimSpace(channel.primaryMemberKey)
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(channel.primaryHost), "."))
+	if memberKey == "" {
+		return endpointIdentity(host, channel.primaryPort, channel.primaryPortOK)
+	}
+	if _, err := strconv.ParseUint(memberKey, 10, 64); err != nil || host == "" {
+		return memberKey
+	}
+	return "server-id:" + memberKey + "@" + endpointIdentity(host, channel.primaryPort, channel.primaryPortOK)
+}
+
+func endpointIdentity(host string, port int64, portOK bool) string {
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	if portOK && port >= 1 && port <= 65535 {
+		return host + ":" + strconv.FormatInt(port, 10)
+	}
+	return host
 }
 
 func cloneMetricGroup(input models.MetricGroupValue) models.MetricGroupValue {
@@ -542,6 +590,13 @@ func nullableString(value string) interface{} {
 	return value
 }
 
+func nullableInt64(value int64, ok bool) interface{} {
+	if !ok {
+		return nil
+	}
+	return value
+}
+
 func topologyString(topology models.MetricGroupValue, key string) string {
 	return stringValue(topology[key])
 }
@@ -566,6 +621,8 @@ func selectReplicaStatusFacts(values map[string]interface{}) models.MetricGroupV
 		"Connection_name",
 		"Source_Host",
 		"Master_Host",
+		"Source_Port",
+		"Master_Port",
 		"Source_UUID",
 		"Master_UUID",
 		"Source_Server_Id",
