@@ -41,10 +41,11 @@ type Metrics struct {
 		Conf struct {
 			Variables MetricGroupValue
 		}
-		Info           MetricGroupValue
-		Topology       MetricGroupValue
-		Queries        []MetricGroupValue
-		DatabaseSchema map[string][]MetricGroupValue
+		Info                 MetricGroupValue
+		Topology             MetricGroupValue
+		Queries              []MetricGroupValue
+		DatabaseSchema       map[string][]MetricGroupValue
+		FailedDatabaseSchema []string `json:"FailedDatabaseSchema,omitempty"`
 	}
 	ReleemAgent struct {
 		Info  MetricGroupValue
@@ -88,9 +89,8 @@ type MetricsRepeater interface {
 }
 
 var (
-	DB                      *sql.DB
-	SampleQueries           map[string]string
-	SampleQueriesMutex      sync.RWMutex
-	CountEnabledConsumers   uint64
-	PgStatStatementsEnabled bool
+	DB                    *sql.DB
+	SampleQueries         map[string]string
+	SampleQueriesMutex    sync.RWMutex
+	CountEnabledConsumers uint64
 )

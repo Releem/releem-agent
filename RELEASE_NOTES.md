@@ -191,3 +191,30 @@
 - Updated Go toolchain to 1.26.4
 - Updated Go module dependencies, including Azure, AWS, Google API, OpenTelemetry, and `golang.org/x/*` packages
 - Bumped agent, installer, configurer, and Windows script versions to 1.23.7
+
+## 1.24.0
+- Added the first iteration of the automatic task executor
+- Added installer support for custom MySQL and PostgreSQL root login overrides
+- Added explicit installer flags for selecting the database type
+- Fixed root password prompt handling in the installer
+- Fixed Windows installer exit handling and added custom root login tests
+- Added startup delay to ensure the server is registered before follow-up operations
+- Bumped agent, installer, configurer, and Windows script versions to 1.24.0
+
+## 1.25.0
+- Added PostgreSQL query optimization collection with `pg_stat_statements` capability detection and support for PostgreSQL 12 and newer
+- Added PostgreSQL EXPLAIN collection with query deduplication, collection quotas, prepared-statement parameter handling, and `search_path` support
+- Added PostgreSQL schema collection for tables, partitions, columns, indexes, constraints, foreign keys, sequences, relation sizes, and planner statistics
+- Added PostgreSQL metadata for expression, partial, covering, and partitioned indexes
+- Improved query and schema collection resilience when individual databases, schema sections, or EXPLAIN operations fail
+- Aligned MySQL and PostgreSQL schema publishing, failure reporting, and EXPLAIN collection behavior
+- Added PostgreSQL query optimization grants and hardened installer quoting and credential escaping
+- Fixed PostgreSQL process and query collection compatibility across server versions
+- Fixed Windows installer system utility resolution
+- Expanded automated coverage for PostgreSQL query optimization, schema collection, installer behavior, and cross-database compatibility
+
+## 1.25.1
+- Cache MySQL/MariaDB table size metrics on large servers to reduce `information_schema` load during collection (closes [#496](https://github.com/Releem/releem-agent/issues/496), #528)
+- Configurable thresholds/TTL: `table_size_cache_table_threshold`, `table_size_cache_ram_multiplier`, `table_size_cache_ttl_seconds`
+- Stale snapshot fallback on refresh failure; AWS RDS physical RAM KiB→bytes for eligibility
+- Bumped agent, installer, configurer, and Windows script versions to 1.25.1

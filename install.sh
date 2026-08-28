@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh - Version 1.23.7
+# install.sh - Version 1.25.1
 # (C) Releem, Inc 2022
 # All rights reserved
 
@@ -10,7 +10,7 @@ set -e -E
 # using the package manager.
 
 # Set defaults.
-install_script_version=1.23.7
+install_script_version=1.25.1
 logfile="/var/log/releem-install.log"
 npipe=""
 
@@ -106,11 +106,11 @@ function detect_database_type() {
     database_type="mysql"  # Default to MySQL for backward compatibility
     
     # Check for PostgreSQL environment variables
-    if [[ -n "${RELEEM_PG_HOST+x}" ]] || [[ -n "${RELEEM_PG_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_PASSWORD+x}" ]] || [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+    if [[ -n "${RELEEM_PG_TYPE+x}" ]] || [[ -n "${RELEEM_PG_HOST+x}" ]] || [[ -n "${RELEEM_PG_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_PASSWORD+x}" ]] || [[ -n "${RELEEM_PG_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
         database_type="postgresql"
         printf "\033[37m   Detected PostgreSQL configuration.\033[0m\n"
     # Check for MySQL environment variables (fallback)
-    elif [[ -n "${RELEEM_MYSQL_HOST+x}" ]] || [[ -n "${RELEEM_MYSQL_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_PASSWORD+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
+    elif [[ -n "${RELEEM_MYSQL_TYPE+x}" ]] || [[ -n "${RELEEM_MYSQL_HOST+x}" ]] || [[ -n "${RELEEM_MYSQL_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_PASSWORD+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_LOGIN+x}" ]] || [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
         database_type="mysql"
         printf "\033[37m   Detected MySQL configuration.\033[0m\n"
     else
@@ -200,9 +200,11 @@ function setup_mysql_connection_string() {
                 mysql_user_host="%"
             fi
             connection_string="${connection_string} --host=${RELEEM_MYSQL_HOST}"
+            root_connection_string="${root_connection_string} --host=${RELEEM_MYSQL_HOST}"
             
             if [ -n "$RELEEM_MYSQL_PORT" ]; then
                 connection_string="${connection_string} --port=${RELEEM_MYSQL_PORT}"
+                root_connection_string="${root_connection_string} --port=${RELEEM_MYSQL_PORT}"
             else
                 connection_string="${connection_string} --port=3306"
             fi
@@ -214,6 +216,7 @@ function setup_mysql_connection_string() {
         
         if [ -n "$RELEEM_MYSQL_PORT" ]; then
             connection_string="${connection_string} --port=${RELEEM_MYSQL_PORT}"
+            root_connection_string="${root_connection_string} --port=${RELEEM_MYSQL_PORT}"
         else
             connection_string="${connection_string} --port=3306"
         fi
@@ -229,7 +232,7 @@ function setup_postgresql_connection_string() {
     pg_root_peer_connection=""
 
     # Set PostgreSQL host
-    if [ -z "$RELEEM_PG_ROOT_PASSWORD" ]; then
+    if [[ -z "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
         pg_root_connection_string="${pg_root_connection_string}"
         pg_root_peer_connection="sudo -u postgres "
     else
@@ -248,6 +251,53 @@ function setup_postgresql_connection_string() {
     pg_database="${RELEEM_PG_DATABASE:-postgres}"
     pg_connection_string="${pg_connection_string} -d ${pg_database}"
     pg_root_connection_string="${pg_root_connection_string} -d ${pg_database}"
+}
+
+function postgresql_root_exec() {
+    local pg_superuser="$1"
+    shift
+
+    if [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+        PGPASSWORD="${RELEEM_PG_ROOT_PASSWORD}" ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@" < /dev/null
+    else
+        ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@" < /dev/null
+    fi
+}
+
+function postgresql_root_exec_stdin() {
+    local pg_superuser="$1"
+    shift
+
+    if [[ -n "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+        PGPASSWORD="${RELEEM_PG_ROOT_PASSWORD}" ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@"
+    else
+        ${pg_root_peer_connection} "${psqlcmd}" ${pg_root_connection_string} -U "${pg_superuser}" "$@"
+    fi
+}
+
+function postgresql_root_connection_successful() {
+    local pg_superuser="$1"
+    postgresql_root_exec "${pg_superuser}" -c "SELECT VERSION()" >/dev/null 2>&1
+}
+
+function prompt_postgresql_root_password_until_success() {
+    local pg_superuser="$1"
+
+    while true; do
+        if ! read -s -p "Please enter PostgreSQL superuser password: " RELEEM_PG_ROOT_PASSWORD; then
+            echo
+            printf "\033[31m\n Unable to read PostgreSQL superuser password.\033[0m\n"
+            return 1
+        fi
+        echo
+        setup_postgresql_connection_string
+
+        if postgresql_root_connection_successful "${pg_superuser}"; then
+            return 0
+        fi
+
+        printf "\033[31m\n PostgreSQL connection failed with the entered superuser password.\033[0m\n"
+    done
 }
 
 function detect_mysql_service() {
@@ -356,6 +406,7 @@ function setup_mysql_config_directory() {
 }
 
 function setup_mysql_root_password_option() {
+    mysql_root_login="${RELEEM_MYSQL_ROOT_LOGIN:-root}"
     mysql_root_password_option=()
     if [[ -n "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
         mysql_root_password_option=("--password=${RELEEM_MYSQL_ROOT_PASSWORD}")
@@ -363,11 +414,11 @@ function setup_mysql_root_password_option() {
 }
 
 function mysql_root_ping() {
-    $mysqladmincmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" ping
+    $mysqladmincmd ${root_connection_string} --user="${mysql_root_login:-root}" "${mysql_root_password_option[@]}" ping
 }
 
 function mysql_root_exec() {
-    $mysqlcmd ${root_connection_string} --user=root "${mysql_root_password_option[@]}" -Be "$1"
+    $mysqlcmd ${root_connection_string} --user="${mysql_root_login:-root}" "${mysql_root_password_option[@]}" -Be "$1"
 }
 
 function mysql_root_connection_successful() {
@@ -430,6 +481,177 @@ function setup_postgresql_config_directory() {
     else
         printf "\033[37m   Using PostgreSQL configuration directory: %s\033[0m\n" "$PG_CONF_DIR"
     fi
+}
+
+function quote_postgresql_identifier() {
+    local identifier="$1"
+    identifier="${identifier//\"/\"\"}"
+    printf '"%s"' "${identifier}"
+}
+
+function quote_postgresql_literal() {
+    local value="$1"
+    value=$(printf "%s" "${value}" | sed "s/'/''/g")
+    printf "'%s'" "${value}"
+}
+
+function quote_hcl_string() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "${value}"
+}
+
+function read_postgresql_root_catalog() {
+    local pg_superuser="$1"
+    local output_file
+    local command_status
+    local record
+    shift
+
+    postgresql_catalog_records=()
+
+    if ! output_file=$(mktemp); then
+        return 1
+    fi
+
+    if postgresql_root_exec "${pg_superuser}" "$@" >"${output_file}"; then
+        :
+    else
+        command_status=$?
+        rm -f "${output_file}"
+        return "${command_status}"
+    fi
+
+    while IFS= read -r -d '' record; do
+        postgresql_catalog_records+=("${record}")
+    done <"${output_file}"
+
+    rm -f "${output_file}"
+}
+
+function postgresql_user_schema_search_path() {
+    local quoted_schemas=("$@")
+    local quoted_user_placeholder quoted_public search_path quoted_schema
+    quoted_user_placeholder=$(quote_postgresql_identifier '$user')
+    quoted_public=$(quote_postgresql_identifier public)
+    search_path="${quoted_user_placeholder}, ${quoted_public}"
+    for quoted_schema in "${quoted_schemas[@]}"; do
+        [ -z "${quoted_schema}" ] && continue
+        if [ "${quoted_schema}" = "${quoted_public}" ]; then
+            continue
+        fi
+        search_path="${search_path}, ${quoted_schema}"
+    done
+    printf '%s' "${search_path}"
+}
+
+function set_postgresql_monitoring_role_search_path() {
+    local pg_superuser="$1"
+    local quoted_monitoring_role="$2"
+    local database="$3"
+    shift 3
+    local quoted_schemas=("$@")
+    local quoted_database search_path
+    quoted_database=$(quote_postgresql_identifier "${database}")
+    search_path=$(postgresql_user_schema_search_path "${quoted_schemas[@]}")
+    postgresql_root_exec "${pg_superuser}" -v ON_ERROR_STOP=1 -c "ALTER ROLE ${quoted_monitoring_role} IN DATABASE ${quoted_database} SET search_path TO ${search_path};"
+}
+
+function grant_postgresql_query_optimization_access() {
+    local pg_superuser="$1"
+    local monitoring_role="$2"
+    local quoted_monitoring_role
+    local server_version_num
+    local -a databases
+    local database
+    local quoted_database
+    local -a schemas
+    local -a quoted_schemas
+    local schema
+    local quoted_schema
+    local catalog_status
+
+    if [ -z "${monitoring_role}" ]; then
+        printf "\033[31m PostgreSQL monitoring role name cannot be empty.\033[0m\n"
+        return 1
+    fi
+
+    if ! server_version_num=$(postgresql_root_exec "${pg_superuser}" -tAc "SHOW server_version_num;"); then
+        printf "\033[31m Failed to detect PostgreSQL server version for query optimization grants.\033[0m\n"
+        return 1
+    fi
+    server_version_num="${server_version_num//[[:space:]]/}"
+    if [[ ! "${server_version_num}" =~ ^[0-9]+$ ]]; then
+        printf "\033[31m Invalid PostgreSQL server_version_num: %s\033[0m\n" "${server_version_num}"
+        return 1
+    fi
+
+    quoted_monitoring_role=$(quote_postgresql_identifier "${monitoring_role}")
+    if read_postgresql_root_catalog "${pg_superuser}" -At -0 -c "SELECT datname
+FROM pg_database
+WHERE datallowconn AND NOT datistemplate
+ORDER BY datname;"; then
+        databases=("${postgresql_catalog_records[@]}")
+    else
+        catalog_status=$?
+        return "${catalog_status}"
+    fi
+
+    for database in "${databases[@]}"; do
+        [ -z "${database}" ] && continue
+        quoted_database=$(quote_postgresql_identifier "${database}")
+        if ! postgresql_root_exec "${pg_superuser}" -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE ${quoted_database} TO ${quoted_monitoring_role};"; then
+            return 1
+        fi
+    done
+
+    if (( server_version_num >= 140000 )); then
+        if ! postgresql_root_exec "${pg_superuser}" -v ON_ERROR_STOP=1 -c "GRANT pg_read_all_data TO ${quoted_monitoring_role};"; then
+            return 1
+        fi
+    fi
+
+    for database in "${databases[@]}"; do
+        [ -z "${database}" ] && continue
+        if read_postgresql_root_catalog "${pg_superuser}" -d "${database}" -At -0 -c "SELECT nspname
+FROM pg_namespace
+WHERE nspname NOT IN ('information_schema', 'pg_catalog')
+  AND nspname NOT LIKE 'pg_toast%'
+  AND nspname NOT LIKE 'pg_temp_%'
+ORDER BY nspname;"; then
+            schemas=("${postgresql_catalog_records[@]}")
+        else
+            catalog_status=$?
+            return "${catalog_status}"
+        fi
+
+        quoted_schemas=()
+        for schema in "${schemas[@]}"; do
+            [ -z "${schema}" ] && continue
+            quoted_schema=$(quote_postgresql_identifier "${schema}")
+            quoted_schemas+=("${quoted_schema}")
+            if (( server_version_num < 140000 )); then
+                if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
+                    return 1
+                fi
+                if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
+                    return 1
+                fi
+                if ! postgresql_root_exec "${pg_superuser}" -d "${database}" -v ON_ERROR_STOP=1 -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${quoted_schema} TO ${quoted_monitoring_role};"; then
+                    return 1
+                fi
+            fi
+        done
+        if ! set_postgresql_monitoring_role_search_path "${pg_superuser}" "${quoted_monitoring_role}" "${database}" "${quoted_schemas[@]}"; then
+            return 1
+        fi
+    done
+
+    printf "\033[33m Rerun the installer after adding PostgreSQL schemas or objects so grants and search_path stay current.\033[0m\n"
 }
 
 function create_mysql_user() {
@@ -514,7 +736,7 @@ function create_mysql_user() {
             printf "\033[32m\n Created new user \`${RELEEM_MYSQL_LOGIN}\`\033[0m\n"
             FLAG_SUCCESS=1
         else
-            printf "\033[31m\n%s\n%s\033[0m\n" "MySQL connection failed with user root." "Check that the password is correct, the execution of the command \`${mysqladmincmd} ${root_connection_string} --user=root --password=<MYSQL_ROOT_PASSWORD> ping\` and reinstall the agent."
+            printf "\033[31m\n%s\n%s\033[0m\n" "MySQL connection failed with user ${mysql_root_login:-root}." "Check that the password is correct, the execution of the command \`${mysqladmincmd} ${root_connection_string} --user=${mysql_root_login:-root} --password=<MYSQL_ROOT_PASSWORD> ping\` and reinstall the agent."
             mysql_root_ping || true
             on_error
             exit 1
@@ -535,6 +757,58 @@ function create_mysql_user() {
     fi
 }
 
+function create_or_update_postgresql_monitoring_role() {
+    local pg_superuser="$1"
+    local monitoring_role="$2"
+    local monitoring_password="$3"
+    local quoted_monitoring_role
+    local quoted_monitoring_role_literal
+    local hba_file
+    local hba_auth_method
+    local password_encryption
+    local safe_monitoring_password
+    local quoted_monitoring_password
+
+    quoted_monitoring_role=$(quote_postgresql_identifier "${monitoring_role}")
+    quoted_monitoring_role_literal=$(quote_postgresql_literal "${monitoring_role}")
+    safe_monitoring_password=$(printf "%s" "${monitoring_password}" | sed "s/'/''/g")
+    quoted_monitoring_password="'${safe_monitoring_password}'"
+    hba_file="$(postgresql_root_exec "${pg_superuser}" -tAc "SHOW hba_file;" | tr -d '\r\n')"
+    if [ -n "${hba_file}" ] && [ -r "${hba_file}" ]; then
+        hba_auth_method=$(awk '$1=="host" && $2=="all" && $3=="all" && $4=="127.0.0.1/32" {print $5; exit}' "${hba_file}" 2>/dev/null || true)
+    else
+        hba_auth_method=''
+    fi
+    case "${hba_auth_method}" in
+        scram-*)
+            password_encryption='scram-sha-256'
+            ;;
+        *)
+            password_encryption=''
+            ;;
+    esac
+
+    if postgresql_root_exec "${pg_superuser}" -tAc "SELECT 1 FROM pg_roles WHERE rolname = ${quoted_monitoring_role_literal};" 2>/dev/null | grep -q "1"; then
+        if [ -n "${password_encryption:-}" ]; then
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; ALTER USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
+        else
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "ALTER USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
+        fi
+        printf "\033[32m   Updated password for existing PostgreSQL user \`${monitoring_role}\`\033[0m\n"
+    else
+        if [ -n "${password_encryption:-}" ]; then
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "SET password_encryption='${password_encryption}'; CREATE USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
+        else
+            postgresql_root_exec "${pg_superuser}" -v "ON_ERROR_STOP=1" -c "CREATE USER ${quoted_monitoring_role} WITH PASSWORD ${quoted_monitoring_password};"
+        fi
+        printf "\033[32m   Created new PostgreSQL user \`${monitoring_role}\`\033[0m\n"
+    fi
+
+    postgresql_root_exec "${pg_superuser}" -c "GRANT pg_monitor TO ${quoted_monitoring_role};" 2>/dev/null
+    postgresql_root_exec "${pg_superuser}" -c "GRANT SELECT ON pg_hba_file_rules TO ${quoted_monitoring_role};" 2>/dev/null
+    postgresql_root_exec "${pg_superuser}" -c "GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO ${quoted_monitoring_role};" 2>/dev/null
+}
+
 function create_postgresql_user() {
     printf "\033[37m\n * Configuring the PostgreSQL user for metrics collection.\033[0m\n"
     FLAG_SUCCESS=0
@@ -546,27 +820,25 @@ function create_postgresql_user() {
         printf "\033[37m - Using PostgreSQL superuser for user creation.\033[0m\n"        
         # Test connection with superuser (usually postgres)
         pg_superuser="${RELEEM_PG_ROOT_LOGIN:-postgres}"            
-        if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "SELECT VERSION()" >/dev/null 2>&1; then
+        if ! postgresql_root_connection_successful "${pg_superuser}" && [[ -z "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+            prompt_postgresql_root_password_until_success "${pg_superuser}" || true
+        fi
+
+        if postgresql_root_connection_successful "${pg_superuser}"; then
 
             printf "\033[37m - PostgreSQL connection successful.\033[0m\n"
             
             # Set default user and generate password
             RELEEM_PG_LOGIN="releem"
             RELEEM_PG_PASSWORD=$(cat /dev/urandom | tr -cd '%*)?@#~' | head -c2 ; cat /dev/urandom | tr -cd '%*)?@#~A-Za-z0-9%*)?@#~' | head -c16 ; cat /dev/urandom | tr -cd '%*)?@#~' | head -c2 )
-            
-            # Update the password for an existing role, otherwise create it.
-            if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${RELEEM_PG_LOGIN}';" 2>/dev/null | grep -q "1"; then
-                PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "ALTER USER ${RELEEM_PG_LOGIN} WITH PASSWORD '${RELEEM_PG_PASSWORD}';" 2>/dev/null
-                printf "\033[32m   Updated password for existing PostgreSQL user \`${RELEEM_PG_LOGIN}\`\033[0m\n"
-            else
-                PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "CREATE USER ${RELEEM_PG_LOGIN} WITH PASSWORD '${RELEEM_PG_PASSWORD}';" 2>/dev/null
-                printf "\033[32m   Created new PostgreSQL user \`${RELEEM_PG_LOGIN}\`\033[0m\n"
+            create_or_update_postgresql_monitoring_role "${pg_superuser}" "${RELEEM_PG_LOGIN}" "${RELEEM_PG_PASSWORD}"
+            if [ -n "$RELEEM_QUERY_OPTIMIZATION" ]; then
+                if ! grant_postgresql_query_optimization_access "${pg_superuser}" "${RELEEM_PG_LOGIN}"; then
+                    printf "\033[31m Failed to grant PostgreSQL query optimization read access.\033[0m\n"
+                    on_error
+                    exit 1
+                fi
             fi
-            
-            # Grant necessary permissions
-            PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "GRANT pg_monitor TO ${RELEEM_PG_LOGIN};" 2>/dev/null 
-            PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "GRANT SELECT ON pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null 
-            PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO ${RELEEM_PG_LOGIN};" 2>/dev/null 
 
 
             # # Try to grant access to pg_stat_statements if available
@@ -576,12 +848,12 @@ function create_postgresql_user() {
             # fi
             # Check if pg_stat_statements extension is available
             FLAG_PG_STAT_STATEMENTS=1
-            if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null  | grep -q "1" 2>/dev/null; then
+            if postgresql_root_exec "${pg_superuser}" -c "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null  | grep -q "1" 2>/dev/null; then
                 printf "\033[32m - pg_stat_statements extension is available for query performance monitoring.\033[0m\n"
             else
                 printf "\033[37m - Installing pg_stat_statements extension.\033[0m\n"
                 
-                if PGPASSWORD=${RELEEM_PG_ROOT_PASSWORD} ${pg_root_peer_connection} $psqlcmd ${pg_root_connection_string} -U ${pg_superuser} -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>/dev/null; then
+                if postgresql_root_exec "${pg_superuser}" -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>/dev/null; then
                     printf "\033[32m   Successfully installed pg_stat_statements extension.\033[0m\n"
                 else
                     FLAG_PG_STAT_STATEMENTS=0
@@ -598,14 +870,14 @@ function create_postgresql_user() {
     
     # Test connection with the monitoring user
     if [ "$FLAG_SUCCESS" == "1" ]; then
-        if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -c "SELECT VERSION()" >/dev/null 2>&1; then
+        if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -c "SELECT VERSION()" >/dev/null 2>&1; then
             printf "\033[32m\n   PostgreSQL connection with user \`${RELEEM_PG_LOGIN}\` - successful. \033[0m\n"
             PG_LOGIN=$RELEEM_PG_LOGIN
             PG_PASSWORD=$RELEEM_PG_PASSWORD
 
             if [ -z "${FLAG_PG_STAT_STATEMENTS+x}" ]; then
                 FLAG_PG_STAT_STATEMENTS=1
-                if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -tAc "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null | grep -q "1" 2>/dev/null; then
+                if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -tAc "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null | grep -q "1" 2>/dev/null; then
                     printf "\033[32m   pg_stat_statements extension is available for query performance monitoring.\033[0m\n"
                 else
                     FLAG_PG_STAT_STATEMENTS=0
@@ -615,44 +887,44 @@ function create_postgresql_user() {
 
             printf "\033[37m - Validating PostgreSQL access required for security collectors.\033[0m\n"
 
-            if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -t -c "SELECT 1 FROM pg_extension LIMIT 1;" >/dev/null 2>&1; then
+            if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -t -c "SELECT 1 FROM pg_extension LIMIT 1;" >/dev/null 2>&1; then
                 printf "\033[32m   Access to pg_extension is available.\033[0m\n"
             else
                 printf "\033[33m   Warning: access to pg_extension is unavailable. Extension-based security checks may be incomplete.\033[0m\n"
             fi
 
-            if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -t -c "SELECT 1 FROM pg_roles LIMIT 1;" >/dev/null 2>&1; then
+            if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -t -c "SELECT 1 FROM pg_roles LIMIT 1;" >/dev/null 2>&1; then
                 printf "\033[32m   Access to pg_roles is available.\033[0m\n"
             else
                 printf "\033[33m   Warning: access to pg_roles is unavailable. Role-based security checks may be incomplete.\033[0m\n"
             fi
 
-            if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -t -c "SELECT 1 FROM pg_auth_members LIMIT 1;" >/dev/null 2>&1; then
+            if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -t -c "SELECT 1 FROM pg_auth_members LIMIT 1;" >/dev/null 2>&1; then
                 printf "\033[32m   Access to pg_auth_members is available.\033[0m\n"
             else
                 printf "\033[33m   Warning: access to pg_auth_members is unavailable. Role membership checks may be incomplete.\033[0m\n"
             fi
 
-            if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -t -c "SELECT * FROM pg_hba_file_rules LIMIT 1;" >/dev/null 2>&1; then
+            if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -t -c "SELECT * FROM pg_hba_file_rules LIMIT 1;" >/dev/null 2>&1; then
                 printf "\033[32m   Access to pg_hba_file_rules is available.\033[0m\n"
             else
                 printf "\033[33m   Warning: access to pg_hba_file_rules is unavailable. pg_hba-based security checks may be incomplete.\033[0m\n"
             fi
 
-            if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -t -c "SELECT has_schema_privilege('public', 'public', 'USAGE');" >/dev/null 2>&1; then
+            if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -t -c "SELECT has_schema_privilege('public', 'public', 'USAGE');" >/dev/null 2>&1; then
                 printf "\033[32m   Access to schema privilege inspection is available.\033[0m\n"
             else
                 printf "\033[33m   Warning: schema privilege inspection is unavailable. PUBLIC schema permission checks may be incomplete.\033[0m\n"
             fi
 
-            if PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -t -c "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relrowsecurity);" >/dev/null 2>&1; then
+            if PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -t -c "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relrowsecurity);" >/dev/null 2>&1; then
                 printf "\033[32m   Access to RLS metadata is available.\033[0m\n"
             else
                 printf "\033[33m   Warning: access to RLS metadata is unavailable. RLS reporting may be incomplete.\033[0m\n"
             fi
         else
             printf "\033[31m\n%s\n%s\033[0m\n" "PostgreSQL connection failed with user \`${RELEEM_PG_LOGIN}\`." "Check that the host, user and password are correct and the user has necessary permissions."
-            PGPASSWORD=${RELEEM_PG_PASSWORD} $psqlcmd ${pg_connection_string} -U ${RELEEM_PG_LOGIN} -c "SELECT VERSION()" || true
+            PGPASSWORD="${RELEEM_PG_PASSWORD}" "${psqlcmd}" ${pg_connection_string} -U "${RELEEM_PG_LOGIN}" -c "SELECT VERSION()" || true
             on_error
             exit 1
         fi
@@ -848,8 +1120,8 @@ function configure_releem_agent() {
         # PostgreSQL configuration
         if [ -n "$PG_LOGIN" ] && [ -n "$PG_PASSWORD" ]; then
             printf "\033[37m - Adding PostgreSQL user and password to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
-            echo "pg_user=\"$PG_LOGIN\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
-            echo "pg_password=\"$PG_PASSWORD\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
+            printf 'pg_user=%s\n' "$(quote_hcl_string "${PG_LOGIN}")" | $sudo_cmd tee -a "$RELEEM_CONF_FILE" >/dev/null
+            printf 'pg_password=%s\n' "$(quote_hcl_string "${PG_PASSWORD}")" | $sudo_cmd tee -a "$RELEEM_CONF_FILE" >/dev/null
         fi
         if [ -n "$RELEEM_PG_HOST" ]; then
             printf "\033[37m - Adding PostgreSQL host to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
@@ -861,7 +1133,7 @@ function configure_releem_agent() {
         fi
         if [ -n "$RELEEM_PG_SSL_MODE" ]; then
             printf "\033[37m - Adding PostgreSQL SSL mode to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
-            echo "pg_ssl_mode=\"$RELEEM_PG_SSL_MODE\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
+            echo "pg_ssl_mode=$RELEEM_PG_SSL_MODE" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
         fi
         if [ -n "$pg_service_name_cmd" ]; then
             printf "\033[37m - Adding PostgreSQL restart command to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
@@ -1041,6 +1313,77 @@ function detect_releem_api_key() {
     fi    
 }
 
+
+function load_runtime_config() {
+    if test -f "$RELEEM_CONF_FILE" ; then
+        . "$RELEEM_CONF_FILE"
+
+        if [ ! -z "$apikey" ] && [ -z "${RELEEM_API_KEY:-}" ]; then
+            RELEEM_API_KEY=$apikey
+        fi
+        if [ ! -z "$memory_limit" ]; then
+            DB_MEMORY_LIMIT=$memory_limit
+        fi
+        if [ ! -z "$query_optimization" ]; then
+            RELEEM_QUERY_OPTIMIZATION=$query_optimization
+        fi
+        if [ ! -z "$releem_region" ]; then
+            RELEEM_REGION=$releem_region
+        fi
+        if [ ! -z "$instance_type" ] && [ -z "${RELEEM_INSTANCE_TYPE:-}" ]; then
+            RELEEM_INSTANCE_TYPE=$instance_type
+        fi
+
+        # MySQL Configuration Variables
+        if [ ! -z "$mysql_cnf_dir" ]; then
+            RELEEM_MYSQL_CONFIG_DIR=$mysql_cnf_dir
+        fi
+        if [ ! -z "$mysql_restart_service" ]; then
+            RELEEM_MYSQL_RESTART_SERVICE=$mysql_restart_service
+        fi
+        if [ ! -z "$mysql_user" ]; then
+            MYSQL_LOGIN="${RELEEM_MYSQL_LOGIN:-${mysql_user}}"
+            RELEEM_MYSQL_LOGIN="${RELEEM_MYSQL_LOGIN:-${mysql_user}}"
+        fi
+        if [ ! -z "$mysql_password" ]; then
+            MYSQL_PASSWORD="${RELEEM_MYSQL_PASSWORD:-${mysql_password}}"
+            RELEEM_MYSQL_PASSWORD="${RELEEM_MYSQL_PASSWORD:-${mysql_password}}"
+        fi
+        if [ ! -z "$mysql_host" ] && [ -z "${RELEEM_MYSQL_HOST:-}" ]; then
+            RELEEM_MYSQL_HOST=${mysql_host}
+        fi
+        if [ ! -z "$mysql_port" ] && [ -z "${RELEEM_MYSQL_PORT:-}" ]; then
+            RELEEM_MYSQL_PORT=${mysql_port}
+        fi
+
+        # PostgreSQL Configuration Variables
+        if [ ! -z "$pg_cnf_dir" ]; then
+            RELEEM_PG_CONFIG_DIR=$pg_cnf_dir
+        fi
+        if [ ! -z "$pg_restart_service" ]; then
+            RELEEM_PG_RESTART_SERVICE=$pg_restart_service
+        fi
+        if [ ! -z "$pg_user" ]; then
+            PG_LOGIN="${RELEEM_PG_LOGIN:-${pg_user}}"
+            RELEEM_PG_LOGIN="${RELEEM_PG_LOGIN:-${pg_user}}"
+        fi
+        if [ ! -z "$pg_password" ]; then
+            PG_PASSWORD="${RELEEM_PG_PASSWORD:-${pg_password}}"
+            RELEEM_PG_PASSWORD="${RELEEM_PG_PASSWORD:-${pg_password}}"
+        fi
+        if [ ! -z "$pg_host" ] && [ -z "${RELEEM_PG_HOST:-}" ]; then
+            RELEEM_PG_HOST=${pg_host}
+        fi
+        if [ ! -z "$pg_port" ] && [ -z "${RELEEM_PG_PORT:-}" ]; then
+            RELEEM_PG_PORT=${pg_port}
+        fi
+        if [ ! -z "$pg_database" ] && [ -z "${RELEEM_PG_DATABASE:-}" ]; then
+            RELEEM_PG_DATABASE=${pg_database}
+        fi
+    fi
+
+}
+
 function first_run_releem_agent() {
     set +e
     trap - ERR
@@ -1049,6 +1392,9 @@ function first_run_releem_agent() {
         printf "\033[37m\n * Executing Releem Agent for the first time.\033[0m\n"
         printf "\033[37m This may take up to 15 minutes on servers with many databases.\033[0m\n\n"
         $sudo_cmd $RELEEM_WORKDIR/releem-agent -f
+        # Wait for 10 seconds to ensure the agent is started
+        printf "\033[37m\n * Waiting for 30 seconds to ensure the server is added to the Releem platform.\033[0m\n"
+        sleep 30        
         $sudo_cmd timeout --preserve-status 10 $RELEEM_WORKDIR/releem-agent
     fi
     trap on_error ERR
@@ -1144,16 +1490,46 @@ elif [ "$INSTALL_MODE" == "enable_query_optimization" ] || [ "$1" == "enable_que
 then
     #Enable Query Optimitsation
     detect_releem_api_key
+    load_runtime_config
     detect_instance_type
     detect_database_type
     configure_connection_parameters
 
-    grant_privileges_sql=$($mysqlcmd  ${root_connection_string} --user=root --password=${RELEEM_MYSQL_ROOT_PASSWORD} -NBe 'select Concat("GRANT SELECT on *.* to `",User,"`@`", Host,"`;") from mysql.user where User="releem"')
-    for query in  "${grant_privileges_sql[@]}";
-    do
-        echo "${query}"
-        $mysqlcmd  ${root_connection_string} --user=root --password=${RELEEM_MYSQL_ROOT_PASSWORD} -Be "${query}"
-    done
+    if [ "$database_type" == "postgresql" ]; then
+        pg_monitoring_role="${PG_LOGIN:-${RELEEM_PG_LOGIN:-releem}}"
+        pg_superuser="${RELEEM_PG_ROOT_LOGIN:-postgres}"
+        if ! postgresql_root_connection_successful "${pg_superuser}" && [[ -z "${RELEEM_PG_ROOT_PASSWORD+x}" ]]; then
+            prompt_postgresql_root_password_until_success "${pg_superuser}" || true
+        fi
+
+        if postgresql_root_connection_successful "${pg_superuser}"; then
+            if ! grant_postgresql_query_optimization_access "${pg_superuser}" "${pg_monitoring_role}"; then
+                printf "\033[31m Failed to grant PostgreSQL query optimization read access.\033[0m\n"
+                exit 1
+            fi
+        else
+            printf "\033[31m\n%s\n%s\033[0m\n" "PostgreSQL connection failed with superuser ${pg_superuser}." "Check that PostgreSQL is running and accessible, or set RELEEM_PG_ROOT_PASSWORD if authentication is required."
+            exit 1
+        fi
+    else
+        setup_mysql_root_password_option
+        if ! mysql_root_connection_successful && [[ -z "${RELEEM_MYSQL_ROOT_PASSWORD+x}" ]]; then
+            prompt_mysql_root_password_until_success || true
+        fi
+
+        mysql_monitoring_user="${MYSQL_LOGIN:-${RELEEM_MYSQL_LOGIN:-releem}}"
+        mysql_monitoring_user_hex=$(printf '%s' "${mysql_monitoring_user}" | od -An -tx1 | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+        grant_privileges_sql=$($mysqlcmd ${root_connection_string} --user="${mysql_root_login:-root}" "${mysql_root_password_option[@]}" -NBe "select Concat('GRANT SELECT on *.* to ', CHAR(96), REPLACE(User, CHAR(96), CONCAT(CHAR(96), CHAR(96))), CHAR(96), '@', CHAR(96), REPLACE(Host, CHAR(96), CONCAT(CHAR(96), CHAR(96))), CHAR(96), ';') from mysql.user where HEX(User)='${mysql_monitoring_user_hex}'")
+        if [[ -z "${grant_privileges_sql//[[:space:]]/}" ]]; then
+            printf "\033[31m Configured MySQL monitoring account was not found.\033[0m\n"
+            exit 1
+        fi
+        while IFS= read -r query; do
+            [ -z "$query" ] && continue
+            echo "${query}"
+            mysql_root_exec "${query}"
+        done <<< "${grant_privileges_sql}"
+    fi
     if [ -z "$query_optimization" ]; then
         echo "query_optimization=true" | $sudo_cmd tee -a $RELEEM_CONF_FILE
     else

@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -23,6 +24,20 @@ type QueryExplainTaskResult struct {
 	Schema                  map[string][]models.MetricGroupValue `json:"schema"`
 	Explain                 string                               `json:"explain"`
 	EventsStatementsHistory models.MetricGroupValue              `json:"events_statements_history"`
+}
+
+type queryExplainDatabaseConnector func(*config.Config, logging.Logger, string) (*sql.DB, error)
+
+func executeQueryExplain(connect queryExplainDatabaseConnector, configuration *config.Config, logger logging.Logger, schemaName string, queryText string) (string, error) {
+	db, err := connect(configuration, logger, schemaName)
+	if err != nil {
+		return "", err
+	}
+	if db == nil {
+		return "", fmt.Errorf("connect to database %q: nil database handle", schemaName)
+	}
+	defer db.Close()
+	return mysql.ExecuteExplain(db, queryText, logger)
 }
 
 func ProcessQueryExplainTask(task_details string, logger logging.Logger, configuration *config.Config, metrics *models.Metrics) (int, int, string, string) {
@@ -108,9 +123,6 @@ func ProcessQueryExplainTask(task_details string, logger logging.Logger, configu
 			}
 		}
 
-		// Connect to the database
-		db := utils.ConnectionDatabase(configuration, logger, input.SchemaName)
-
 		// // Get THREAD_ID before executing EXPLAIN (using the same connection)
 		// var threadID uint64
 		// err = db.QueryRow("SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID = CONNECTION_ID()").Scan(&threadID)
@@ -123,8 +135,8 @@ func ProcessQueryExplainTask(task_details string, logger logging.Logger, configu
 		// }
 		// logger.Info("THREAD_ID: ", threadID)
 
-		// Execute EXPLAIN
-		explainResult, explain_error := mysql.ExecuteExplain(db, input.QueryText, logger)
+		// Connect to the database and execute EXPLAIN
+		explainResult, explain_error := executeQueryExplain(utils.ConnectionDatabaseErr, configuration, logger, input.SchemaName, input.QueryText)
 		// explainResult, err := executeExplain(db, input.QueryText, logger)
 		if explainResult != "" {
 			query_data["explain"] = explainResult
@@ -163,8 +175,6 @@ func ProcessQueryExplainTask(task_details string, logger logging.Logger, configu
 		// 	}
 		// 	logger.Info("Digest: ", Digest, " DigestText: ", DigestText)
 		// }
-
-		db.Close()
 
 		// Build result
 		metrics.DB.Queries = append(metrics.DB.Queries, query_data)
