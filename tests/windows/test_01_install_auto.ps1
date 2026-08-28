@@ -68,4 +68,35 @@ Assert-FileContains "releem.conf has mysql restart service" "C:\ProgramData\Rele
 
 Assert-MySQLUserExists "releem MySQL user created" "releem"
 
+$ReleemMysqlUser = Get-ReleemConfigValue -Path "C:\ProgramData\ReleemAgent\releem.conf" -Key "mysql_user"
+$ReleemMysqlPassword = Get-ReleemConfigValue -Path "C:\ProgramData\ReleemAgent\releem.conf" -Key "mysql_password"
+$ReplicaStatusQuery = "SHOW SLAVE STATUS"
+$DbVersionString = & mysql -u root -p"$env:MYSQL_ROOT_PASSWORD" -sNe "SELECT VERSION()" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Fail "Could not detect the database version for replication privilege checks"
+} elseif ($DbVersionString -match "MariaDB") {
+    $ReplicaStatusQuery = "SHOW ALL REPLICAS STATUS"
+    $null = & mysql -u root -p"$env:MYSQL_ROOT_PASSWORD" -e $ReplicaStatusQuery 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $ReplicaStatusQuery = "SHOW ALL SLAVES STATUS"
+    }
+} else {
+    $ReplicaStatusQuery = "SHOW REPLICA STATUS"
+    $null = & mysql -u root -p"$env:MYSQL_ROOT_PASSWORD" -e $ReplicaStatusQuery 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $ReplicaStatusQuery = "SHOW SLAVE STATUS"
+    }
+}
+Assert-MySQLCanRunQuery "releem user can read replication status" $ReleemMysqlUser $ReleemMysqlPassword $ReplicaStatusQuery
+
+$GroupMembersTableExists = & mysql -u root -p"$env:MYSQL_ROOT_PASSWORD" -sNe `
+    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='performance_schema' AND table_name='replication_group_members';" 2>$null
+$GroupMembersProbeExit = $LASTEXITCODE
+if ($GroupMembersProbeExit -ne 0) {
+    Write-Fail "Could not check whether performance_schema.replication_group_members exists"
+} elseif ([int]$GroupMembersTableExists -gt 0) {
+    Assert-MySQLCanRunQuery "releem user can read Group Replication members" $ReleemMysqlUser $ReleemMysqlPassword `
+        "SELECT COUNT(*) FROM performance_schema.replication_group_members"
+}
+
 Show-Summary "Test 1: Fresh install with auto user creation (Windows)"

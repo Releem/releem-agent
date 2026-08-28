@@ -107,6 +107,20 @@ assert_mysql_can_connect() {
     fi
 }
 
+get_releem_config_value() {
+    local file="$1" key="$2"
+    sed -n "s/^${key}=\"\(.*\)\"$/\1/p" "$file" | head -n 1
+}
+
+assert_mysql_can_run_query() {
+    local desc="$1" user="$2" password="$3" query="$4"
+    if mysql -u "$user" -p"$password" -h 127.0.0.1 -e "$query" &>/dev/null; then
+        log_pass "$desc"
+    else
+        log_fail "$desc: MySQL user '$user' cannot run: $query"
+    fi
+}
+
 assert_file_contains() {
     local desc="$1" file="$2" pattern="$3"
     if grep -q "$pattern" "$file" 2>/dev/null; then

@@ -60,6 +60,29 @@ assert_file_contains "releem.conf has api key"      "/opt/releem/releem.conf" "$
 
 assert_mysql_user_exists "releem MySQL user created" "releem"
 
+RELEEM_MYSQL_USER=$(get_releem_config_value "/opt/releem/releem.conf" "mysql_user")
+RELEEM_MYSQL_PASSWORD=$(get_releem_config_value "/opt/releem/releem.conf" "mysql_password")
+DB_VERSION_STRING=$(mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -sNe "SELECT VERSION()" 2>/dev/null)
+if [[ "$DB_VERSION_STRING" == *MariaDB* ]]; then
+    REPLICA_STATUS_QUERY="SHOW ALL REPLICAS STATUS"
+    if ! mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "$REPLICA_STATUS_QUERY" &>/dev/null; then
+        REPLICA_STATUS_QUERY="SHOW ALL SLAVES STATUS"
+    fi
+else
+    REPLICA_STATUS_QUERY="SHOW REPLICA STATUS"
+    if ! mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "$REPLICA_STATUS_QUERY" &>/dev/null; then
+        REPLICA_STATUS_QUERY="SHOW SLAVE STATUS"
+    fi
+fi
+assert_mysql_can_run_query "releem user can read replication status" "$RELEEM_MYSQL_USER" "$RELEEM_MYSQL_PASSWORD" "$REPLICA_STATUS_QUERY"
+
+GROUP_MEMBERS_TABLE_EXISTS=$(mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -sNe \
+    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='performance_schema' AND table_name='replication_group_members';" 2>/dev/null)
+if [[ "$GROUP_MEMBERS_TABLE_EXISTS" -gt 0 ]]; then
+    assert_mysql_can_run_query "releem user can read Group Replication members" "$RELEEM_MYSQL_USER" "$RELEEM_MYSQL_PASSWORD" \
+        "SELECT COUNT(*) FROM performance_schema.replication_group_members"
+fi
+
 # Verify cron job added
 if crontab -l 2>/dev/null | grep -q releem || ls /etc/cron.d/ 2>/dev/null | grep -q releem; then
     log_pass "Cron job for releem configured"

@@ -456,6 +456,13 @@ function create_mysql_user() {
             mysql_root_exec "CREATE USER '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}' identified by '${RELEEM_MYSQL_PASSWORD}';"
             mysql_root_exec "GRANT PROCESS ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"
             mysql_root_exec "GRANT REPLICATION CLIENT ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"
+            if mysql_root_exec "GRANT REPLICA MONITOR ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
+            then
+                echo "Successfully GRANT" > /dev/null
+            elif mysql_root_exec "GRANT REPLICATION SLAVE ADMIN ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
+            then
+                echo "Successfully GRANT" > /dev/null
+            fi
             mysql_root_exec "GRANT SHOW VIEW ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"
             mysql_root_exec "GRANT SELECT ON mysql.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';"
 
@@ -477,7 +484,14 @@ function create_mysql_user() {
                 echo "Successfully GRANT" > /dev/null
             else
                 printf "\033[31m\n This database version is too old.\033[0m\n"
-            fi      
+            fi
+
+            if mysql_root_exec "GRANT SELECT ON performance_schema.replication_group_members TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
+            then
+                echo "Successfully GRANT" > /dev/null
+            else
+                printf "\033[33m\n Group Replication topology metrics are unavailable on this database version.\033[0m\n"
+            fi
 
             if mysql_root_exec "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
             then

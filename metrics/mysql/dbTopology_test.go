@@ -1,13 +1,102 @@
 package mysql
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/Releem/mysqlconfigurer/models"
 	logging "github.com/google/logger"
 )
+
+func TestReplicaStatusQueriesUsesMariaDBAllChannels(t *testing.T) {
+	queries := replicaStatusQueries(map[string]string{
+		"version":         "10.11.14-MariaDB-0ubuntu0.24.04.2",
+		"version_comment": "Ubuntu 24.04",
+	})
+
+	expected := []string{
+		"SHOW ALL REPLICAS STATUS",
+		"SHOW ALL SLAVES STATUS",
+		"SHOW REPLICA STATUS",
+		"SHOW SLAVE STATUS",
+	}
+	if len(queries) != len(expected) {
+		t.Fatalf("expected %d MariaDB replica status queries, got %#v", len(expected), queries)
+	}
+	for idx := range expected {
+		if queries[idx] != expected[idx] {
+			t.Fatalf("expected query %d to be %q, got %q", idx, expected[idx], queries[idx])
+		}
+	}
+}
+
+func TestReplicaStatusQueriesKeepsMySQLCompatibilityOrder(t *testing.T) {
+	queries := replicaStatusQueries(map[string]string{
+		"version":         "8.0.42",
+		"version_comment": "MySQL Community Server - GPL",
+	})
+
+	expected := []string{"SHOW REPLICA STATUS", "SHOW SLAVE STATUS"}
+	if len(queries) != len(expected) {
+		t.Fatalf("expected %d MySQL replica status queries, got %#v", len(expected), queries)
+	}
+	for idx := range expected {
+		if queries[idx] != expected[idx] {
+			t.Fatalf("expected query %d to be %q, got %q", idx, expected[idx], queries[idx])
+		}
+	}
+}
+
+func TestReplicaStatusQueriesDetectsMariaDBFromVersionComment(t *testing.T) {
+	queries := replicaStatusQueries(map[string]string{
+		"version":         "10.6.22",
+		"version_comment": "MariaDB Server",
+	})
+
+	if queries[0] != "SHOW ALL REPLICAS STATUS" {
+		t.Fatalf("expected MariaDB query order from version comment, got %#v", queries)
+	}
+}
+
+func TestFirstSupportedTopologyQueryFallsBackAfterQueryError(t *testing.T) {
+	queries := []string{"unsupported", "supported", "not-called"}
+	called := []string{}
+	expectedRows := []map[string]interface{}{{"Connection_name": "channel-a"}}
+
+	rows := firstSupportedTopologyQuery(queries, func(query string) ([]map[string]interface{}, bool) {
+		called = append(called, query)
+		if query == "supported" {
+			return expectedRows, true
+		}
+		return nil, false
+	})
+
+	if len(called) != 2 || called[0] != "unsupported" || called[1] != "supported" {
+		t.Fatalf("expected fallback to stop at first supported query, called %#v", called)
+	}
+	if len(rows) != 1 || rows[0]["Connection_name"] != "channel-a" {
+		t.Fatalf("expected rows from supported fallback query, got %#v", rows)
+	}
+}
+
+func TestFirstSupportedTopologyQueryStopsOnSuccessfulEmptyResult(t *testing.T) {
+	called := []string{}
+
+	rows := firstSupportedTopologyQuery([]string{"supported-empty", "not-called"}, func(query string) ([]map[string]interface{}, bool) {
+		called = append(called, query)
+		return []map[string]interface{}{}, true
+	})
+
+	if len(called) != 1 || called[0] != "supported-empty" {
+		t.Fatalf("expected successful empty result to stop fallback, called %#v", called)
+	}
+	if rows == nil || len(rows) != 0 {
+		t.Fatalf("expected successful empty result, got %#v", rows)
+	}
+}
 
 func TestBuildTopologyFromFactsDetectsAsyncReplica(t *testing.T) {
 	topology := BuildTopologyFromFacts(TopologyFacts{
@@ -50,6 +139,39 @@ func TestBuildTopologyFromFactsDetectsAsyncReplica(t *testing.T) {
 	}
 	if topology["IsWriter"] != false {
 		t.Fatalf("expected replica not to be writer, got %#v", topology["IsWriter"])
+	}
+}
+
+func TestBuildTopologyFromFactsUsesMariaDBMasterServerID(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_id":       "22",
+			"read_only":       "ON",
+			"version":         "10.11.14-MariaDB",
+			"version_comment": "MariaDB Server",
+		},
+		ReplicaStatus: []map[string]interface{}{
+			{
+				"Connection_name":       "source-a",
+				"Master_Host":           "mariadb-primary.example.com",
+				"Master_Server_Id":      "11",
+				"Slave_IO_Running":      "Yes",
+				"Slave_SQL_Running":     "Yes",
+				"Seconds_Behind_Master": "0",
+			},
+		},
+	})
+
+	if topology["PrimaryMemberKey"] != "11" {
+		t.Fatalf("expected MariaDB primary server_id, got %#v", topology["PrimaryMemberKey"])
+	}
+	if topology["GroupKey"] != "11" {
+		t.Fatalf("expected MariaDB primary server_id as group key, got %#v", topology["GroupKey"])
+	}
+	facts := topology["Facts"].(models.MetricGroupValue)
+	channels := facts["ReplicaChannels"].([]models.MetricGroupValue)
+	if channels[0]["Master_Server_Id"] != "11" {
+		t.Fatalf("expected Master_Server_Id retained in facts, got %#v", channels[0])
 	}
 }
 
@@ -149,8 +271,8 @@ func TestBuildTopologyFromFactsUsesWorstAsyncReplicationChannel(t *testing.T) {
 	if topology["IsReader"] != false {
 		t.Fatalf("expected stopped async replica not to serve reads, got %#v", topology["IsReader"])
 	}
-	if topology["GroupKey"] != "multi-source:healthy-primary-uuid,stopped-primary-uuid" {
-		t.Fatalf("expected stable multi-source group key, got %#v", topology["GroupKey"])
+	if topology["GroupKey"] != "multi-source:82acf8935d3df10fc257ed12b4b9245a87310a07d571d8dbca1cdbc56294a445" {
+		t.Fatalf("expected stable multi-source digest, got %#v", topology["GroupKey"])
 	}
 
 	facts := topology["Facts"].(models.MetricGroupValue)
@@ -203,8 +325,8 @@ func TestBuildTopologyFromFactsBreaksAsyncReplicationTiesByLag(t *testing.T) {
 	if topology["ReplicationLagSeconds"] != int64(30) {
 		t.Fatalf("expected higher lag at top level, got %#v", topology["ReplicationLagSeconds"])
 	}
-	if topology["GroupKey"] != "multi-source:high-lag-primary-uuid,low-lag-primary-uuid" {
-		t.Fatalf("expected stable sorted multi-source group key, got %#v", topology["GroupKey"])
+	if topology["GroupKey"] != "multi-source:86b73165acc9c089ed26433fa9afc4feacb02f04121bb1cce08bee9ff24c46fb" {
+		t.Fatalf("expected stable sorted multi-source digest, got %#v", topology["GroupKey"])
 	}
 }
 
@@ -219,8 +341,38 @@ func TestAsyncReplicaGroupKeyUsesAnalyzedChannels(t *testing.T) {
 		asyncReplicaChannel{primaryMemberKey: "primary-b", primaryHost: "db-b.example.com"},
 	)
 
-	if groupKey != "multi-source:primary-a,primary-b" {
-		t.Fatalf("expected sorted group key from analyzed channels, got %#v", groupKey)
+	if groupKey != "multi-source:3495b08ea97ce2bcd1bbcab31a6538ddc3500c561b3c7ae30e5cf45d9ec9b137" {
+		t.Fatalf("expected sorted digest from analyzed channels, got %#v", groupKey)
+	}
+}
+
+func TestAsyncReplicaGroupKeyUsesFixedLengthDigest(t *testing.T) {
+	channels := []asyncReplicaChannel{
+		{primaryMemberKey: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
+		{primaryMemberKey: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
+		{primaryMemberKey: "cccccccc-cccc-cccc-cccc-cccccccccccc"},
+		{primaryMemberKey: "dddddddd-dddd-dddd-dddd-dddddddddddd"},
+		{primaryMemberKey: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"},
+		{primaryMemberKey: "ffffffff-ffff-ffff-ffff-ffffffffffff"},
+		{primaryMemberKey: "11111111-1111-1111-1111-111111111111"},
+	}
+	selected := channels[0]
+
+	groupKey := asyncReplicaGroupKey(channels, "replica-uuid", selected)
+	reversed := append([]asyncReplicaChannel(nil), channels...)
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	reversedGroupKey := asyncReplicaGroupKey(reversed, "replica-uuid", selected)
+
+	if !strings.HasPrefix(groupKey, "multi-source:") {
+		t.Fatalf("expected multi-source digest prefix, got %q", groupKey)
+	}
+	if len(groupKey) != len("multi-source:")+64 {
+		t.Fatalf("expected fixed-length SHA-256 group key, got %d characters: %q", len(groupKey), groupKey)
+	}
+	if groupKey != reversedGroupKey {
+		t.Fatalf("expected channel order not to affect digest, got %q and %q", groupKey, reversedGroupKey)
 	}
 }
 
@@ -291,8 +443,8 @@ func TestBuildTopologyFromFactsInfersGroupReplicationPrimaryWhenMembersUnavailab
 	if topology["PrimaryMemberKey"] != "member-1" {
 		t.Fatalf("expected current member as primary, got %#v", topology["PrimaryMemberKey"])
 	}
-	if topology["IsWriter"] != true {
-		t.Fatalf("expected writable primary, got %#v", topology["IsWriter"])
+	if topology["IsWriter"] != false {
+		t.Fatalf("expected unknown replication state not to advertise writer availability, got %#v", topology["IsWriter"])
 	}
 	if topology["IsReader"] != true {
 		t.Fatalf("expected inferred group replication primary to serve reads, got %#v", topology["IsReader"])
@@ -335,6 +487,109 @@ func TestBuildTopologyFromFactsDetectsGroupReplicationSecondary(t *testing.T) {
 	}
 }
 
+func TestBuildTopologyFromFactsMapsMySQL57GroupReplicationPrimaryFromStatus(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":                           "member-2",
+			"group_replication_group_name":          "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+			"group_replication_single_primary_mode": "ON",
+			"read_only":                             "ON",
+			"super_read_only":                       "ON",
+		},
+		Status: map[string]interface{}{
+			"group_replication_primary_member": "member-1",
+		},
+		GroupMembers: []map[string]interface{}{
+			{
+				"MEMBER_ID":    "member-1",
+				"MEMBER_HOST":  "db1.example.com",
+				"MEMBER_STATE": "ONLINE",
+			},
+			{
+				"MEMBER_ID":    "member-2",
+				"MEMBER_HOST":  "db2.example.com",
+				"MEMBER_STATE": "ONLINE",
+			},
+		},
+	})
+
+	if topology["Role"] != "replica" {
+		t.Fatalf("expected MySQL 5.7 secondary role, got %#v", topology["Role"])
+	}
+	if topology["PrimaryMemberKey"] != "member-1" {
+		t.Fatalf("expected primary from group_replication_primary_member, got %#v", topology["PrimaryMemberKey"])
+	}
+	if topology["PrimaryHost"] != "db1.example.com" {
+		t.Fatalf("expected primary host mapped from members, got %#v", topology["PrimaryHost"])
+	}
+}
+
+func TestBuildTopologyFromFactsClearsPrimaryForMultiPrimaryGroupReplication(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":                           "member-2",
+			"group_replication_group_name":          "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+			"group_replication_single_primary_mode": "OFF",
+			"read_only":                             "OFF",
+			"super_read_only":                       "OFF",
+		},
+		Status: map[string]interface{}{
+			"group_replication_primary_member": "member-1",
+		},
+		GroupMembers: []map[string]interface{}{
+			{
+				"MEMBER_ID":    "member-1",
+				"MEMBER_HOST":  "db1.example.com",
+				"MEMBER_STATE": "ONLINE",
+				"MEMBER_ROLE":  "PRIMARY",
+			},
+			{
+				"MEMBER_ID":    "member-2",
+				"MEMBER_HOST":  "db2.example.com",
+				"MEMBER_STATE": "ONLINE",
+				"MEMBER_ROLE":  "PRIMARY",
+			},
+		},
+	})
+
+	if topology["Role"] != "multi_primary" {
+		t.Fatalf("expected multi-primary role, got %#v", topology["Role"])
+	}
+	if topology["PrimaryMemberKey"] != nil || topology["PrimaryHost"] != nil {
+		t.Fatalf("expected no unique primary in multi-primary mode, got key=%#v host=%#v", topology["PrimaryMemberKey"], topology["PrimaryHost"])
+	}
+	if topology["IsWriter"] != true {
+		t.Fatalf("expected healthy writable multi-primary member, got %#v", topology["IsWriter"])
+	}
+}
+
+func TestBuildTopologyFromFactsMarksOfflineGroupReplicationPrimaryAsNonWriter(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":                           "member-1",
+			"group_replication_group_name":          "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+			"group_replication_single_primary_mode": "ON",
+			"read_only":                             "OFF",
+			"super_read_only":                       "OFF",
+		},
+		GroupMembers: []map[string]interface{}{
+			{
+				"MEMBER_ID":    "member-1",
+				"MEMBER_HOST":  "db1.example.com",
+				"MEMBER_STATE": "OFFLINE",
+				"MEMBER_ROLE":  "PRIMARY",
+			},
+		},
+	})
+
+	if topology["ReplicationState"] != "error" {
+		t.Fatalf("expected offline member state to be error, got %#v", topology["ReplicationState"])
+	}
+	if topology["IsWriter"] != false {
+		t.Fatalf("expected offline primary not to be a writer, got %#v", topology["IsWriter"])
+	}
+}
+
 func TestBuildTopologyFromFactsDetectsGaleraCluster(t *testing.T) {
 	topology := BuildTopologyFromFacts(TopologyFacts{
 		Variables: map[string]interface{}{
@@ -369,6 +624,126 @@ func TestBuildTopologyFromFactsDetectsGaleraCluster(t *testing.T) {
 	}
 	if topology["IsReader"] != true {
 		t.Fatalf("expected healthy galera node to serve reads, got %#v", topology["IsReader"])
+	}
+}
+
+func TestBuildTopologyFromFactsUsesGaleraNodeNameBeforeClusterStateUUID(t *testing.T) {
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"wsrep_on":                 "ON",
+			"wsrep_node_name":          "galera-node-2",
+			"wsrep_node_address":       "10.0.0.12",
+			"wsrep_cluster_state_uuid": "shared-cluster-state",
+			"read_only":                "OFF",
+		},
+		Status: map[string]interface{}{
+			"wsrep_local_state_uuid":    "shared-cluster-state",
+			"wsrep_ready":               "ON",
+			"wsrep_connected":           "ON",
+			"wsrep_cluster_status":      "Primary",
+			"wsrep_local_state_comment": "Synced",
+		},
+	})
+
+	if topology["MemberKey"] != "galera-node-2" {
+		t.Fatalf("expected Galera node name as member key, got %#v", topology["MemberKey"])
+	}
+	if topology["MemberKey"] == topology["GroupKey"] {
+		t.Fatalf("expected member identity to differ from shared cluster state UUID")
+	}
+}
+
+func TestBuildTopologyFromFactsPreservesConcurrentTopologyRelations(t *testing.T) {
+	asyncStatus := []map[string]interface{}{
+		{
+			"Connection_name":       "clusterset-channel",
+			"Master_Host":           "upstream.example.com",
+			"Master_UUID":           "upstream-uuid",
+			"Slave_IO_Running":      "Yes",
+			"Slave_SQL_Running":     "Yes",
+			"Seconds_Behind_Master": "0",
+		},
+	}
+
+	tests := []struct {
+		name      string
+		facts     TopologyFacts
+		primary   string
+		relations []string
+	}{
+		{
+			name: "galera with async channel",
+			facts: TopologyFacts{
+				Variables: map[string]interface{}{
+					"wsrep_on":                 "ON",
+					"wsrep_cluster_state_uuid": "galera-group",
+					"wsrep_node_name":          "galera-1",
+					"read_only":                "OFF",
+				},
+				Status: map[string]interface{}{
+					"wsrep_ready":               "ON",
+					"wsrep_connected":           "ON",
+					"wsrep_cluster_status":      "Primary",
+					"wsrep_local_state_comment": "Synced",
+				},
+				ReplicaStatus: asyncStatus,
+			},
+			primary:   "galera_cluster",
+			relations: []string{"galera_cluster", "async_replication"},
+		},
+		{
+			name: "group replication with ClusterSet channel",
+			facts: TopologyFacts{
+				Variables: map[string]interface{}{
+					"server_uuid":                           "member-1",
+					"group_replication_group_name":          "gr-group",
+					"group_replication_single_primary_mode": "ON",
+					"read_only":                             "OFF",
+				},
+				GroupMembers: []map[string]interface{}{
+					{
+						"MEMBER_ID":    "member-1",
+						"MEMBER_HOST":  "db1.example.com",
+						"MEMBER_STATE": "ONLINE",
+						"MEMBER_ROLE":  "PRIMARY",
+					},
+				},
+				ReplicaStatus: asyncStatus,
+			},
+			primary:   "group_replication",
+			relations: []string{"group_replication", "async_replication"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			topology := BuildTopologyFromFacts(test.facts)
+			if topology["Type"] != test.primary {
+				t.Fatalf("expected primary topology %q, got %#v", test.primary, topology["Type"])
+			}
+
+			facts := topology["Facts"].(models.MetricGroupValue)
+			relations, ok := facts["Relations"].([]models.MetricGroupValue)
+			if !ok {
+				t.Fatalf("expected concurrent topology relations in facts, got %#v", facts["Relations"])
+			}
+			if len(relations) != len(test.relations) {
+				t.Fatalf("expected %d relations, got %#v", len(test.relations), relations)
+			}
+			for idx, relationType := range test.relations {
+				if relations[idx]["Type"] != relationType {
+					t.Fatalf("expected relation %d type %q, got %#v", idx, relationType, relations[idx]["Type"])
+				}
+			}
+			asyncFacts := relations[len(relations)-1]["Facts"].(models.MetricGroupValue)
+			channels := asyncFacts["ReplicaChannels"].([]models.MetricGroupValue)
+			if len(channels) != 1 || channels[0]["Master_UUID"] != "upstream-uuid" {
+				t.Fatalf("expected full async channel relation, got %#v", channels)
+			}
+			if _, err := json.Marshal(topology); err != nil {
+				t.Fatalf("expected concurrent relations to be JSON serializable: %v", err)
+			}
+		})
 	}
 }
 
@@ -416,14 +791,16 @@ func TestBuildTopologyFromFactsReturnsStandaloneForNoReplicationFacts(t *testing
 }
 
 type fakeTopologyRows struct {
-	columns []string
-	rows    [][]interface{}
-	err     error
-	index   int
+	columns    []string
+	columnsErr error
+	rows       [][]interface{}
+	scanErr    error
+	err        error
+	index      int
 }
 
 func (r *fakeTopologyRows) Columns() ([]string, error) {
-	return r.columns, nil
+	return r.columns, r.columnsErr
 }
 
 func (r *fakeTopologyRows) Next() bool {
@@ -431,6 +808,9 @@ func (r *fakeTopologyRows) Next() bool {
 }
 
 func (r *fakeTopologyRows) Scan(dest ...interface{}) error {
+	if r.scanErr != nil {
+		return r.scanErr
+	}
 	row := r.rows[r.index]
 	r.index++
 	for i := range dest {
@@ -444,17 +824,42 @@ func (r *fakeTopologyRows) Err() error {
 	return r.err
 }
 
-func TestScanTopologyRowsReturnsNilOnRowsErr(t *testing.T) {
+func TestScanTopologyRowsReportsRowErrors(t *testing.T) {
 	logger := *logging.Init("db-topology-test", false, false, io.Discard)
 	defer logger.Close()
 
-	rows := &fakeTopologyRows{
-		columns: []string{"Source_Host"},
-		rows:    [][]interface{}{{"primary.example.com"}},
-		err:     errors.New("cursor failed"),
+	tests := []struct {
+		name string
+		rows *fakeTopologyRows
+	}{
+		{
+			name: "columns error",
+			rows: &fakeTopologyRows{columnsErr: errors.New("columns failed")},
+		},
+		{
+			name: "scan error",
+			rows: &fakeTopologyRows{
+				columns: []string{"Source_Host"},
+				rows:    [][]interface{}{{"primary.example.com"}},
+				scanErr: errors.New("scan failed"),
+			},
+		},
+		{
+			name: "iteration error",
+			rows: &fakeTopologyRows{
+				columns: []string{"Source_Host"},
+				rows:    [][]interface{}{{"primary.example.com"}},
+				err:     errors.New("cursor failed"),
+			},
+		},
 	}
 
-	if result := scanTopologyRows(rows, logger); result != nil {
-		t.Fatalf("expected nil result when rows has iteration error, got %#v", result)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, ok := scanTopologyRows(test.rows, logger)
+			if ok || result != nil {
+				t.Fatalf("expected failed row scan, got ok=%v result=%#v", ok, result)
+			}
+		})
 	}
 }

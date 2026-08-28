@@ -14,11 +14,12 @@ OS_VERSION="windows-2022"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --os)      OS_VERSION="$2"; shift 2 ;;
         --db)      DB_VERSION="$2"; shift 2 ;;
         --test)    TEST_NUM="$2";   shift 2 ;;
         --keep-vm) KEEP_VM=true;      shift ;;
         -h|--help)
-            echo "Usage: $0 [--db mysql-8.0|mysql-8.4|mariadb-10] [--test 1|2|3|4|5|6|7|8|9|all] [--keep-vm]"
+            echo "Usage: $0 [--os windows-server-2022] [--db mysql-8.0|mysql-8.4|mariadb-10] [--test 1|2|3|4|5|6|7|8|9|all] [--keep-vm]"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;

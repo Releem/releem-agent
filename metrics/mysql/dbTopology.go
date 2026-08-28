@@ -1,7 +1,7 @@
 package mysql
 
 import (
-	"database/sql"
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strconv"
@@ -50,15 +50,13 @@ func NewDBTopologyGatherer(logger logging.Logger, configuration *config.Config) 
 func (g *DBTopologyGatherer) GetMetrics(metrics *models.Metrics) error {
 	defer utils.HandlePanic(g.configuration, g.logger)
 
-	replicaStatus := g.queryOptionalRows("SHOW REPLICA STATUS")
-	if len(replicaStatus) == 0 {
-		replicaStatus = g.queryOptionalRows("SHOW SLAVE STATUS")
-	}
+	variables := mapFromMetricGroup(metrics.DB.Conf.Variables)
+	replicaStatus := g.queryReplicaStatus(normalizeKeys(variables))
 
 	groupMembers := g.queryGroupReplicationMembers()
 
 	metrics.DB.Topology = BuildTopologyFromFacts(TopologyFacts{
-		Variables:     mapFromMetricGroup(metrics.DB.Conf.Variables),
+		Variables:     variables,
 		Status:        mapFromMetricGroup(metrics.DB.Metrics.Status),
 		ReplicaStatus: replicaStatus,
 		GroupMembers:  groupMembers,
@@ -67,30 +65,56 @@ func (g *DBTopologyGatherer) GetMetrics(metrics *models.Metrics) error {
 	return nil
 }
 
-func (g *DBTopologyGatherer) queryOptionalRows(query string) []map[string]interface{} {
+func (g *DBTopologyGatherer) queryOptionalRows(query string) ([]map[string]interface{}, bool) {
 	rows, err := models.DB.Query(query)
 	if err != nil {
-		if err != sql.ErrNoRows {
-			g.logger.V(5).Info("Topology query skipped: ", err)
-		}
-		return nil
+		g.logger.V(5).Info("Topology query skipped: ", err)
+		return nil, false
 	}
 	defer rows.Close()
 
 	return scanTopologyRows(rows, g.logger)
 }
 
+func (g *DBTopologyGatherer) queryReplicaStatus(variables map[string]string) []map[string]interface{} {
+	return firstSupportedTopologyQuery(replicaStatusQueries(variables), g.queryOptionalRows)
+}
+
+func firstSupportedTopologyQuery(queries []string, queryRows func(string) ([]map[string]interface{}, bool)) []map[string]interface{} {
+	for _, query := range queries {
+		rows, supported := queryRows(query)
+		if supported {
+			return rows
+		}
+	}
+	return nil
+}
+
+func replicaStatusQueries(variables map[string]string) []string {
+	vendor := strings.ToLower(firstString(variables, "version") + " " + firstString(variables, "version_comment"))
+	if strings.Contains(vendor, "mariadb") {
+		return []string{
+			"SHOW ALL REPLICAS STATUS",
+			"SHOW ALL SLAVES STATUS",
+			"SHOW REPLICA STATUS",
+			"SHOW SLAVE STATUS",
+		}
+	}
+	return []string{"SHOW REPLICA STATUS", "SHOW SLAVE STATUS"}
+}
+
 func (g *DBTopologyGatherer) queryGroupReplicationMembers() []map[string]interface{} {
-	groupMembers := g.queryOptionalRows(`
+	groupMembers, supported := g.queryOptionalRows(`
 		SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_STATE, MEMBER_ROLE
 		FROM performance_schema.replication_group_members`)
-	if len(groupMembers) > 0 {
+	if supported {
 		return groupMembers
 	}
 
-	return g.queryOptionalRows(`
+	groupMembers, _ = g.queryOptionalRows(`
 		SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_STATE
 		FROM performance_schema.replication_group_members`)
+	return groupMembers
 }
 
 func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
@@ -120,17 +144,38 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		"Facts":                 models.MetricGroupValue{},
 	}
 
+	var selected models.MetricGroupValue
+	relations := make([]models.MetricGroupValue, 0, 3)
 	if isGalera(variables, status) {
-		return buildGaleraTopology(topology, variables, status)
+		galera := buildGaleraTopology(cloneMetricGroup(topology), variables, status)
+		selected = galera
+		relations = append(relations, topologyRelation(galera))
 	}
 	if isGroupReplication(variables, facts.GroupMembers) {
-		return buildGroupReplicationTopology(topology, variables, facts.GroupMembers, readOnly, superReadOnly)
+		groupReplication := buildGroupReplicationTopology(cloneMetricGroup(topology), variables, status, facts.GroupMembers, readOnly, superReadOnly)
+		if selected == nil {
+			selected = groupReplication
+		}
+		relations = append(relations, topologyRelation(groupReplication))
 	}
 	if len(facts.ReplicaStatus) > 0 {
-		return buildAsyncReplicaTopology(topology, variables, facts.ReplicaStatus)
+		asyncReplication := buildAsyncReplicaTopology(cloneMetricGroup(topology), variables, facts.ReplicaStatus)
+		if selected == nil {
+			selected = asyncReplication
+		}
+		relations = append(relations, topologyRelation(asyncReplication))
 	}
 
-	return topology
+	if selected == nil {
+		return topology
+	}
+	if len(relations) > 1 {
+		selectedFacts, _ := selected["Facts"].(models.MetricGroupValue)
+		selectedFacts = cloneMetricGroup(selectedFacts)
+		selectedFacts["Relations"] = relations
+		selected["Facts"] = selectedFacts
+	}
+	return selected
 }
 
 func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[string]string, replicaStatuses []map[string]interface{}) models.MetricGroupValue {
@@ -167,7 +212,12 @@ func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[s
 func analyzeAsyncReplicaChannel(replicaStatus map[string]interface{}) asyncReplicaChannel {
 	row := normalizeKeys(replicaStatus)
 	primaryHost := firstNonEmpty(firstString(row, "source_host"), firstString(row, "master_host"))
-	primaryMemberKey := firstNonEmpty(firstString(row, "source_uuid"), firstString(row, "master_uuid"))
+	primaryMemberKey := firstNonEmpty(
+		firstString(row, "source_uuid"),
+		firstString(row, "master_uuid"),
+		firstString(row, "source_server_id"),
+		firstString(row, "master_server_id"),
+	)
 	lagValue, lagOK := optionalInt64(firstNonEmpty(firstString(row, "seconds_behind_source"), firstString(row, "seconds_behind_master")))
 	ioRunning := strings.EqualFold(firstNonEmpty(firstString(row, "replica_io_running"), firstString(row, "slave_io_running")), "Yes")
 	sqlRunning := strings.EqualFold(firstNonEmpty(firstString(row, "replica_sql_running"), firstString(row, "slave_sql_running")), "Yes")
@@ -194,7 +244,7 @@ func analyzeAsyncReplicaChannel(replicaStatus map[string]interface{}) asyncRepli
 	}
 }
 
-func buildGroupReplicationTopology(topology models.MetricGroupValue, variables map[string]string, members []map[string]interface{}, readOnly bool, superReadOnly bool) models.MetricGroupValue {
+func buildGroupReplicationTopology(topology models.MetricGroupValue, variables map[string]string, status map[string]string, members []map[string]interface{}, readOnly bool, superReadOnly bool) models.MetricGroupValue {
 	memberKey := firstNonEmpty(firstString(variables, "server_uuid"), topologyString(topology, "MemberKey"))
 	groupKey := firstNonEmpty(firstString(variables, "group_replication_group_name"), memberKey)
 	singlePrimary := !strings.EqualFold(firstString(variables, "group_replication_single_primary_mode"), "OFF")
@@ -202,14 +252,16 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 	state := "unknown"
 	primaryMemberKey := ""
 	primaryHost := ""
+	memberHosts := make(map[string]string, len(members))
 
 	for _, rawMember := range members {
 		member := normalizeKeys(rawMember)
 		memberID := firstString(member, "member_id")
 		memberRole := strings.ToUpper(firstString(member, "member_role"))
+		memberHosts[memberID] = firstString(member, "member_host")
 		if memberRole == "PRIMARY" && primaryMemberKey == "" {
 			primaryMemberKey = memberID
-			primaryHost = firstString(member, "member_host")
+			primaryHost = memberHosts[memberID]
 		}
 		if memberID == memberKey {
 			state = groupMemberState(firstString(member, "member_state"))
@@ -220,13 +272,24 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 			}
 		}
 	}
+	if singlePrimary && primaryMemberKey == "" {
+		primaryMemberKey = firstString(status, "group_replication_primary_member")
+		primaryHost = memberHosts[primaryMemberKey]
+	}
 	if !singlePrimary {
 		role = "multi_primary"
+		primaryMemberKey = ""
+		primaryHost = ""
 	} else if role == "member" {
-		if !readOnly && !superReadOnly {
+		if primaryMemberKey != "" && memberKey == primaryMemberKey {
+			role = "primary"
+		} else if primaryMemberKey != "" {
+			role = "replica"
+		} else if !readOnly && !superReadOnly {
 			role = "primary"
 			primaryMemberKey = memberKey
-		} else if readOnly || superReadOnly {
+			primaryHost = memberHosts[memberKey]
+		} else {
 			role = "replica"
 		}
 	}
@@ -236,7 +299,7 @@ func buildGroupReplicationTopology(topology models.MetricGroupValue, variables m
 	topology["GroupKey"] = groupKey
 	topology["PrimaryMemberKey"] = nullableString(primaryMemberKey)
 	topology["PrimaryHost"] = nullableString(primaryHost)
-	topology["IsWriter"] = (role == "primary" || role == "multi_primary") && !readOnly && !superReadOnly
+	topology["IsWriter"] = (role == "primary" || role == "multi_primary") && !readOnly && !superReadOnly && state == "healthy"
 	topology["IsReader"] = topologyIsReader(state)
 	topology["ReplicationState"] = state
 	topology["Facts"] = models.MetricGroupValue{"GroupMembers": members}
@@ -253,8 +316,13 @@ func buildGaleraTopology(topology models.MetricGroupValue, variables map[string]
 	)
 	memberKey := firstNonEmpty(
 		firstString(variables, "wsrep_node_uuid"),
-		firstString(status, "wsrep_local_state_uuid"),
+		firstString(status, "wsrep_node_uuid"),
+		firstString(variables, "wsrep_node_name"),
+		firstString(status, "wsrep_node_name"),
+		firstString(variables, "wsrep_node_address"),
+		firstString(status, "wsrep_node_address"),
 		topologyString(topology, "MemberKey"),
+		firstString(status, "wsrep_local_state_uuid"),
 	)
 	state := "unknown"
 	if truthy(firstString(status, "wsrep_ready")) &&
@@ -279,11 +347,11 @@ func buildGaleraTopology(topology models.MetricGroupValue, variables map[string]
 	return topology
 }
 
-func scanTopologyRows(rows topologyRows, logger logging.Logger) []map[string]interface{} {
+func scanTopologyRows(rows topologyRows, logger logging.Logger) ([]map[string]interface{}, bool) {
 	cols, err := rows.Columns()
 	if err != nil {
 		logger.Error(err)
-		return nil
+		return nil, false
 	}
 
 	result := []map[string]interface{}{}
@@ -295,7 +363,7 @@ func scanTopologyRows(rows topologyRows, logger logging.Logger) []map[string]int
 		}
 		if err := rows.Scan(ptrs...); err != nil {
 			logger.Error(err)
-			return nil
+			return nil, false
 		}
 		row := make(map[string]interface{}, len(cols))
 		for i, col := range cols {
@@ -310,9 +378,9 @@ func scanTopologyRows(rows topologyRows, logger logging.Logger) []map[string]int
 	}
 	if err := rows.Err(); err != nil {
 		logger.Error(err)
-		return nil
+		return nil, false
 	}
-	return result
+	return result, true
 }
 
 func mapFromMetricGroup(input models.MetricGroupValue) map[string]interface{} {
@@ -411,7 +479,27 @@ func asyncReplicaGroupKey(channels []asyncReplicaChannel, serverUUID string, sel
 		return firstNonEmpty(serverUUID, selected.primaryMemberKey, selected.primaryHost)
 	}
 	sort.Strings(keys)
-	return "multi-source:" + strings.Join(keys, ",")
+	if len(keys) == 1 {
+		return keys[0]
+	}
+	digest := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
+	return fmt.Sprintf("multi-source:%x", digest)
+}
+
+func cloneMetricGroup(input models.MetricGroupValue) models.MetricGroupValue {
+	output := make(models.MetricGroupValue, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
+}
+
+func topologyRelation(topology models.MetricGroupValue) models.MetricGroupValue {
+	relation := cloneMetricGroup(topology)
+	if facts, ok := topology["Facts"].(models.MetricGroupValue); ok {
+		relation["Facts"] = cloneMetricGroup(facts)
+	}
+	return relation
 }
 
 func truthy(value string) bool {
@@ -480,6 +568,8 @@ func selectReplicaStatusFacts(values map[string]interface{}) models.MetricGroupV
 		"Master_Host",
 		"Source_UUID",
 		"Master_UUID",
+		"Source_Server_Id",
+		"Master_Server_Id",
 		"Replica_IO_Running",
 		"Slave_IO_Running",
 		"Replica_SQL_Running",

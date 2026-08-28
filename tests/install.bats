@@ -321,6 +321,94 @@ exit 0
     [ "$status" -ne 0 ] || return 1
 }
 
+@test "Linux and Windows installers grant Group Replication membership access" {
+    local grant="GRANT SELECT ON performance_schema.replication_group_members"
+
+    run grep -F "$grant" "${INSTALL_SH}"
+    [ "$status" -eq 0 ]
+
+    run grep -F "$grant" "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+}
+
+@test "Windows test runner accepts the workflow OS option" {
+    run bash "${REPO_ROOT}/tests/run_tests_windows.sh" --os windows-server-2022 --help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage:"* ]]
+}
+
+@test "Linux and Windows installers grant version-compatible MariaDB replica monitoring access" {
+    local current_grant="GRANT REPLICA MONITOR ON *.*"
+    local compatibility_grant="GRANT REPLICATION SLAVE ADMIN ON *.*"
+
+    run grep -F "$current_grant" "${INSTALL_SH}"
+    [ "$status" -eq 0 ]
+    run grep -F "$compatibility_grant" "${INSTALL_SH}"
+    [ "$status" -eq 0 ]
+
+    run grep -F "$current_grant" "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+    run grep -F "$compatibility_grant" "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+}
+
+@test "create_mysql_user falls back to legacy MariaDB replica monitoring privilege" {
+    load_install_functions
+    set -e
+    create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
+    create_mock_cmd "mysql" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"GRANT REPLICA MONITOR ON"* ]]; then
+  exit 1
+fi
+exit 0
+'
+
+    export MYSQL_ARGS_LOG="${TEST_TMPDIR}/mysql.args"
+    mysqladmincmd="${MOCK_BIN}/mysqladmin"
+    mysqlcmd="${MOCK_BIN}/mysql"
+    root_connection_string="--host=127.0.0.1 --port=3306"
+    connection_string="--host=127.0.0.1 --port=3306"
+    mysql_user_host="127.0.0.1"
+    unset RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_QUERY_OPTIMIZATION
+
+    run create_mysql_user
+
+    [ "$status" -eq 0 ]
+    run grep -F "GRANT REPLICA MONITOR ON *.*" "${TEST_TMPDIR}/mysql.args"
+    [ "$status" -eq 0 ]
+    run grep -F "GRANT REPLICATION SLAVE ADMIN ON *.*" "${TEST_TMPDIR}/mysql.args"
+    [ "$status" -eq 0 ]
+}
+
+@test "create_mysql_user treats Group Replication membership grant as non-fatal" {
+    load_install_functions
+    set -e
+    create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
+    create_mock_cmd "mysql" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"performance_schema.replication_group_members"* ]]; then
+  exit 1
+fi
+exit 0
+'
+
+    export MYSQL_ARGS_LOG="${TEST_TMPDIR}/mysql.args"
+    mysqladmincmd="${MOCK_BIN}/mysqladmin"
+    mysqlcmd="${MOCK_BIN}/mysql"
+    root_connection_string="--host=127.0.0.1 --port=3306"
+    connection_string="--host=127.0.0.1 --port=3306"
+    mysql_user_host="127.0.0.1"
+    unset RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_QUERY_OPTIMIZATION
+
+    run create_mysql_user
+
+    [ "$status" -eq 0 ]
+    run grep -F "GRANT SELECT ON performance_schema.replication_group_members" "${TEST_TMPDIR}/mysql.args"
+    [ "$status" -eq 0 ]
+}
+
 @test "create_mysql_user keeps empty root password option when root password env is set to empty string" {
     load_install_functions
     set -e

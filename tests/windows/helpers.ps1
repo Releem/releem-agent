@@ -101,6 +101,27 @@ function Assert-MySQLCanConnect {
     }
 }
 
+function Get-ReleemConfigValue {
+    param([string]$Path, [string]$Key)
+
+    foreach ($line in Get-Content -Path $Path) {
+        if ($line -match "^$([regex]::Escape($Key))=""?(.*?)""?$") {
+            return $matches[1]
+        }
+    }
+    throw "Key '$Key' not found in $Path"
+}
+
+function Assert-MySQLCanRunQuery {
+    param([string]$Desc, [string]$User, [string]$Password, [string]$Query)
+    $output = & mysql -u $User -p"$Password" -h 127.0.0.1 -e $Query 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Pass $Desc
+    } else {
+        Write-Fail "$Desc`: MySQL user '$User' cannot run '$Query': $output"
+    }
+}
+
 function Assert-FileContains {
     param([string]$Desc, [string]$FilePath, [string]$Pattern)
     if (Test-Path $FilePath) {

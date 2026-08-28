@@ -484,6 +484,12 @@ if ($env:RELEEM_MYSQL_PASSWORD -and $env:RELEEM_MYSQL_LOGIN) {
         $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
             -e "GRANT REPLICATION CLIENT ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
+            -e "GRANT REPLICA MONITOR ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        if ($LASTEXITCODE -ne 0) {
+            $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
+                -e "GRANT REPLICATION SLAVE ADMIN ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        }
+        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
             -e "GRANT SHOW VIEW ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
             -e "GRANT SELECT ON mysql.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
@@ -495,6 +501,8 @@ if ($env:RELEEM_MYSQL_PASSWORD -and $env:RELEEM_MYSQL_LOGIN) {
             -e "GRANT SELECT ON performance_schema.table_io_waits_summary_by_index_usage TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
             -e "GRANT SELECT ON performance_schema.file_summary_by_instance TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
+            -e "GRANT SELECT ON performance_schema.replication_group_members TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
 
         # SYSTEM_VARIABLES_ADMIN or SUPER (non-fatal)
         $null = Invoke-MySQL -h $MysqlHost -P $MysqlPort -u root "-p$RootPassword" `
