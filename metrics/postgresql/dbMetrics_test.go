@@ -119,23 +119,28 @@ func TestDbMetricsUsesCapabilityInfoRelation(t *testing.T) {
 
 func TestIsPGManagedInternalDatabase(t *testing.T) {
 	tests := []struct {
-		name     string
-		database string
-		want     bool
+		name         string
+		instanceType string
+		database     string
+		want         bool
 	}{
-		{name: "AWS Aurora/RDS maintenance database", database: "rdsadmin", want: true},
-		{name: "GCP Cloud SQL maintenance database", database: "cloudsqladmin", want: true},
-		{name: "Azure maintenance database", database: "azure_maintenance", want: true},
-		{name: "case and padding are ignored", database: "  RDSAdmin ", want: true},
-		{name: "customer database is collected", database: "app", want: false},
-		{name: "default postgres database is collected", database: "postgres", want: false},
-		{name: "similar customer name is not skipped", database: "rdsadmin_reports", want: false},
+		{name: "local rdsadmin database is collected", instanceType: "local", database: "rdsadmin", want: false},
+		{name: "local cloudsqladmin database is collected", instanceType: "local", database: "cloudsqladmin", want: false},
+		{name: "local azure maintenance database is collected", instanceType: "local", database: "azure_maintenance", want: false},
+		{name: "AWS skips its maintenance database", instanceType: "aws/rds", database: "rdsadmin", want: true},
+		{name: "AWS collects another provider maintenance name", instanceType: "aws/rds", database: "cloudsqladmin", want: false},
+		{name: "GCP skips its maintenance database", instanceType: "gcp/cloudsql", database: "cloudsqladmin", want: true},
+		{name: "Azure PostgreSQL skips its maintenance database", instanceType: "azure/postgresql", database: "azure_maintenance", want: true},
+		{name: "case and padding are ignored", instanceType: " AWS/RDS ", database: "  RDSAdmin ", want: true},
+		{name: "customer database is collected", instanceType: "aws/rds", database: "app", want: false},
+		{name: "similar customer name is not skipped", instanceType: "aws/rds", database: "rdsadmin_reports", want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isPGManagedInternalDatabase(tt.database); got != tt.want {
-				t.Fatalf("isPGManagedInternalDatabase(%q) = %t, want %t", tt.database, got, tt.want)
+			t.Parallel()
+			if got := isPGManagedInternalDatabase(tt.instanceType, tt.database); got != tt.want {
+				t.Errorf("isPGManagedInternalDatabase(%q, %q) = %t, want %t", tt.instanceType, tt.database, got, tt.want)
 			}
 		})
 	}

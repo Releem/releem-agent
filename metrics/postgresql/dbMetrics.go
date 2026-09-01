@@ -38,20 +38,18 @@ type pgDatabaseConnection interface {
 	Close() error
 }
 
-// pgManagedInternalDatabases are the maintenance databases that managed
-// providers keep for themselves. A customer role is refused at the pg_hba
-// level, which no catalog privilege check can predict, so they are excluded by
-// name to keep the per-database loop from reporting an unavoidable failure on
-// every collection cycle.
-var pgManagedInternalDatabases = map[string]struct{}{
-	"rdsadmin":          {}, // AWS RDS / Aurora
-	"cloudsqladmin":     {}, // GCP Cloud SQL
-	"azure_maintenance": {}, // Azure Database for PostgreSQL
+// pgManagedInternalDatabaseByInstanceType maps managed providers to the
+// maintenance database that they keep for themselves. These names remain
+// valid customer database names on local PostgreSQL installations.
+var pgManagedInternalDatabaseByInstanceType = map[string]string{
+	"aws/rds":          "rdsadmin",
+	"gcp/cloudsql":     "cloudsqladmin",
+	"azure/postgresql": "azure_maintenance",
 }
 
-func isPGManagedInternalDatabase(database string) bool {
-	_, managed := pgManagedInternalDatabases[strings.ToLower(strings.TrimSpace(database))]
-	return managed
+func isPGManagedInternalDatabase(instanceType, database string) bool {
+	internalDatabase, managed := pgManagedInternalDatabaseByInstanceType[strings.ToLower(strings.TrimSpace(instanceType))]
+	return managed && internalDatabase == strings.ToLower(strings.TrimSpace(database))
 }
 
 func forEachPGDatabase(databases []string, connect func(string) pgDatabaseConnection, collect func(string, pgDatabaseConnection) error, logError func(string, error)) {
@@ -148,7 +146,7 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 				DBMetricsBase.logger.Error(err)
 				return err
 			}
-			if isPGManagedInternalDatabase(database) {
+			if isPGManagedInternalDatabase(DBMetricsBase.configuration.InstanceType, database) {
 				DBMetricsBase.logger.V(5).Info("Skipping provider-managed database ", database)
 				continue
 			}
