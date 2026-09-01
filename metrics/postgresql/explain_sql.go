@@ -32,8 +32,8 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 		}
 
 		logger.Error("Explain prepared statement error: ", err)
-		if isExplainPermissionError(err) {
-			return explain, errors.New("need_grant_permission")
+		if grantErr := explainPermissionGrantError(queryText, err); grantErr != nil {
+			return explain, grantErr
 		}
 		if shouldRetryExplainWithoutPrepare(err) {
 			logger.Info("Retrying explain without prepare")
@@ -42,8 +42,8 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 				return explain, nil
 			}
 			logger.Error("Fallback direct EXPLAIN for parameterized query failed: ", err)
-			if isExplainPermissionError(err) {
-				return explain, errors.New("need_grant_permission")
+			if grantErr := explainPermissionGrantError(queryText, err); grantErr != nil {
+				return explain, grantErr
 			}
 		}
 		return explain, err
@@ -55,8 +55,8 @@ func ExecuteExplain(db *sql.DB, queryId string, queryText string, supportsParame
 		return explain, nil
 	}
 	logger.Error("Direct explain error: ", err)
-	if isExplainPermissionError(err) {
-		return explain, errors.New("need_grant_permission")
+	if grantErr := explainPermissionGrantError(queryText, err); grantErr != nil {
+		return explain, grantErr
 	}
 	return explain, err
 }
@@ -152,6 +152,13 @@ func skipPgBlockComment(query string, start int) (int, bool) {
 // 	return value
 // }
 
+func explainPermissionGrantError(queryText string, err error) error {
+	if !isExplainPermissionError(err) || pgContainsDataModifyingCommand(queryText) {
+		return nil
+	}
+	return errors.New("need_grant_permission")
+}
+
 func isExplainPermissionError(err error) bool {
 	if err == nil {
 		return false
@@ -163,6 +170,246 @@ func isExplainPermissionError(err error) bool {
 	return strings.Contains(errText, "select command denied to user") ||
 		strings.Contains(errText, "access denied for user") ||
 		strings.Contains(errText, "permission denied")
+}
+
+func pgContainsDataModifyingCommand(query string) bool {
+	for i := 0; i < len(query); {
+		if i+1 < len(query) && query[i:i+2] == "--" {
+			i += 2
+			for i < len(query) && query[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+1 < len(query) && query[i:i+2] == "/*" {
+			next, ok := skipPgBlockComment(query, i)
+			if !ok {
+				return false
+			}
+			i = next
+			continue
+		}
+		switch query[i] {
+		case '\'':
+			i = skipPgSingleQuotedString(query, i)
+			continue
+		case '"':
+			i = skipPgDoubleQuotedIdentifier(query, i)
+			continue
+		case '$':
+			if tag, ok := pgDollarQuoteTag(query, i); ok {
+				contentStart := i + len(tag)
+				closingOffset := strings.Index(query[contentStart:], tag)
+				if closingOffset < 0 {
+					return false
+				}
+				i = contentStart + closingOffset + len(tag)
+				continue
+			}
+		}
+
+		if !isPgIdentifierStart(query[i]) {
+			i++
+			continue
+		}
+		start := i
+		i++
+		for i < len(query) && isPgIdentifierPart(query[i]) {
+			i++
+		}
+		switch strings.ToLower(query[start:i]) {
+		case "insert":
+			if pgLooksLikeInsertCommand(query, i) {
+				return true
+			}
+		case "merge":
+			if ident, _, ok := nextPgIdentifier(query, i); ok && ident == "into" {
+				return true
+			}
+		case "delete":
+			if ident, _, ok := nextPgIdentifier(query, i); ok && ident == "from" {
+				return true
+			}
+		case "update":
+			if pgLooksLikeUpdateCommand(query, i) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pgLooksLikeInsertCommand(query string, start int) bool {
+	ident, i, ok := nextPgIdentifier(query, start)
+	if !ok || ident == "as" {
+		return false
+	}
+	if ident == "into" {
+		ident, i, ok = nextPgIdentifier(query, i)
+		if !ok {
+			return false
+		}
+	}
+	if ident == "only" {
+		i, ok = skipPgWhitespaceAndComments(query, i)
+		if !ok {
+			return false
+		}
+		if i < len(query) && query[i] == '(' {
+			_, i, ok = nextPgIdentifier(query, i+1)
+			if !ok {
+				return false
+			}
+			i, ok = skipPgWhitespaceAndComments(query, i)
+			if !ok || i >= len(query) || query[i] != ')' {
+				return false
+			}
+			i++
+		} else {
+			_, i, ok = nextPgIdentifier(query, i)
+			if !ok {
+				return false
+			}
+		}
+	}
+	i, ok = skipPgWhitespaceAndComments(query, i)
+	if !ok {
+		return false
+	}
+	if i < len(query) && query[i] == '.' {
+		_, i, ok = nextPgIdentifier(query, i+1)
+		if !ok {
+			return false
+		}
+		i, ok = skipPgWhitespaceAndComments(query, i)
+		if !ok {
+			return false
+		}
+	}
+	if i < len(query) && query[i] == '(' {
+		return true
+	}
+	rest, i, ok := nextPgIdentifier(query, i)
+	if !ok {
+		return false
+	}
+	if rest == "as" {
+		_, i, ok = nextPgIdentifier(query, i)
+		if !ok {
+			return false
+		}
+		return pgLooksLikeInsertRest(query, i)
+	}
+	if pgIsInsertRestKeyword(rest) {
+		return true
+	}
+	return pgLooksLikeInsertRest(query, i)
+}
+
+func pgLooksLikeInsertRest(query string, start int) bool {
+	i, ok := skipPgWhitespaceAndComments(query, start)
+	if !ok {
+		return false
+	}
+	if i < len(query) && query[i] == '(' {
+		return true
+	}
+	rest, _, ok := nextPgIdentifier(query, i)
+	return ok && pgIsInsertRestKeyword(rest)
+}
+
+func pgIsInsertRestKeyword(ident string) bool {
+	switch ident {
+	case "values", "default", "overriding", "select", "with", "table":
+		return true
+	default:
+		return false
+	}
+}
+
+func pgLooksLikeUpdateCommand(query string, start int) bool {
+	ident, i, ok := nextPgIdentifier(query, start)
+	if !ok || ident == "as" {
+		return false
+	}
+	if ident == "only" {
+		i, ok = skipPgWhitespaceAndComments(query, i)
+		if !ok {
+			return false
+		}
+		if i < len(query) && query[i] == '(' {
+			_, i, ok = nextPgIdentifier(query, i+1)
+			if !ok {
+				return false
+			}
+			i, ok = skipPgWhitespaceAndComments(query, i)
+			if !ok || i >= len(query) || query[i] != ')' {
+				return false
+			}
+			i++
+		} else {
+			_, i, ok = nextPgIdentifier(query, i)
+			if !ok {
+				return false
+			}
+		}
+	}
+	i, ok = skipPgWhitespaceAndComments(query, i)
+	if !ok {
+		return false
+	}
+	if i < len(query) && query[i] == '.' {
+		_, i, ok = nextPgIdentifier(query, i+1)
+		if !ok {
+			return false
+		}
+		i, ok = skipPgWhitespaceAndComments(query, i)
+		if !ok {
+			return false
+		}
+	}
+	if i < len(query) && query[i] == '*' {
+		i++
+	}
+	ident, i, ok = nextPgIdentifier(query, i)
+	if !ok {
+		return false
+	}
+	if ident == "as" {
+		_, i, ok = nextPgIdentifier(query, i)
+		if !ok {
+			return false
+		}
+		ident, _, ok = nextPgIdentifier(query, i)
+		if !ok {
+			return false
+		}
+	} else if ident != "set" {
+		ident, _, ok = nextPgIdentifier(query, i)
+		if !ok {
+			return false
+		}
+	}
+	return ident == "set"
+}
+
+func nextPgIdentifier(query string, start int) (string, int, bool) {
+	i, ok := skipPgWhitespaceAndComments(query, start)
+	if !ok || i >= len(query) {
+		return "", i, false
+	}
+	if query[i] == '"' {
+		end := skipPgDoubleQuotedIdentifier(query, i)
+		return strings.ToLower(query[i:end]), end, true
+	}
+	if !isPgIdentifierStart(query[i]) {
+		return "", i, false
+	}
+	end := i + 1
+	for end < len(query) && isPgIdentifierPart(query[end]) {
+		end++
+	}
+	return strings.ToLower(query[i:end]), end, true
 }
 
 func hasPgErrorCode(err error, code pq.ErrorCode) bool {
