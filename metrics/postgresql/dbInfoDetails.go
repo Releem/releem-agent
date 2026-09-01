@@ -225,12 +225,25 @@ func (DBInfo *DBInfoGatherer) collectRLSInfo() bool {
 // Aurora/RDS own the view with an internal role (rdsadmin) that cannot delegate
 // access to a customer monitoring role, and PostgreSQL below 10 has no such view
 // at all.
-func pgHBARulesUnavailable(err error) bool {
+func pgHBARulesUnavailable(instanceType string, err error) bool {
 	const (
 		insufficientPrivilege = "42501"
 		undefinedTable        = "42P01"
 	)
-	return hasPgErrorCode(err, insufficientPrivilege) || hasPgErrorCode(err, undefinedTable)
+	return hasPgErrorCode(err, undefinedTable) ||
+		(isPGManagedInstanceType(instanceType) && hasPgErrorCode(err, insufficientPrivilege))
+}
+
+func (DBInfo *DBInfoGatherer) handlePgHBARulesUnavailable(err error) bool {
+	instanceType := ""
+	if DBInfo.configuration != nil {
+		instanceType = DBInfo.configuration.InstanceType
+	}
+	if !pgHBARulesUnavailable(instanceType, err) {
+		return false
+	}
+	DBInfo.logger.Warningf("pg_hba_file_rules is unavailable for PostgreSQL instance type %q; dependent security checks are unknown", instanceType)
+	return true
 }
 
 func (DBInfo *DBInfoGatherer) collectPgHBA() []models.MetricGroupValue {
@@ -247,7 +260,7 @@ func (DBInfo *DBInfoGatherer) collectPgHBA() []models.MetricGroupValue {
 		FROM pg_hba_file_rules
 		ORDER BY line_number`)
 	if err != nil {
-		if pgHBARulesUnavailable(err) {
+		if DBInfo.handlePgHBARulesUnavailable(err) {
 			return nil
 		}
 		DBInfo.logger.Error(err)

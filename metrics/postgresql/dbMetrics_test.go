@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Releem/mysqlconfigurer/config"
+	logging "github.com/google/logger"
 	"github.com/lib/pq"
 )
 
@@ -148,41 +151,84 @@ func TestIsPGManagedInternalDatabase(t *testing.T) {
 
 func TestPgHBARulesUnavailable(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		want bool
+		name         string
+		instanceType string
+		err          error
+		want         bool
 	}{
 		{
-			name: "Aurora denies the rdsadmin-owned view",
-			err:  &pq.Error{Code: "42501", Message: `permission denied for view pg_hba_file_rules`},
-			want: true,
+			name:         "Aurora denies the rdsadmin-owned view",
+			instanceType: "aws/rds",
+			err:          &pq.Error{Code: "42501", Message: `permission denied for view pg_hba_file_rules`},
+			want:         true,
 		},
 		{
-			name: "PostgreSQL below 10 has no such view",
-			err:  &pq.Error{Code: "42P01", Message: `relation "pg_hba_file_rules" does not exist`},
-			want: true,
+			name:         "local PostgreSQL reports insufficient privileges",
+			instanceType: "local",
+			err:          &pq.Error{Code: "42501", Message: `permission denied for view pg_hba_file_rules`},
+			want:         false,
 		},
 		{
-			name: "wrapped permission error is still recognised",
-			err:  fmt.Errorf("collect pg_hba: %w", &pq.Error{Code: "42501"}),
-			want: true,
+			name:         "PostgreSQL below 10 has no such view",
+			instanceType: "local",
+			err:          &pq.Error{Code: "42P01", Message: `relation "pg_hba_file_rules" does not exist`},
+			want:         true,
 		},
 		{
-			name: "a real query fault must stay an error",
-			err:  &pq.Error{Code: "57014", Message: "canceling statement due to statement timeout"},
-			want: false,
+			name:         "wrapped managed permission error is still recognised",
+			instanceType: "aws/rds",
+			err:          fmt.Errorf("collect pg_hba: %w", &pq.Error{Code: "42501"}),
+			want:         true,
 		},
 		{
-			name: "a non-PostgreSQL error must stay an error",
-			err:  errors.New("connection reset by peer"),
-			want: false,
+			name:         "a real query fault must stay an error",
+			instanceType: "aws/rds",
+			err:          &pq.Error{Code: "57014", Message: "canceling statement due to statement timeout"},
+			want:         false,
+		},
+		{
+			name:         "a non-PostgreSQL error must stay an error",
+			instanceType: "aws/rds",
+			err:          errors.New("connection reset by peer"),
+			want:         false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := pgHBARulesUnavailable(tt.err); got != tt.want {
-				t.Fatalf("pgHBARulesUnavailable(%v) = %t, want %t", tt.err, got, tt.want)
+			t.Parallel()
+			if got := pgHBARulesUnavailable(tt.instanceType, tt.err); got != tt.want {
+				t.Errorf("pgHBARulesUnavailable(%q, %v) = %t, want %t", tt.instanceType, tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDBInfoHandlePgHBARulesUnavailableWarnsOnlyForExpectedErrors(t *testing.T) {
+	permissionErr := &pq.Error{Code: "42501", Message: `permission denied for view pg_hba_file_rules`}
+	tests := []struct {
+		name         string
+		instanceType string
+		wantHandled  bool
+		wantWarning  bool
+	}{
+		{name: "managed provider warns and suppresses", instanceType: "aws/rds", wantHandled: true, wantWarning: true},
+		{name: "local installation leaves permission error actionable", instanceType: "local", wantHandled: false, wantWarning: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := *logging.Init("pg-hba-unavailable-test", false, false, &output)
+			gatherer := NewDBInfoGatherer(logger, &config.Config{InstanceType: tt.instanceType})
+
+			gotHandled := gatherer.handlePgHBARulesUnavailable(permissionErr)
+			if gotHandled != tt.wantHandled {
+				t.Errorf("handlePgHBARulesUnavailable(%q, %v) = %t, want %t", tt.instanceType, permissionErr, gotHandled, tt.wantHandled)
+			}
+			gotWarning := strings.Contains(output.String(), "pg_hba_file_rules is unavailable")
+			if gotWarning != tt.wantWarning {
+				t.Errorf("handlePgHBARulesUnavailable(%q, %v) warning = %t, want %t; output=%q", tt.instanceType, permissionErr, gotWarning, tt.wantWarning, output.String())
 			}
 		})
 	}

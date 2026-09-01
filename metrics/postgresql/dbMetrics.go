@@ -47,6 +47,11 @@ var pgManagedInternalDatabaseByInstanceType = map[string]string{
 	"azure/postgresql": "azure_maintenance",
 }
 
+func isPGManagedInstanceType(instanceType string) bool {
+	_, managed := pgManagedInternalDatabaseByInstanceType[strings.ToLower(strings.TrimSpace(instanceType))]
+	return managed
+}
+
 func isPGManagedInternalDatabase(instanceType, database string) bool {
 	internalDatabase, managed := pgManagedInternalDatabaseByInstanceType[strings.ToLower(strings.TrimSpace(instanceType))]
 	return managed && internalDatabase == strings.ToLower(strings.TrimSpace(database))
