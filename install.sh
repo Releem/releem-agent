@@ -1202,6 +1202,10 @@ function configure_releem_agent() {
             echo "aws_rds_db=\"$RELEEM_AWS_RDS_DB\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
             printf "\033[37m - Adding AWS RDS Parameter Group ${RELEEM_AWS_RDS_PARAMETER_GROUP} to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
             echo "aws_rds_parameter_group=\"$RELEEM_AWS_RDS_PARAMETER_GROUP\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
+            if [ -n "$RELEEM_AWS_RDS_CLUSTER_PARAMETER_GROUP" ]; then
+                printf "\033[37m - Adding AWS RDS Cluster Parameter Group ${RELEEM_AWS_RDS_CLUSTER_PARAMETER_GROUP} to the Releem Agent configuration: $RELEEM_CONF_FILE\n\033[0m"
+                echo "aws_rds_cluster_parameter_group=\"$RELEEM_AWS_RDS_CLUSTER_PARAMETER_GROUP\"" | $sudo_cmd tee -a $RELEEM_CONF_FILE >/dev/null
+            fi
         else
             printf "\033[31m - AWS region, AWS RDS DB or AWS RDS Parameter Group is not set. Please set the variables RELEEM_AWS_REGION, RELEEM_AWS_RDS_DB and RELEEM_AWS_RDS_PARAMETER_GROUP\033[0m\n"
             exit 1

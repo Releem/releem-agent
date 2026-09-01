@@ -105,6 +105,10 @@ aws_rds_db="${AWS_RDS_DB}"
 # RDS database parameter group name.
 aws_rds_parameter_group="${AWS_RDS_PARAMETER_GROUP}"
 
+# AwsRDSClusterParameterGroup string `hcl:"aws_rds_cluster_parameter_group"`
+# Custom cluster parameter group name. Required for Aurora; leave empty only for non-Aurora RDS. RELEEM_AWS_RDS_CLUSTER_PARAMETER_GROUP takes precedence over AWS_RDS_CLUSTER_PARAMETER_GROUP.
+aws_rds_cluster_parameter_group="${RELEEM_AWS_RDS_CLUSTER_PARAMETER_GROUP:-${AWS_RDS_CLUSTER_PARAMETER_GROUP:-}}"
+
 #GcpProjectId string `hcl:"gcp_project_id"`
 #GCP project ID for Cloud SQL instance
 gcp_project_id="${RELEEM_GCP_PROJECT_ID}"

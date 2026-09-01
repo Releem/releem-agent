@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 
+	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/Releem/mysqlconfigurer/utils"
@@ -14,17 +17,24 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 )
 
-const rdsMetricsLogGroupName = "RDSOSMetrics"
+const (
+	rdsMetricsLogGroupName         = "RDSOSMetrics"
+	awsRDSMetadataDiscoveryTimeout = 30 * time.Second
+)
+
+type RDSMetadataDiscoverer func(context.Context) (awsrds.Metadata, error)
 
 type AWSRDSEnhancedMetricsGatherer struct {
-	logger        logging.Logger
-	debug         bool
-	dbinstance    types.DBInstance
-	cwlogsclient  *cloudwatchlogs.Client
-	configuration *config.Config
+	logger                   logging.Logger
+	debug                    bool
+	cwlogsclient             *cloudwatchlogs.Client
+	configuration            *config.Config
+	discoverMetadata         RDSMetadataDiscoverer
+	metadataDiscoveryTimeout time.Duration
+	metadataMu               sync.RWMutex
+	metadata                 awsrds.Metadata
 }
 
 type osMetrics struct {
@@ -184,18 +194,85 @@ func parseOSMetrics(b []byte, disallowUnknownFields bool) (*osMetrics, error) {
 	return &m, nil
 }
 
-func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, dbinstance types.DBInstance, cwlogsclient *cloudwatchlogs.Client, configuration *config.Config) *AWSRDSEnhancedMetricsGatherer {
+func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, cwlogsclient *cloudwatchlogs.Client,
+	configuration *config.Config, initialMetadata awsrds.Metadata,
+	discoverMetadata RDSMetadataDiscoverer) *AWSRDSEnhancedMetricsGatherer {
 	return &AWSRDSEnhancedMetricsGatherer{
-		logger:        logger,
-		debug:         configuration.Debug,
-		cwlogsclient:  cwlogsclient,
-		dbinstance:    dbinstance,
-		configuration: configuration,
+		logger:                   logger,
+		debug:                    configuration.Debug,
+		cwlogsclient:             cwlogsclient,
+		configuration:            configuration,
+		discoverMetadata:         discoverMetadata,
+		metadataDiscoveryTimeout: awsRDSMetadataDiscoveryTimeout,
+		metadata:                 initialMetadata,
 	}
+}
+
+func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ctx context.Context) awsrds.Metadata {
+	discoveryCtx, cancel := context.WithTimeout(ctx, awsrdsenhancedmetrics.metadataDiscoveryTimeout)
+	defer cancel()
+
+	metadata, err := awsrdsenhancedmetrics.discoverMetadata(discoveryCtx)
+	if err != nil {
+		awsrdsenhancedmetrics.metadataMu.RLock()
+		cached := awsrdsenhancedmetrics.metadata
+		awsrdsenhancedmetrics.metadataMu.RUnlock()
+		logAWSRDSDiscoveryFallback(awsrdsenhancedmetrics.logger, cached, err)
+		return cached
+	}
+
+	awsrdsenhancedmetrics.metadataMu.Lock()
+	awsrdsenhancedmetrics.metadata = metadata
+	awsrdsenhancedmetrics.metadataMu.Unlock()
+	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", metadata)
+	return metadata
+}
+
+// LogAWSRDSDiscovery emits safe discovery topology without endpoint, resource
+// identifier, credentials, or provider response data.
+func LogAWSRDSDiscovery(logger logging.Logger, source string, metadata awsrds.Metadata) {
+	event, err := marshalAWSRDSDiscoveryEvent(source, metadata, nil)
+	if err != nil {
+		logger.Warningf("AWS RDS discovery event could not be serialized: %T", err)
+		return
+	}
+	if source == "live" {
+		logger.V(5).Info(event)
+		return
+	}
+	logger.Info(event)
+}
+
+func logAWSRDSDiscoveryFallback(logger logging.Logger, metadata awsrds.Metadata, discoveryErr error) {
+	event, err := marshalAWSRDSDiscoveryEvent("cache", metadata, map[string]interface{}{
+		"reason":     "discovery-failed",
+		"error_type": fmt.Sprintf("%T", discoveryErr),
+	})
+	if err != nil {
+		logger.Warningf("AWS RDS discovery event could not be serialized: %T", err)
+		return
+	}
+	logger.Warning(event)
+}
+
+func marshalAWSRDSDiscoveryEvent(source string, metadata awsrds.Metadata, extra map[string]interface{}) (string, error) {
+	payload := map[string]interface{}{
+		"event":    "aws_rds_discovery",
+		"source":   source,
+		"metadata": metadata.LogFields(),
+	}
+	for name, value := range extra {
+		payload[name] = value
+	}
+	encoded, err := json.Marshal(payload)
+	return string(encoded), err
 }
 
 func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *models.Metrics) error {
 	defer utils.HandlePanic(awsrdsenhancedmetrics.configuration, awsrdsenhancedmetrics.logger)
+
+	ctx := context.Background()
+	metadata := awsrdsenhancedmetrics.metadataForReport(ctx)
 
 	info := make(models.MetricGroupValue)
 	metricsMap := make(models.MetricGroupValue)
@@ -204,13 +281,13 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 		Limit:         aws.Int32(1),
 		StartFromHead: aws.Bool(false),
 		LogGroupName:  aws.String(rdsMetricsLogGroupName),
-		LogStreamName: awsrdsenhancedmetrics.dbinstance.DbiResourceId,
+		LogStreamName: aws.String(metadata.DBInstanceResourceID),
 	}
 
-	result, err := awsrdsenhancedmetrics.cwlogsclient.GetLogEvents(context.TODO(), &input)
+	result, err := awsrdsenhancedmetrics.cwlogsclient.GetLogEvents(ctx, &input)
 
 	if err != nil {
-		awsrdsenhancedmetrics.logger.Fatalf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, aws.ToString(awsrdsenhancedmetrics.dbinstance.DbiResourceId), err)
+		awsrdsenhancedmetrics.logger.Fatalf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, metadata.DBInstanceResourceID, err)
 		return err
 	}
 
@@ -265,12 +342,20 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 	info["Host"] = models.MetricGroupValue{
 		"InstanceType":               "aws/rds",
 		"platform":                   "aws",
-		"platformVersion":            "rds " + osMetrics.Engine,
+		"platformVersion":            "rds " + metadata.Engine,
 		"Timestamp":                  osMetrics.Timestamp,
 		"Uptime":                     osMetrics.Uptime,
-		"Engine":                     osMetrics.Engine,
+		"Engine":                     metadata.Engine,
 		"Version":                    osMetrics.Version,
 		"ServerlessDatabaseCapacity": osMetrics.ServerlessDatabaseCapacity,
+		"DBInstanceIdentifier":       metadata.DBInstanceIdentifier,
+		"DBInstanceResourceID":       metadata.DBInstanceResourceID,
+		"DBInstanceClass":            metadata.DBInstanceClass,
+		"DBParameterGroup":           metadata.DBParameterGroup,
+		"DBClusterIdentifier":        metadata.DBClusterIdentifier,
+		"DBClusterParameterGroup":    metadata.DBClusterParameterGroup,
+		"IsClusterWriter":            metadata.IsClusterWriter,
+		"EngineMode":                 metadata.EngineMode,
 	}
 
 	metrics.System.Info = info

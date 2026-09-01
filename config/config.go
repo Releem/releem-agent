@@ -50,6 +50,7 @@ type Config struct {
 	AwsRegion                    string        `hcl:"aws_region"`
 	AwsRDSDB                     string        `hcl:"aws_rds_db"`
 	AwsRDSParameterGroup         string        `hcl:"aws_rds_parameter_group"`
+	AwsRDSClusterParameterGroup  string        `hcl:"aws_rds_cluster_parameter_group"`
 	GcpProjectId                 string        `hcl:"gcp_project_id"`
 	GcpRegion                    string        `hcl:"gcp_region"`
 	GcpCloudSqlInstance          string        `hcl:"gcp_cloudsql_instance"`
