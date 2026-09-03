@@ -33,6 +33,21 @@ func CompositeKey(namespace string, identities []string) string {
 		return key
 	}
 
+	namespace = boundedNamespace(namespace)
+	key = namespace + ":" + identity
+	if len(key) <= MaxKeyLength {
+		return key
+	}
+
 	digest := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("%s:sha256:%x", namespace, digest)
+}
+
+func boundedNamespace(namespace string) string {
+	if len(namespace)+len(":sha256:")+sha256.Size*2 <= MaxKeyLength {
+		return namespace
+	}
+
+	digest := sha256.Sum256([]byte(namespace))
+	return fmt.Sprintf("sha256:%x", digest)
 }

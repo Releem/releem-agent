@@ -18,6 +18,9 @@ type TopologyFacts struct {
 	Status        map[string]interface{}
 	ReplicaStatus []map[string]interface{}
 	GroupMembers  []map[string]interface{}
+	// RelationDiscoveryComplete is nil for direct fact fixtures, which remain
+	// complete for compatibility. The live gatherer always sets it.
+	RelationDiscoveryComplete *bool
 }
 
 type DBTopologyGatherer struct {
@@ -53,15 +56,16 @@ func (g *DBTopologyGatherer) GetMetrics(metrics *models.Metrics) error {
 	defer utils.HandlePanic(g.configuration, g.logger)
 
 	variables := mapFromMetricGroup(metrics.DB.Conf.Variables)
-	replicaStatus := g.queryReplicaStatus(normalizeKeys(variables))
-
-	groupMembers := g.queryGroupReplicationMembers()
+	replicaStatus, replicaStatusComplete := g.queryReplicaStatus(normalizeKeys(variables))
+	groupMembers, groupMembersComplete := g.queryGroupReplicationMembers()
+	relationDiscoveryComplete := replicaStatusComplete && groupMembersComplete
 
 	metrics.DB.Topology = BuildTopologyFromFacts(TopologyFacts{
-		Variables:     variables,
-		Status:        mapFromMetricGroup(metrics.DB.Metrics.Status),
-		ReplicaStatus: replicaStatus,
-		GroupMembers:  groupMembers,
+		Variables:                 variables,
+		Status:                    mapFromMetricGroup(metrics.DB.Metrics.Status),
+		ReplicaStatus:             replicaStatus,
+		GroupMembers:              groupMembers,
+		RelationDiscoveryComplete: &relationDiscoveryComplete,
 	})
 	g.logger.V(5).Info("CollectMetrics DBTopology ", metrics.DB.Topology)
 	return nil
@@ -78,18 +82,23 @@ func (g *DBTopologyGatherer) queryOptionalRows(query string) ([]map[string]inter
 	return scanTopologyRows(rows, g.logger)
 }
 
-func (g *DBTopologyGatherer) queryReplicaStatus(variables map[string]string) []map[string]interface{} {
-	return firstSupportedTopologyQuery(replicaStatusQueries(variables), g.queryOptionalRows)
+func (g *DBTopologyGatherer) queryReplicaStatus(variables map[string]string) ([]map[string]interface{}, bool) {
+	return firstSupportedTopologyQueryResult(replicaStatusQueries(variables), g.queryOptionalRows)
 }
 
 func firstSupportedTopologyQuery(queries []string, queryRows func(string) ([]map[string]interface{}, bool)) []map[string]interface{} {
+	rows, _ := firstSupportedTopologyQueryResult(queries, queryRows)
+	return rows
+}
+
+func firstSupportedTopologyQueryResult(queries []string, queryRows func(string) ([]map[string]interface{}, bool)) ([]map[string]interface{}, bool) {
 	for _, query := range queries {
 		rows, supported := queryRows(query)
 		if supported {
-			return rows
+			return rows, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 func replicaStatusQueries(variables map[string]string) []string {
@@ -105,18 +114,18 @@ func replicaStatusQueries(variables map[string]string) []string {
 	return []string{"SHOW REPLICA STATUS", "SHOW SLAVE STATUS"}
 }
 
-func (g *DBTopologyGatherer) queryGroupReplicationMembers() []map[string]interface{} {
+func (g *DBTopologyGatherer) queryGroupReplicationMembers() ([]map[string]interface{}, bool) {
 	groupMembers, supported := g.queryOptionalRows(`
 		SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_STATE, MEMBER_ROLE
 		FROM performance_schema.replication_group_members`)
 	if supported {
-		return groupMembers
+		return groupMembers, true
 	}
 
-	groupMembers, _ = g.queryOptionalRows(`
+	groupMembers, supported = g.queryOptionalRows(`
 		SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_STATE
 		FROM performance_schema.replication_group_members`)
-	return groupMembers
+	return groupMembers, supported
 }
 
 func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
@@ -181,8 +190,12 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		selected = topology
 		relations = append(relations, topologyRelation(topology))
 	}
-	AttachTopologyRelations(selected, relations, true)
+	AttachTopologyRelations(selected, relations, topologyRelationsComplete(facts))
 	return selected
+}
+
+func topologyRelationsComplete(facts TopologyFacts) bool {
+	return facts.RelationDiscoveryComplete == nil || *facts.RelationDiscoveryComplete
 }
 
 func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[string]string, replicaStatuses []map[string]interface{}) models.MetricGroupValue {

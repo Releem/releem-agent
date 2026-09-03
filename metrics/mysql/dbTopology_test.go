@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Releem/mysqlconfigurer/config"
 	"github.com/Releem/mysqlconfigurer/models"
 	logging "github.com/google/logger"
 )
@@ -910,6 +912,35 @@ func TestIncompleteRelationDiscoveryOmitsCanonicalSnapshot(t *testing.T) {
 	want := []models.MetricGroupValue{{"Type": "async_replication", "GroupKey": "source-a", "MemberKey": "member-a"}}
 	if got := facts["Relations"]; !reflect.DeepEqual(got, want) {
 		t.Fatalf("AttachTopologyRelations(topology, relations, false) Facts.Relations = %#v, want %#v", got, want)
+	}
+}
+
+func TestDBTopologyGathererOmitsCanonicalRelationsWhenOptionalDiscoveryFails(t *testing.T) {
+	setMysqlSchemaTestDB(t, func(query string) (driver.Rows, error) {
+		if strings.HasPrefix(query, "SHOW") {
+			return mysqlEmptySchemaRows(), nil
+		}
+		return nil, errors.New("optional topology query failed")
+	})
+
+	logger := *logging.Init("mysql-topology-incomplete-discovery-test", false, false, io.Discard)
+	gatherer := NewDBTopologyGatherer(logger, &config.Config{})
+	metrics := &models.Metrics{}
+	metrics.DB.Conf.Variables = models.MetricGroupValue{
+		"server_uuid": "standalone-uuid",
+		"hostname":    "standalone.example.com",
+		"port":        "3306",
+	}
+
+	if err := gatherer.GetMetrics(metrics); err != nil {
+		t.Fatalf("GetMetrics() error = %v", err)
+	}
+	if _, ok := metrics.DB.Topology["Relations"]; ok {
+		t.Fatalf("GetMetrics() canonical Relations = %#v, want omitted after optional discovery failure", metrics.DB.Topology["Relations"])
+	}
+	facts := metrics.DB.Topology["Facts"].(models.MetricGroupValue)
+	if _, ok := facts["Relations"].([]models.MetricGroupValue); !ok {
+		t.Fatalf("GetMetrics() Facts.Relations = %#v, want compatibility relation mirror", facts["Relations"])
 	}
 }
 
