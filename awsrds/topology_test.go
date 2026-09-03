@@ -329,8 +329,11 @@ func TestTopologyRelationsGathererOmitsCanonicalSnapshotWhenProviderIsIncomplete
 	}
 	metrics := &models.Metrics{}
 	metrics.DB.Topology = topology
+	AttachReportMetadata(metrics, metadata, false)
+	metadata.DBClusterResourceID = "mutated-cluster-resource"
+	metadata.ClusterMembers[0].IsClusterWriter = false
 	logger := *logging.Init("aws-topology-incomplete-test", false, false, io.Discard)
-	gatherer := NewTopologyRelationsGatherer(logger, func() (Metadata, bool) { return metadata, false })
+	gatherer := NewTopologyRelationsGatherer(logger)
 
 	if err := gatherer.GetMetrics(metrics); err != nil {
 		t.Fatalf("TopologyRelationsGatherer.GetMetrics(incomplete provider snapshot) error = %v", err)

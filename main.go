@@ -66,7 +66,6 @@ func (programm *Programm) Run() {
 	// var gatherers map[string][]models.MetricsGatherer
 	gatherers := make(map[string][]models.MetricsGatherer)
 	var Mode models.ModeType
-	var awsRDSMetadataSnapshot awsrds.MetadataSnapshot
 
 	// Do something, call your goroutines, etc
 	logger.Info("Releem-agent version is ", config.ReleemAgentVersion) //
@@ -148,7 +147,6 @@ func (programm *Programm) Run() {
 				return awsrds.DiscoverInstance(ctx, rdsclient, configuration.AwsRDSDB)
 			},
 		)
-		awsRDSMetadataSnapshot = awsMetricsGatherer.MetadataSnapshot
 		gatherers["default"] = append(gatherers["default"], awsMetricsGatherer)
 		logger.Info("AWS RDS DB instance found: ", configuration.AwsRDSDB)
 	case "gcp/cloudsql":
@@ -285,8 +283,8 @@ func (programm *Programm) Run() {
 			mysql.NewDBInfoGatherer(logger, configuration),
 			mysql.NewDBMetricsBaseGatherer(logger, configuration),
 			mysql.NewDBTopologyGatherer(logger, configuration))
-		if awsRDSMetadataSnapshot != nil {
-			gatherers["default"] = append(gatherers["default"], awsrds.NewTopologyRelationsGatherer(logger, awsRDSMetadataSnapshot))
+		if configuration.InstanceType == "aws/rds" {
+			gatherers["default"] = append(gatherers["default"], awsrds.NewTopologyRelationsGatherer(logger))
 		}
 		gatherers["default"] = append(gatherers["default"], metrics.NewAgentMetricsGatherer(logger, configuration))
 

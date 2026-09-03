@@ -43,3 +43,18 @@ func TestMetricsJSONIncludesFailedDatabaseSchemaWhenPresent(t *testing.T) {
 		t.Fatalf("failure metadata missing from payload: %s", payload)
 	}
 }
+
+func TestMetricsJSONOmitsInternalCollectionContext(t *testing.T) {
+	var metrics Metrics
+	metrics.Internal.AWSRDS = map[string]interface{}{
+		"private_endpoint": "orders.internal",
+	}
+
+	payload, err := json.Marshal(metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(payload, []byte(`"Internal"`)) || bytes.Contains(payload, []byte("orders.internal")) {
+		t.Fatalf("internal collection context must be omitted: %s", payload)
+	}
+}

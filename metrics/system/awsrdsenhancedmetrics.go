@@ -210,7 +210,7 @@ func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, cwlogsclient *cloud
 	}
 }
 
-func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ctx context.Context) awsrds.Metadata {
+func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ctx context.Context) (awsrds.Metadata, bool) {
 	discoveryCtx, cancel := context.WithTimeout(ctx, awsrdsenhancedmetrics.metadataDiscoveryTimeout)
 	defer cancel()
 
@@ -221,7 +221,7 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ct
 		awsrdsenhancedmetrics.metadataComplete = false
 		awsrdsenhancedmetrics.metadataMu.Unlock()
 		logAWSRDSDiscoveryFallback(awsrdsenhancedmetrics.logger, cached, err)
-		return cached
+		return cached, false
 	}
 
 	stored := metadata.Clone()
@@ -230,7 +230,7 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ct
 	awsrdsenhancedmetrics.metadataComplete = true
 	awsrdsenhancedmetrics.metadataMu.Unlock()
 	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", stored)
-	return stored.Clone()
+	return stored.Clone(), true
 }
 
 // MetadataSnapshot returns an immutable copy of the latest metadata and whether
@@ -285,7 +285,8 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 	defer utils.HandlePanic(awsrdsenhancedmetrics.configuration, awsrdsenhancedmetrics.logger)
 
 	ctx := context.Background()
-	metadata := awsrdsenhancedmetrics.metadataForReport(ctx)
+	metadata, metadataComplete := awsrdsenhancedmetrics.metadataForReport(ctx)
+	awsrds.AttachReportMetadata(metrics, metadata, metadataComplete)
 
 	info := make(models.MetricGroupValue)
 	metricsMap := make(models.MetricGroupValue)

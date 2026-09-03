@@ -280,7 +280,7 @@ func TestAWSRDSEnhancedMetricsGathererMetadataSnapshotIsImmutable(t *testing.T) 
 		t.Errorf("MetadataSnapshot() initial child = %q, want orders-child", got)
 	}
 
-	if got := gatherer.metadataForReport(context.Background()); got.ClusterMembers[0].Endpoint != "fresh-reader.internal" {
+	if got, _ := gatherer.metadataForReport(context.Background()); got.ClusterMembers[0].Endpoint != "fresh-reader.internal" {
 		t.Errorf("metadataForReport() member endpoint = %q, want fresh-reader.internal", got.ClusterMembers[0].Endpoint)
 	}
 	discovered.ClusterMembers[0].Endpoint = "mutated-discoverer.internal"
@@ -329,7 +329,7 @@ func TestAWSRDSEnhancedMetricsGathererMetadataSnapshotConcurrentAccess(t *testin
 		go func() {
 			defer wg.Done()
 			for iteration := 0; iteration < 100; iteration++ {
-				gatherer.metadataForReport(context.Background())
+				_, _ = gatherer.metadataForReport(context.Background())
 			}
 		}()
 		go func() {
@@ -404,7 +404,8 @@ func TestAWSRelationsAreMergedAfterNativeTopology(t *testing.T) {
 		InstanceStatus: "available",
 	}
 	logger := *logging.Init("aws-topology-merge-test", false, false, io.Discard)
-	gatherer := awsrds.NewTopologyRelationsGatherer(logger, func() (awsrds.Metadata, bool) { return metadata, true })
+	awsrds.AttachReportMetadata(metrics, metadata, true)
+	gatherer := awsrds.NewTopologyRelationsGatherer(logger)
 
 	if err := gatherer.GetMetrics(metrics); err != nil {
 		t.Fatalf("TopologyRelationsGatherer.GetMetrics() error = %v", err)
@@ -424,6 +425,180 @@ func TestAWSRelationsAreMergedAfterNativeTopology(t *testing.T) {
 	if metrics.DB.Topology["Type"] != "standalone" || metrics.DB.Topology["MemberKey"] != "mysql-member" {
 		t.Errorf("TopologyRelationsGatherer.GetMetrics() compatibility projection = %#v, want native standalone mysql-member", metrics.DB.Topology)
 	}
+}
+
+func TestAWSRelationsAreReportScopedDuringInterleaving(t *testing.T) {
+	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_reader.json")
+	if err != nil {
+		t.Fatalf("read enhanced-monitoring fixture: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		firstError    bool
+		secondError   bool
+		wantCanonical [2]bool
+		wantRoles     [2]string
+	}{
+		{
+			name:          "failed report reaches relations after successful report",
+			firstError:    true,
+			wantCanonical: [2]bool{false, true},
+			wantRoles:     [2]string{"replica", "primary"},
+		},
+		{
+			name:          "successful report reaches relations after failed report",
+			secondError:   true,
+			wantCanonical: [2]bool{true, false},
+			wantRoles:     [2]string{"primary", "primary"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			initial := testReportAuroraMetadata(false)
+			fresh := testReportAuroraMetadata(true)
+			outcomes := []struct {
+				metadata awsrds.Metadata
+				err      error
+			}{
+				{metadata: fresh},
+				{metadata: fresh},
+			}
+			if tt.firstError {
+				outcomes[0] = struct {
+					metadata awsrds.Metadata
+					err      error
+				}{err: errors.New("report A discovery failed")}
+			}
+			if tt.secondError {
+				outcomes[1] = struct {
+					metadata awsrds.Metadata
+					err      error
+				}{err: errors.New("report B discovery failed")}
+			}
+
+			discoveryCall := 0
+			discover := func(context.Context) (awsrds.Metadata, error) {
+				outcome := outcomes[discoveryCall]
+				discoveryCall++
+				return outcome.metadata, outcome.err
+			}
+			client, requestedStream := testCloudWatchLogsClient(t, fixture)
+			logger := *logging.Init("aws-report-interleaving-test", false, false, io.Discard)
+			enhanced := NewAWSRDSEnhancedMetricsGatherer(logger, client, &config.Config{}, initial, discover)
+			relations := awsrds.NewTopologyRelationsGatherer(logger)
+			reports := [2]*models.Metrics{testNativeTopologyMetrics(), testNativeTopologyMetrics()}
+
+			for report := range reports {
+				if err := enhanced.GetMetrics(reports[report]); err != nil {
+					t.Fatalf("AWSRDSEnhancedMetricsGatherer.GetMetrics(report=%d) error = %v", report+1, err)
+				}
+				<-requestedStream
+			}
+			for report := range reports {
+				if err := relations.GetMetrics(reports[report]); err != nil {
+					t.Fatalf("TopologyRelationsGatherer.GetMetrics(report=%d) error = %v", report+1, err)
+				}
+			}
+
+			for report, metrics := range reports {
+				_, canonical := metrics.DB.Topology["Relations"]
+				if canonical != tt.wantCanonical[report] {
+					t.Errorf("report %d canonical Relations presence = %t, want %t", report+1, canonical, tt.wantCanonical[report])
+				}
+				if got := awsRelationRole(t, metrics); got != tt.wantRoles[report] {
+					t.Errorf("report %d aurora_cluster role = %q, want %q", report+1, got, tt.wantRoles[report])
+				}
+			}
+		})
+	}
+}
+
+func testNativeTopologyMetrics() *models.Metrics {
+	metrics := &models.Metrics{}
+	metrics.DB.Topology = mysql.BuildTopologyFromFacts(mysql.TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid": "mysql-member",
+			"hostname":    "mysql.internal",
+			"port":        "3306",
+		},
+	})
+	return metrics
+}
+
+func testReportAuroraMetadata(writer bool) awsrds.Metadata {
+	metadata := awsrds.Metadata{
+		Region:                        "us-east-1",
+		DBInstanceIdentifier:          "orders-reader",
+		DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-reader",
+		DBInstanceResourceID:          "db-orders-reader-resource",
+		DBInstanceClass:               "db.r7g.large",
+		Endpoint:                      "orders-reader.internal",
+		EndpointPort:                  3306,
+		Engine:                        "aurora-mysql",
+		EngineMode:                    "provisioned",
+		DBClusterIdentifier:           "orders",
+		DBClusterARN:                  "arn:aws:rds:us-east-1:123456789012:cluster:orders",
+		DBClusterResourceID:           "cluster-orders-resource",
+		DBClusterParameterGroup:       "orders-cluster-pg",
+		DBClusterParameterGroupStatus: "in-sync",
+		ClusterMembers: []awsrds.ClusterMember{
+			{
+				DBInstanceIdentifier:          "orders-writer",
+				DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-writer",
+				DBInstanceResourceID:          "db-orders-writer-resource",
+				DBInstanceClass:               "db.r7g.large",
+				Endpoint:                      "orders-writer.internal",
+				EndpointPort:                  3306,
+				InstanceStatus:                "available",
+				IsClusterWriter:               true,
+				DBClusterParameterGroupStatus: "in-sync",
+			},
+			{
+				DBInstanceIdentifier:          "orders-reader",
+				DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-reader",
+				DBInstanceResourceID:          "db-orders-reader-resource",
+				DBInstanceClass:               "db.r7g.large",
+				Endpoint:                      "orders-reader.internal",
+				EndpointPort:                  3306,
+				InstanceStatus:                "available",
+				PromotionTier:                 1,
+				DBClusterParameterGroupStatus: "in-sync",
+			},
+		},
+		PromotionTier:  1,
+		InstanceStatus: "available",
+	}
+	if writer {
+		metadata.DBInstanceIdentifier = metadata.ClusterMembers[0].DBInstanceIdentifier
+		metadata.DBInstanceARN = metadata.ClusterMembers[0].DBInstanceARN
+		metadata.DBInstanceResourceID = metadata.ClusterMembers[0].DBInstanceResourceID
+		metadata.Endpoint = metadata.ClusterMembers[0].Endpoint
+		metadata.IsClusterWriter = true
+		metadata.PromotionTier = 0
+	}
+	return metadata
+}
+
+func awsRelationRole(t *testing.T, metrics *models.Metrics) string {
+	t.Helper()
+	facts, ok := metrics.DB.Topology["Facts"].(models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("report topology Facts = %#v, want models.MetricGroupValue", metrics.DB.Topology["Facts"])
+	}
+	relations, ok := facts["Relations"].([]models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("report topology Facts.Relations = %#v, want []models.MetricGroupValue", facts["Relations"])
+	}
+	for _, relation := range relations {
+		if relation["Type"] == "aurora_cluster" {
+			role, _ := relation["Role"].(string)
+			return role
+		}
+	}
+	t.Fatalf("report topology has no aurora_cluster relation: %#v", relations)
+	return ""
 }
 
 func relationTypes(relations []models.MetricGroupValue) []string {

@@ -13,17 +13,20 @@ import (
 // is complete for the current report.
 type MetadataSnapshot func() (Metadata, bool)
 
-type topologyRelationsGatherer struct {
-	snapshot MetadataSnapshot
+type reportTopologyMetadata struct {
+	metadata Metadata
+	complete bool
 }
+
+type topologyRelationsGatherer struct{}
 
 var _ models.MetricsGatherer = (*topologyRelationsGatherer)(nil)
 
-// NewTopologyRelationsGatherer merges provider relations after native database
-// topology. The project logger type is retained for constructor consistency;
-// discovery failures are logged by AWSRDSEnhancedMetricsGatherer.
-func NewTopologyRelationsGatherer(_ logging.Logger, snapshot MetadataSnapshot) models.MetricsGatherer {
-	return &topologyRelationsGatherer{snapshot: snapshot}
+// NewTopologyRelationsGatherer merges report-local provider relations after
+// native database topology. Discovery failures are logged by the enhanced
+// metrics gatherer.
+func NewTopologyRelationsGatherer(_ logging.Logger) models.MetricsGatherer {
+	return &topologyRelationsGatherer{}
 }
 
 func (g *topologyRelationsGatherer) GetMetrics(metrics *models.Metrics) error {
@@ -31,13 +34,35 @@ func (g *topologyRelationsGatherer) GetMetrics(metrics *models.Metrics) error {
 		return nil
 	}
 
-	metadata := Metadata{}
-	complete := false
-	if g.snapshot != nil {
-		metadata, complete = g.snapshot()
+	metadata, complete, ok := reportMetadata(metrics)
+	if !ok {
+		return nil
 	}
 	mergeTopologyRelations(metrics.DB.Topology, BuildTopologyRelations(metadata), complete)
 	return nil
+}
+
+// AttachReportMetadata stores an immutable provider snapshot on one collection
+// context for the later topology relation gatherer.
+func AttachReportMetadata(metrics *models.Metrics, metadata Metadata, complete bool) {
+	if metrics == nil {
+		return
+	}
+	metrics.Internal.AWSRDS = reportTopologyMetadata{
+		metadata: metadata.Clone(),
+		complete: complete,
+	}
+}
+
+func reportMetadata(metrics *models.Metrics) (Metadata, bool, bool) {
+	if metrics == nil {
+		return Metadata{}, false, false
+	}
+	snapshot, ok := metrics.Internal.AWSRDS.(reportTopologyMetadata)
+	if !ok {
+		return Metadata{}, false, false
+	}
+	return snapshot.metadata.Clone(), snapshot.complete, true
 }
 
 // Clone returns metadata whose slice storage is independent of the receiver.
