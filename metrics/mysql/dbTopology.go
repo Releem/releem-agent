@@ -56,8 +56,9 @@ func (g *DBTopologyGatherer) GetMetrics(metrics *models.Metrics) error {
 	defer utils.HandlePanic(g.configuration, g.logger)
 
 	variables := mapFromMetricGroup(metrics.DB.Conf.Variables)
-	replicaStatus, replicaStatusComplete := g.queryReplicaStatus(normalizeKeys(variables))
-	groupMembers, groupMembersComplete := g.queryGroupReplicationMembers()
+	normalizedVariables := normalizeKeys(variables)
+	replicaStatus, replicaStatusComplete := g.queryReplicaStatus(normalizedVariables)
+	groupMembers, groupMembersComplete := g.queryGroupReplicationMembers(normalizedVariables)
 	relationDiscoveryComplete := replicaStatusComplete && groupMembersComplete
 
 	metrics.DB.Topology = BuildTopologyFromFacts(TopologyFacts{
@@ -102,8 +103,7 @@ func firstSupportedTopologyQueryResult(queries []string, queryRows func(string) 
 }
 
 func replicaStatusQueries(variables map[string]string) []string {
-	vendor := strings.ToLower(firstString(variables, "version") + " " + firstString(variables, "version_comment"))
-	if strings.Contains(vendor, "mariadb") {
+	if isMariaDB(variables) {
 		return []string{
 			"SHOW ALL REPLICAS STATUS",
 			"SHOW ALL SLAVES STATUS",
@@ -114,7 +114,16 @@ func replicaStatusQueries(variables map[string]string) []string {
 	return []string{"SHOW REPLICA STATUS", "SHOW SLAVE STATUS"}
 }
 
-func (g *DBTopologyGatherer) queryGroupReplicationMembers() ([]map[string]interface{}, bool) {
+func isMariaDB(variables map[string]string) bool {
+	vendor := strings.ToLower(firstString(variables, "version") + " " + firstString(variables, "version_comment"))
+	return strings.Contains(vendor, "mariadb")
+}
+
+func (g *DBTopologyGatherer) queryGroupReplicationMembers(variables map[string]string) ([]map[string]interface{}, bool) {
+	if isMariaDB(variables) {
+		return []map[string]interface{}{}, true
+	}
+
 	groupMembers, supported := g.queryOptionalRows(`
 		SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_STATE, MEMBER_ROLE
 		FROM performance_schema.replication_group_members`)

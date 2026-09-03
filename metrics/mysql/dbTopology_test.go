@@ -944,6 +944,86 @@ func TestDBTopologyGathererOmitsCanonicalRelationsWhenOptionalDiscoveryFails(t *
 	}
 }
 
+func TestDBTopologyGathererTreatsMariaDBGroupReplicationAsKnownAbsence(t *testing.T) {
+	groupMemberQueries := 0
+	setMysqlSchemaTestDB(t, func(query string) (driver.Rows, error) {
+		if strings.HasPrefix(query, "SHOW") {
+			return mysqlEmptySchemaRows(), nil
+		}
+		if strings.Contains(query, "replication_group_members") {
+			groupMemberQueries++
+			return nil, errors.New("MariaDB does not support replication_group_members")
+		}
+		return nil, errors.New("unexpected topology query")
+	})
+
+	logger := *logging.Init("mysql-topology-mariadb-known-absence-test", false, false, io.Discard)
+	gatherer := NewDBTopologyGatherer(logger, &config.Config{})
+	metrics := &models.Metrics{}
+	metrics.DB.Conf.Variables = models.MetricGroupValue{
+		"server_id":       "mariadb-server-id",
+		"hostname":        "mariadb.example.com",
+		"port":            "3306",
+		"version":         "10.11.14-MariaDB",
+		"version_comment": "MariaDB Server",
+	}
+
+	if err := gatherer.GetMetrics(metrics); err != nil {
+		t.Fatalf("GetMetrics() error = %v", err)
+	}
+	if groupMemberQueries != 0 {
+		t.Fatalf("GetMetrics() queried replication_group_members %d times, want 0 for MariaDB", groupMemberQueries)
+	}
+	canonical, ok := metrics.DB.Topology["Relations"].([]models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("GetMetrics() canonical Relations = %#v, want complete MariaDB snapshot", metrics.DB.Topology["Relations"])
+	}
+	facts := metrics.DB.Topology["Facts"].(models.MetricGroupValue)
+	legacy := facts["Relations"].([]models.MetricGroupValue)
+	if !reflect.DeepEqual(canonical, legacy) {
+		t.Fatalf("GetMetrics() canonical Relations = %#v, want identical Facts.Relations %#v", canonical, legacy)
+	}
+}
+
+func TestDBTopologyGathererOmitsCanonicalRelationsWhenMySQLGroupMemberDiscoveryFails(t *testing.T) {
+	groupMemberQueries := 0
+	setMysqlSchemaTestDB(t, func(query string) (driver.Rows, error) {
+		if strings.HasPrefix(query, "SHOW") {
+			return mysqlEmptySchemaRows(), nil
+		}
+		if strings.Contains(query, "replication_group_members") {
+			groupMemberQueries++
+			return nil, errors.New("unexpected MySQL group-member query failure")
+		}
+		return nil, errors.New("unexpected topology query")
+	})
+
+	logger := *logging.Init("mysql-topology-mysql-group-member-failure-test", false, false, io.Discard)
+	gatherer := NewDBTopologyGatherer(logger, &config.Config{})
+	metrics := &models.Metrics{}
+	metrics.DB.Conf.Variables = models.MetricGroupValue{
+		"server_uuid":     "mysql-server-uuid",
+		"hostname":        "mysql.example.com",
+		"port":            "3306",
+		"version":         "8.4.7",
+		"version_comment": "MySQL Community Server - GPL",
+	}
+
+	if err := gatherer.GetMetrics(metrics); err != nil {
+		t.Fatalf("GetMetrics() error = %v", err)
+	}
+	if groupMemberQueries != 2 {
+		t.Fatalf("GetMetrics() queried replication_group_members %d times, want both MySQL fallbacks", groupMemberQueries)
+	}
+	if _, ok := metrics.DB.Topology["Relations"]; ok {
+		t.Fatalf("GetMetrics() canonical Relations = %#v, want omitted after MySQL group-member discovery failure", metrics.DB.Topology["Relations"])
+	}
+	facts := metrics.DB.Topology["Facts"].(models.MetricGroupValue)
+	if _, ok := facts["Relations"].([]models.MetricGroupValue); !ok {
+		t.Fatalf("GetMetrics() Facts.Relations = %#v, want compatibility relation mirror", facts["Relations"])
+	}
+}
+
 func TestBuildTopologyFromFactsPreservesConcurrentTopologyRelations(t *testing.T) {
 	asyncStatus := []map[string]interface{}{
 		{
