@@ -35,6 +35,7 @@ type AWSRDSEnhancedMetricsGatherer struct {
 	metadataDiscoveryTimeout time.Duration
 	metadataMu               sync.RWMutex
 	metadata                 awsrds.Metadata
+	metadataComplete         bool
 }
 
 type osMetrics struct {
@@ -204,7 +205,8 @@ func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, cwlogsclient *cloud
 		configuration:            configuration,
 		discoverMetadata:         discoverMetadata,
 		metadataDiscoveryTimeout: awsRDSMetadataDiscoveryTimeout,
-		metadata:                 initialMetadata,
+		metadata:                 initialMetadata.Clone(),
+		metadataComplete:         true,
 	}
 }
 
@@ -214,18 +216,29 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ct
 
 	metadata, err := awsrdsenhancedmetrics.discoverMetadata(discoveryCtx)
 	if err != nil {
-		awsrdsenhancedmetrics.metadataMu.RLock()
-		cached := awsrdsenhancedmetrics.metadata
-		awsrdsenhancedmetrics.metadataMu.RUnlock()
+		awsrdsenhancedmetrics.metadataMu.Lock()
+		cached := awsrdsenhancedmetrics.metadata.Clone()
+		awsrdsenhancedmetrics.metadataComplete = false
+		awsrdsenhancedmetrics.metadataMu.Unlock()
 		logAWSRDSDiscoveryFallback(awsrdsenhancedmetrics.logger, cached, err)
 		return cached
 	}
 
+	stored := metadata.Clone()
 	awsrdsenhancedmetrics.metadataMu.Lock()
-	awsrdsenhancedmetrics.metadata = metadata
+	awsrdsenhancedmetrics.metadata = stored
+	awsrdsenhancedmetrics.metadataComplete = true
 	awsrdsenhancedmetrics.metadataMu.Unlock()
-	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", metadata)
-	return metadata
+	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", stored)
+	return stored.Clone()
+}
+
+// MetadataSnapshot returns an immutable copy of the latest metadata and whether
+// the current report refreshed it successfully.
+func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) MetadataSnapshot() (awsrds.Metadata, bool) {
+	awsrdsenhancedmetrics.metadataMu.RLock()
+	defer awsrdsenhancedmetrics.metadataMu.RUnlock()
+	return awsrdsenhancedmetrics.metadata.Clone(), awsrdsenhancedmetrics.metadataComplete
 }
 
 // LogAWSRDSDiscovery emits safe discovery topology without endpoint, resource

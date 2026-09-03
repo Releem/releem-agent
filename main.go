@@ -66,6 +66,7 @@ func (programm *Programm) Run() {
 	// var gatherers map[string][]models.MetricsGatherer
 	gatherers := make(map[string][]models.MetricsGatherer)
 	var Mode models.ModeType
+	var awsRDSMetadataSnapshot awsrds.MetadataSnapshot
 
 	// Do something, call your goroutines, etc
 	logger.Info("Releem-agent version is ", config.ReleemAgentVersion) //
@@ -138,7 +139,7 @@ func (programm *Programm) Run() {
 			}
 		}
 
-		gatherers["default"] = append(gatherers["default"], system.NewAWSRDSEnhancedMetricsGatherer(
+		awsMetricsGatherer := system.NewAWSRDSEnhancedMetricsGatherer(
 			logger,
 			cwlogsclient,
 			configuration,
@@ -146,7 +147,9 @@ func (programm *Programm) Run() {
 			func(ctx context.Context) (awsrds.Metadata, error) {
 				return awsrds.DiscoverInstance(ctx, rdsclient, configuration.AwsRDSDB)
 			},
-		))
+		)
+		awsRDSMetadataSnapshot = awsMetricsGatherer.MetadataSnapshot
+		gatherers["default"] = append(gatherers["default"], awsMetricsGatherer)
 		logger.Info("AWS RDS DB instance found: ", configuration.AwsRDSDB)
 	case "gcp/cloudsql":
 		logger.Info("InstanceType is gcp/cloudsql")
@@ -281,8 +284,11 @@ func (programm *Programm) Run() {
 			mysql.NewDBConfGatherer(logger, configuration),
 			mysql.NewDBInfoGatherer(logger, configuration),
 			mysql.NewDBMetricsBaseGatherer(logger, configuration),
-			mysql.NewDBTopologyGatherer(logger, configuration),
-			metrics.NewAgentMetricsGatherer(logger, configuration))
+			mysql.NewDBTopologyGatherer(logger, configuration))
+		if awsRDSMetadataSnapshot != nil {
+			gatherers["default"] = append(gatherers["default"], awsrds.NewTopologyRelationsGatherer(logger, awsRDSMetadataSnapshot))
+		}
+		gatherers["default"] = append(gatherers["default"], metrics.NewAgentMetricsGatherer(logger, configuration))
 
 		gatherers["metrics"] = append(gatherers["metrics"], mysql.NewDBMetricsGatherer(logger, configuration))
 

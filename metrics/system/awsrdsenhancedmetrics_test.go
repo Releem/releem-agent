@@ -8,12 +8,15 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
+	"github.com/Releem/mysqlconfigurer/metrics/mysql"
 	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -237,6 +240,199 @@ func TestAWSRDSEnhancedMetricsGathererFallsBackToCachedTopology(t *testing.T) {
 	if got := host["IsClusterWriter"]; got != true {
 		t.Errorf("GetMetrics(discovery failure) IsClusterWriter = %#v, want cached true", got)
 	}
+	snapshot, complete := gatherer.MetadataSnapshot()
+	if complete {
+		t.Errorf("MetadataSnapshot() complete = true after discovery failure, want false")
+	}
+	if snapshot.DBInstanceResourceID != cached.DBInstanceResourceID {
+		t.Errorf("MetadataSnapshot() resource ID = %q, want cached %q", snapshot.DBInstanceResourceID, cached.DBInstanceResourceID)
+	}
+}
+
+func TestAWSRDSEnhancedMetricsGathererMetadataSnapshotIsImmutable(t *testing.T) {
+	initial := testRDSMetadata("orders-reader", "db-reader-resource", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", false)
+	initial.ClusterMembers = []awsrds.ClusterMember{{DBInstanceIdentifier: "orders-reader", Endpoint: "reader.internal"}}
+	initial.ReadReplicaDBInstanceIdentifiers = []string{"orders-child"}
+	discovered := initial
+	discovered.ClusterMembers = append([]awsrds.ClusterMember(nil), initial.ClusterMembers...)
+	discovered.ReadReplicaDBInstanceIdentifiers = append([]string(nil), initial.ReadReplicaDBInstanceIdentifiers...)
+	discovered.ClusterMembers[0].Endpoint = "fresh-reader.internal"
+
+	logger := *logging.Init("aws-rds-metadata-snapshot-test", false, false, io.Discard)
+	gatherer := NewAWSRDSEnhancedMetricsGatherer(
+		logger,
+		nil,
+		&config.Config{},
+		initial,
+		func(context.Context) (awsrds.Metadata, error) { return discovered, nil },
+	)
+
+	initial.ClusterMembers[0].Endpoint = "mutated-initial.internal"
+	initial.ReadReplicaDBInstanceIdentifiers[0] = "mutated-initial-child"
+	snapshot, complete := gatherer.MetadataSnapshot()
+	if !complete {
+		t.Errorf("MetadataSnapshot() initial complete = false, want true")
+	}
+	if got := snapshot.ClusterMembers[0].Endpoint; got != "reader.internal" {
+		t.Errorf("MetadataSnapshot() initial member endpoint = %q, want reader.internal", got)
+	}
+	if got := snapshot.ReadReplicaDBInstanceIdentifiers[0]; got != "orders-child" {
+		t.Errorf("MetadataSnapshot() initial child = %q, want orders-child", got)
+	}
+
+	if got := gatherer.metadataForReport(context.Background()); got.ClusterMembers[0].Endpoint != "fresh-reader.internal" {
+		t.Errorf("metadataForReport() member endpoint = %q, want fresh-reader.internal", got.ClusterMembers[0].Endpoint)
+	}
+	discovered.ClusterMembers[0].Endpoint = "mutated-discoverer.internal"
+	discovered.ReadReplicaDBInstanceIdentifiers[0] = "mutated-discoverer-child"
+	snapshot, complete = gatherer.MetadataSnapshot()
+	if !complete {
+		t.Errorf("MetadataSnapshot() refreshed complete = false, want true")
+	}
+	if got := snapshot.ClusterMembers[0].Endpoint; got != "fresh-reader.internal" {
+		t.Errorf("MetadataSnapshot() refreshed member endpoint = %q, want fresh-reader.internal", got)
+	}
+	if got := snapshot.ReadReplicaDBInstanceIdentifiers[0]; got != "orders-child" {
+		t.Errorf("MetadataSnapshot() refreshed child = %q, want orders-child", got)
+	}
+
+	snapshot.ClusterMembers[0].Endpoint = "mutated-snapshot.internal"
+	snapshot.ReadReplicaDBInstanceIdentifiers[0] = "mutated-snapshot-child"
+	second, _ := gatherer.MetadataSnapshot()
+	if got := second.ClusterMembers[0].Endpoint; got != "fresh-reader.internal" {
+		t.Errorf("MetadataSnapshot() member endpoint after caller mutation = %q, want fresh-reader.internal", got)
+	}
+	if got := second.ReadReplicaDBInstanceIdentifiers[0]; got != "orders-child" {
+		t.Errorf("MetadataSnapshot() child after caller mutation = %q, want orders-child", got)
+	}
+}
+
+func TestAWSRDSEnhancedMetricsGathererMetadataSnapshotConcurrentAccess(t *testing.T) {
+	metadata := testRDSMetadata("orders-reader", "db-reader-resource", "db.r7g.large", "aurora-mysql", "instance-pg", "orders", "cluster-pg", "provisioned", false)
+	metadata.ClusterMembers = []awsrds.ClusterMember{{DBInstanceIdentifier: "orders-reader", Endpoint: "reader.internal"}}
+	metadata.GlobalClusterMembers = []awsrds.GlobalClusterMember{{DBClusterIdentifier: "orders", Region: "us-east-1"}}
+	metadata.ReadReplicaDBInstanceIdentifiers = []string{"orders-child"}
+	metadata.ReadReplicas = []awsrds.RelatedDBInstance{{DBInstanceIdentifier: "orders-child", Endpoint: "child.internal"}}
+
+	logger := *logging.Init("aws-rds-metadata-snapshot-race-test", false, false, io.Discard)
+	gatherer := NewAWSRDSEnhancedMetricsGatherer(
+		logger,
+		nil,
+		&config.Config{},
+		metadata,
+		func(context.Context) (awsrds.Metadata, error) { return metadata, nil },
+	)
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				gatherer.metadataForReport(context.Background())
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				snapshot, _ := gatherer.MetadataSnapshot()
+				snapshot.ClusterMembers[0].Endpoint = "caller-mutation.internal"
+				snapshot.GlobalClusterMembers[0].Region = "caller-region"
+				snapshot.ReadReplicaDBInstanceIdentifiers[0] = "caller-child"
+				snapshot.ReadReplicas[0].Endpoint = "caller-child.internal"
+			}
+		}()
+	}
+	wg.Wait()
+
+	snapshot, complete := gatherer.MetadataSnapshot()
+	if !complete || snapshot.ClusterMembers[0].Endpoint != "reader.internal" || snapshot.GlobalClusterMembers[0].Region != "us-east-1" || snapshot.ReadReplicaDBInstanceIdentifiers[0] != "orders-child" || snapshot.ReadReplicas[0].Endpoint != "child.internal" {
+		t.Errorf("MetadataSnapshot() after concurrent access = %#v, complete %t; want immutable complete metadata", snapshot, complete)
+	}
+}
+
+func TestAWSRelationsAreMergedAfterNativeTopology(t *testing.T) {
+	native := mysql.BuildTopologyFromFacts(mysql.TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":     "mysql-member",
+			"hostname":        "mysql.internal",
+			"port":            "3306",
+			"read_only":       "ON",
+			"super_read_only": "ON",
+		},
+	})
+	metrics := &models.Metrics{}
+	metrics.DB.Topology = native
+	metadata := awsrds.Metadata{
+		Region:                        "us-east-1",
+		DBInstanceIdentifier:          "orders-reader",
+		DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-reader",
+		DBInstanceResourceID:          "db-orders-reader-resource",
+		DBInstanceClass:               "db.r7g.large",
+		Endpoint:                      "orders-reader.internal",
+		EndpointPort:                  3306,
+		Engine:                        "aurora-mysql",
+		EngineMode:                    "provisioned",
+		DBClusterIdentifier:           "orders",
+		DBClusterARN:                  "arn:aws:rds:us-east-1:123456789012:cluster:orders",
+		DBClusterResourceID:           "cluster-orders-resource",
+		DBClusterParameterGroup:       "orders-cluster-pg",
+		DBClusterParameterGroupStatus: "in-sync",
+		ClusterMembers: []awsrds.ClusterMember{
+			{
+				DBInstanceIdentifier:          "orders-writer",
+				DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-writer",
+				DBInstanceResourceID:          "db-orders-writer-resource",
+				Endpoint:                      "orders-writer.internal",
+				EndpointPort:                  3306,
+				InstanceStatus:                "available",
+				IsClusterWriter:               true,
+				DBClusterParameterGroupStatus: "in-sync",
+			},
+			{
+				DBInstanceIdentifier:          "orders-reader",
+				DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-reader",
+				DBInstanceResourceID:          "db-orders-reader-resource",
+				Endpoint:                      "orders-reader.internal",
+				EndpointPort:                  3306,
+				InstanceStatus:                "available",
+				PromotionTier:                 1,
+				DBClusterParameterGroupStatus: "in-sync",
+			},
+		},
+		PromotionTier:  1,
+		InstanceStatus: "available",
+	}
+	logger := *logging.Init("aws-topology-merge-test", false, false, io.Discard)
+	gatherer := awsrds.NewTopologyRelationsGatherer(logger, func() (awsrds.Metadata, bool) { return metadata, true })
+
+	if err := gatherer.GetMetrics(metrics); err != nil {
+		t.Fatalf("TopologyRelationsGatherer.GetMetrics() error = %v", err)
+	}
+	canonical, ok := metrics.DB.Topology["Relations"].([]models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("TopologyRelationsGatherer.GetMetrics() canonical Relations = %#v, want []models.MetricGroupValue", metrics.DB.Topology["Relations"])
+	}
+	if got := relationTypes(canonical); !reflect.DeepEqual(got, []string{"aurora_cluster", "standalone"}) {
+		t.Errorf("TopologyRelationsGatherer.GetMetrics() relation types = %#v, want [aurora_cluster standalone]", got)
+	}
+	facts := metrics.DB.Topology["Facts"].(models.MetricGroupValue)
+	legacy, ok := facts["Relations"].([]models.MetricGroupValue)
+	if !ok || !reflect.DeepEqual(legacy, canonical) {
+		t.Errorf("TopologyRelationsGatherer.GetMetrics() Facts.Relations = %#v, want canonical mirror %#v", facts["Relations"], canonical)
+	}
+	if metrics.DB.Topology["Type"] != "standalone" || metrics.DB.Topology["MemberKey"] != "mysql-member" {
+		t.Errorf("TopologyRelationsGatherer.GetMetrics() compatibility projection = %#v, want native standalone mysql-member", metrics.DB.Topology)
+	}
+}
+
+func relationTypes(relations []models.MetricGroupValue) []string {
+	types := make([]string, 0, len(relations))
+	for _, relation := range relations {
+		typeName, _ := relation["Type"].(string)
+		types = append(types, typeName)
+	}
+	return types
 }
 
 func TestLogAWSRDSDiscoveryRedactsSensitiveMetadata(t *testing.T) {
