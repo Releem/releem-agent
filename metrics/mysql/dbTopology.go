@@ -170,18 +170,18 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		if selected == nil {
 			selected = asyncReplication
 		}
-		relations = append(relations, topologyRelation(asyncReplication))
+		asyncRelation := topologyRelation(asyncReplication)
+		if topologyString(asyncRelation, "MemberKey") == "" && selected != nil {
+			asyncRelation["MemberKey"] = topologyString(selected, "MemberKey")
+		}
+		relations = append(relations, asyncRelation)
 	}
 
 	if selected == nil {
-		return topology
+		selected = topology
+		relations = append(relations, topologyRelation(topology))
 	}
-	if len(relations) > 1 {
-		selectedFacts, _ := selected["Facts"].(models.MetricGroupValue)
-		selectedFacts = cloneMetricGroup(selectedFacts)
-		selectedFacts["Relations"] = relations
-		selected["Facts"] = selectedFacts
-	}
+	AttachTopologyRelations(selected, relations, true)
 	return selected
 }
 

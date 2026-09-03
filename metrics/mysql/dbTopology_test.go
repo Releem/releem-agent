@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -714,6 +715,204 @@ func TestBuildTopologyFromFactsUsesGaleraNodeNameBeforeClusterStateUUID(t *testi
 	}
 }
 
+func TestAttachTopologyRelationsPublishesCanonicalAndLegacyViews(t *testing.T) {
+	topology := models.MetricGroupValue{
+		"Type":      "group_replication",
+		"GroupKey":  "physical-group",
+		"MemberKey": "member-a",
+		"Facts":     models.MetricGroupValue{"GroupMembers": []models.MetricGroupValue{}},
+	}
+	relations := []models.MetricGroupValue{
+		{
+			"Type":                  " group_replication ",
+			"GroupKey":              " group-a ",
+			"MemberKey":             " member-a ",
+			"IsWriter":              "YES",
+			"IsReader":              "false",
+			"ReadOnly":              "ON",
+			"SuperReadOnly":         "0",
+			"MemberPort":            "3306",
+			"PrimaryPort":           []byte("3307"),
+			"ReplicationLagSeconds": "12",
+			"Facts":                 models.MetricGroupValue{"Source": "first"},
+		},
+		{
+			"Type":      "async_replication",
+			"GroupKey":  "source-a",
+			"MemberKey": "member-a",
+			"IsWriter":  false,
+			"IsReader":  true,
+		},
+		{
+			"Type":      "group_replication",
+			"GroupKey":  "group-a",
+			"MemberKey": "member-a",
+			"Facts":     models.MetricGroupValue{"Source": "duplicate"},
+		},
+	}
+
+	AttachTopologyRelations(topology, relations, true)
+
+	canonical, ok := topology["Relations"].([]models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("AttachTopologyRelations(topology, relations, true) Relations = %#v, want []models.MetricGroupValue", topology["Relations"])
+	}
+	facts := topology["Facts"].(models.MetricGroupValue)
+	legacy, ok := facts["Relations"].([]models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("AttachTopologyRelations(topology, relations, true) Facts.Relations = %#v, want []models.MetricGroupValue", facts["Relations"])
+	}
+	if !reflect.DeepEqual(canonical, legacy) {
+		t.Fatalf("AttachTopologyRelations(topology, relations, true) Relations = %#v, want identical Facts.Relations %#v", canonical, legacy)
+	}
+
+	want := []models.MetricGroupValue{
+		{
+			"Type":      "async_replication",
+			"GroupKey":  "source-a",
+			"MemberKey": "member-a",
+			"IsWriter":  false,
+			"IsReader":  true,
+		},
+		{
+			"Type":                  "group_replication",
+			"GroupKey":              "group-a",
+			"MemberKey":             "member-a",
+			"IsWriter":              true,
+			"IsReader":              false,
+			"ReadOnly":              true,
+			"SuperReadOnly":         false,
+			"MemberPort":            int64(3306),
+			"PrimaryPort":           int64(3307),
+			"ReplicationLagSeconds": int64(12),
+			"Facts":                 models.MetricGroupValue{"Source": "first"},
+		},
+	}
+	if !reflect.DeepEqual(canonical, want) {
+		t.Fatalf("AttachTopologyRelations(topology, relations, true) Relations = %#v, want %#v", canonical, want)
+	}
+}
+
+func TestNormalizeTopologyRelationsSortsAndDeduplicates(t *testing.T) {
+	tests := []struct {
+		name      string
+		relations []models.MetricGroupValue
+		want      []models.MetricGroupValue
+	}{
+		{
+			name: "normalizes identity fields and keeps the first duplicate",
+			relations: []models.MetricGroupValue{
+				{"Type": " group_replication ", "GroupKey": " group-b ", "MemberKey": " member-a ", "Facts": models.MetricGroupValue{"Source": "first"}},
+				{"Type": "async_replication", "GroupKey": "source-a", "MemberKey": "member-a"},
+				{"Type": "group_replication", "GroupKey": "group-b", "MemberKey": "member-a", "Facts": models.MetricGroupValue{"Source": "duplicate"}},
+			},
+			want: []models.MetricGroupValue{
+				{"Type": "async_replication", "GroupKey": "source-a", "MemberKey": "member-a"},
+				{"Type": "group_replication", "GroupKey": "group-b", "MemberKey": "member-a", "Facts": models.MetricGroupValue{"Source": "first"}},
+			},
+		},
+		{
+			name: "drops relations without a complete identity",
+			relations: []models.MetricGroupValue{
+				{"Type": "group_replication", "MemberKey": "member-a"},
+				{"Type": "group_replication", "GroupKey": "group-a"},
+				{"GroupKey": "group-a", "MemberKey": "member-a"},
+			},
+			want: []models.MetricGroupValue{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := NormalizeTopologyRelations(test.relations)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("NormalizeTopologyRelations(%#v) = %#v, want %#v", test.relations, got, test.want)
+			}
+
+			if len(test.relations) > 0 && len(got) > 0 {
+				test.relations[0]["Type"] = "mutated-input"
+				if got[len(got)-1]["Type"] != "group_replication" {
+					t.Fatalf("NormalizeTopologyRelations(%#v) retained the input map, got %#v", test.relations, got[len(got)-1])
+				}
+				facts := test.relations[0]["Facts"].(models.MetricGroupValue)
+				facts["Source"] = "mutated-input"
+				canonicalFacts := got[len(got)-1]["Facts"].(models.MetricGroupValue)
+				if canonicalFacts["Source"] != "first" {
+					t.Fatalf("NormalizeTopologyRelations(%#v) retained nested input maps, got %#v", test.relations, canonicalFacts)
+				}
+			}
+		})
+	}
+}
+
+func TestCompositeTopologyKeyIsBoundedAndStable(t *testing.T) {
+	tests := []struct {
+		name       string
+		namespace  string
+		identities []string
+		want       string
+	}{
+		{
+			name:       "uses the canonical single identity",
+			namespace:  "multi-source",
+			identities: []string{" source-a ", "source-a"},
+			want:       "multi-source:source-a",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := CompositeTopologyKey(test.namespace, test.identities); got != test.want {
+				t.Fatalf("CompositeTopologyKey(%q, %#v) = %q, want %q", test.namespace, test.identities, got, test.want)
+			}
+		})
+	}
+
+	identities := make([]string, 0, 20)
+	for index := 0; index < 20; index++ {
+		identities = append(identities, "source-"+string(rune('a'+index))+"-"+strings.Repeat("identity-", 32))
+	}
+	reversed := append([]string(nil), identities...)
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+
+	key := CompositeTopologyKey("multi-source", identities)
+	if key != CompositeTopologyKey("multi-source", reversed) {
+		t.Fatalf("CompositeTopologyKey(%q, %#v) = %q, want stable result for reordered identities", "multi-source", reversed, key)
+	}
+	if !strings.HasPrefix(key, "multi-source:sha256:") {
+		t.Fatalf("CompositeTopologyKey(%q, 20 identities) = %q, want sha256 fallback", "multi-source", key)
+	}
+	if len(key) > maxTopologyKeyLength || len(key) >= 255 {
+		t.Fatalf("CompositeTopologyKey(%q, 20 identities) length = %d, want at most %d and below 255", "multi-source", len(key), maxTopologyKeyLength)
+	}
+	for _, character := range key[len("multi-source:sha256:"):] {
+		if !(character >= '0' && character <= '9') && !(character >= 'a' && character <= 'f') {
+			t.Fatalf("CompositeTopologyKey(%q, 20 identities) = %q, want lowercase SHA-256 hex", "multi-source", key)
+		}
+	}
+}
+
+func TestIncompleteRelationDiscoveryOmitsCanonicalSnapshot(t *testing.T) {
+	topology := models.MetricGroupValue{
+		"Relations": []models.MetricGroupValue{{"Type": "stale", "GroupKey": "stale", "MemberKey": "stale"}},
+		"Facts":     models.MetricGroupValue{},
+	}
+	relations := []models.MetricGroupValue{{"Type": "async_replication", "GroupKey": "source-a", "MemberKey": "member-a"}}
+
+	AttachTopologyRelations(topology, relations, false)
+
+	if _, ok := topology["Relations"]; ok {
+		t.Fatalf("AttachTopologyRelations(topology, relations, false) retained canonical Relations %#v, want omitted", topology["Relations"])
+	}
+	facts := topology["Facts"].(models.MetricGroupValue)
+	want := []models.MetricGroupValue{{"Type": "async_replication", "GroupKey": "source-a", "MemberKey": "member-a"}}
+	if got := facts["Relations"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("AttachTopologyRelations(topology, relations, false) Facts.Relations = %#v, want %#v", got, want)
+	}
+}
+
 func TestBuildTopologyFromFactsPreservesConcurrentTopologyRelations(t *testing.T) {
 	asyncStatus := []map[string]interface{}{
 		{
@@ -750,7 +949,7 @@ func TestBuildTopologyFromFactsPreservesConcurrentTopologyRelations(t *testing.T
 				ReplicaStatus: asyncStatus,
 			},
 			primary:   "galera_cluster",
-			relations: []string{"galera_cluster", "async_replication"},
+			relations: []string{"async_replication", "galera_cluster"},
 		},
 		{
 			name: "group replication with ClusterSet channel",
@@ -772,7 +971,7 @@ func TestBuildTopologyFromFactsPreservesConcurrentTopologyRelations(t *testing.T
 				ReplicaStatus: asyncStatus,
 			},
 			primary:   "group_replication",
-			relations: []string{"group_replication", "async_replication"},
+			relations: []string{"async_replication", "group_replication"},
 		},
 	}
 
@@ -796,7 +995,13 @@ func TestBuildTopologyFromFactsPreservesConcurrentTopologyRelations(t *testing.T
 					t.Fatalf("expected relation %d type %q, got %#v", idx, relationType, relations[idx]["Type"])
 				}
 			}
-			asyncFacts := relations[len(relations)-1]["Facts"].(models.MetricGroupValue)
+			var asyncFacts models.MetricGroupValue
+			for _, relation := range relations {
+				if relation["Type"] == "async_replication" {
+					asyncFacts = relation["Facts"].(models.MetricGroupValue)
+					break
+				}
+			}
 			channels := asyncFacts["ReplicaChannels"].([]models.MetricGroupValue)
 			if len(channels) != 1 || channels[0]["Master_UUID"] != "upstream-uuid" {
 				t.Fatalf("expected full async channel relation, got %#v", channels)
