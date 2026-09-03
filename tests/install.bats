@@ -1130,11 +1130,15 @@ exit 0
     run grep -F "GRANT SELECT ON mysql_innodb_cluster_metadata.*" "${TEST_TMPDIR}/mysql.args"
     [ "$status" -eq 0 ]
 
-    run sed -n '/# Non-fatal performance_schema grants/,/# SYSTEM_VARIABLES_ADMIN/p' "${REPO_ROOT}/windows/install.ps1"
+    local expected_windows_sequence
+    printf -v expected_windows_sequence '%s\n%s\n%s' \
+        "        \$null = Invoke-MySQLRoot -e \"GRANT SELECT ON mysql_innodb_cluster_metadata.* TO '\$ReleemMysqlLogin'\$at'\$MysqlUserHost';\"" \
+        '        if ($LASTEXITCODE -ne 0) {' \
+        "            Write-Log 'WARNING: InnoDB Cluster metadata topology metrics are unavailable. The mysql_innodb_cluster_metadata schema may not exist yet or the grant was rejected; initialize the schema or grant SELECT to enable these metrics.'"
+
+    run awk '/GRANT SELECT ON mysql_innodb_cluster_metadata[.][*]/ { print; if (getline > 0) print; if (getline > 0) print; exit }' "${REPO_ROOT}/windows/install.ps1"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"GRANT SELECT ON mysql_innodb_cluster_metadata.*"* ]]
-    [[ "$output" == *'if ($LASTEXITCODE -ne 0)'* ]]
-    [[ "$output" == *"InnoDB Cluster metadata topology metrics are unavailable"* ]]
+    [ "$output" = "$expected_windows_sequence" ]
 }
 
 @test "create_mysql_user keeps empty root password option when root password env is set to empty string" {
