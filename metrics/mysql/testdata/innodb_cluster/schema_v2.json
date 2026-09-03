@@ -1,0 +1,32 @@
+{
+  "schema_version": "2.1.0",
+  "columns": {
+    "schema_version": ["major", "minor", "patch"],
+    "v2_gr_clusters": ["cluster_type", "primary_mode", "cluster_id", "cluster_name", "group_name", "attributes", "options", "router_options", "description", "clusterset_id"],
+    "v2_instances": ["instance_id", "cluster_id", "label", "mysql_server_uuid", "address", "endpoint", "xendpoint", "attributes"],
+    "v2_cs_clustersets": ["view_id", "async_topology_type", "clusterset_id", "domain_name", "attributes", "options", "router_options"],
+    "v2_cs_members": ["view_id", "clusterset_id", "cluster_id", "cluster_name", "member_role", "master_cluster_id", "invalidated"]
+  },
+  "rows": {
+    "schema_version": [
+      {"major": "2", "minor": "1", "patch": "0"}
+    ],
+    "v2_gr_clusters": [
+      {"cluster_type": "gr", "primary_mode": "pm", "cluster_id": "22222222-2222-2222-2222-222222222222", "cluster_name": "primaryCluster", "group_name": "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa", "clusterset_id": "44444444-4444-4444-4444-444444444444"},
+      {"cluster_type": "gr", "primary_mode": "pm", "cluster_id": "33333333-3333-3333-3333-333333333333", "cluster_name": "replicaCluster", "group_name": "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb", "clusterset_id": "44444444-4444-4444-4444-444444444444"}
+    ],
+    "v2_instances": [
+      {"instance_id": "201", "cluster_id": "22222222-2222-2222-2222-222222222222", "label": "primary-1", "mysql_server_uuid": "cccccccc-cccc-cccc-cccc-cccccccccccc", "address": "primary-1.example.com:3306", "endpoint": "primary-1.example.com:3306"},
+      {"instance_id": "301", "cluster_id": "33333333-3333-3333-3333-333333333333", "label": "replica-1", "mysql_server_uuid": "dddddddd-dddd-dddd-dddd-dddddddddddd", "address": "replica-1.example.com:3306", "endpoint": "replica-1.example.com:3306"},
+      {"instance_id": "999", "cluster_id": "99999999-9999-9999-9999-999999999999", "label": "removed-instance", "mysql_server_uuid": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "address": "removed.example.com:3306", "endpoint": "removed.example.com:3306"}
+    ],
+    "v2_cs_clustersets": [
+      {"view_id": "7", "async_topology_type": "SINGLE-PRIMARY-TREE", "clusterset_id": "44444444-4444-4444-4444-444444444444", "domain_name": "productionSet"}
+    ],
+    "v2_cs_members": [
+      {"view_id": "7", "clusterset_id": "44444444-4444-4444-4444-444444444444", "cluster_id": "22222222-2222-2222-2222-222222222222", "cluster_name": "primaryCluster", "member_role": "PRIMARY", "master_cluster_id": "", "invalidated": "0"},
+      {"view_id": "7", "clusterset_id": "44444444-4444-4444-4444-444444444444", "cluster_id": "33333333-3333-3333-3333-333333333333", "cluster_name": "replicaCluster", "member_role": "REPLICA", "master_cluster_id": "22222222-2222-2222-2222-222222222222", "invalidated": "0"},
+      {"view_id": "7", "clusterset_id": "44444444-4444-4444-4444-444444444444", "cluster_id": "99999999-9999-9999-9999-999999999999", "cluster_name": "removedCluster", "member_role": "", "master_cluster_id": "22222222-2222-2222-2222-222222222222", "invalidated": "1"}
+    ]
+  }
+}

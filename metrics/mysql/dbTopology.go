@@ -14,10 +14,11 @@ import (
 )
 
 type TopologyFacts struct {
-	Variables     map[string]interface{}
-	Status        map[string]interface{}
-	ReplicaStatus []map[string]interface{}
-	GroupMembers  []map[string]interface{}
+	Variables      map[string]interface{}
+	Status         map[string]interface{}
+	ReplicaStatus  []map[string]interface{}
+	GroupMembers   []map[string]interface{}
+	InnoDBMetadata *InnoDBMetadata
 	// RelationDiscoveryComplete is nil for direct fact fixtures, which remain
 	// complete for compatibility. The live gatherer always sets it.
 	RelationDiscoveryComplete *bool
@@ -59,17 +60,59 @@ func (g *DBTopologyGatherer) GetMetrics(metrics *models.Metrics) error {
 	normalizedVariables := normalizeKeys(variables)
 	replicaStatus, replicaStatusComplete := g.queryReplicaStatus(normalizedVariables)
 	groupMembers, groupMembersComplete := g.queryGroupReplicationMembers(normalizedVariables)
-	relationDiscoveryComplete := replicaStatusComplete && groupMembersComplete
+	innodbMetadata := InnoDBMetadata{Complete: true}
+	if !isMariaDB(normalizedVariables) {
+		var err error
+		innodbMetadata, err = DiscoverInnoDBMetadata(queryTopologyStringRows)
+		if err != nil {
+			g.logger.V(5).Info("InnoDB topology metadata discovery incomplete: ", err)
+		}
+	}
+	relationDiscoveryComplete := replicaStatusComplete && groupMembersComplete && innodbMetadata.Complete
 
 	metrics.DB.Topology = BuildTopologyFromFacts(TopologyFacts{
 		Variables:                 variables,
 		Status:                    mapFromMetricGroup(metrics.DB.Metrics.Status),
 		ReplicaStatus:             replicaStatus,
 		GroupMembers:              groupMembers,
+		InnoDBMetadata:            &innodbMetadata,
 		RelationDiscoveryComplete: &relationDiscoveryComplete,
 	})
 	g.logger.V(5).Info("CollectMetrics DBTopology ", metrics.DB.Topology)
 	return nil
+}
+
+func queryTopologyStringRows(query string, args ...any) ([]map[string]string, error) {
+	rows, err := models.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("read topology query columns: %w", err)
+	}
+	result := make([]map[string]string, 0)
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		destinations := make([]interface{}, len(columns))
+		for index := range values {
+			destinations[index] = &values[index]
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			return nil, fmt.Errorf("scan topology query row: %w", err)
+		}
+		row := make(map[string]string, len(columns))
+		for index, column := range columns {
+			row[column] = stringValue(values[index])
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate topology query rows: %w", err)
+	}
+	return result, nil
 }
 
 func (g *DBTopologyGatherer) queryOptionalRows(query string) ([]map[string]interface{}, bool) {
@@ -170,7 +213,8 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 	}
 
 	var selected models.MetricGroupValue
-	relations := make([]models.MetricGroupValue, 0, 3)
+	var metadataBase models.MetricGroupValue
+	relations := make([]models.MetricGroupValue, 0, 5)
 	if isGalera(variables, status) {
 		galera := buildGaleraTopology(cloneMetricGroup(topology), variables, status)
 		selected = galera
@@ -181,7 +225,8 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		if selected == nil {
 			selected = groupReplication
 		}
-		relations = append(relations, topologyRelation(groupReplication))
+		metadataBase = topologyRelation(groupReplication)
+		relations = append(relations, metadataBase)
 	}
 	if len(facts.ReplicaStatus) > 0 {
 		asyncReplication := buildAsyncReplicaTopology(cloneMetricGroup(topology), variables, facts.ReplicaStatus)
@@ -199,12 +244,20 @@ func BuildTopologyFromFacts(facts TopologyFacts) models.MetricGroupValue {
 		selected = topology
 		relations = append(relations, topologyRelation(topology))
 	}
+	if facts.InnoDBMetadata != nil {
+		if metadataBase == nil {
+			metadataBase = topologyRelation(topology)
+		}
+		metadata := withClusterSetReplicationState(*facts.InnoDBMetadata, facts.ReplicaStatus)
+		relations = append(relations, BuildInnoDBRelations(metadataBase, metadata)...)
+	}
 	AttachTopologyRelations(selected, relations, topologyRelationsComplete(facts))
 	return selected
 }
 
 func topologyRelationsComplete(facts TopologyFacts) bool {
-	return facts.RelationDiscoveryComplete == nil || *facts.RelationDiscoveryComplete
+	complete := facts.RelationDiscoveryComplete == nil || *facts.RelationDiscoveryComplete
+	return complete && (facts.InnoDBMetadata == nil || facts.InnoDBMetadata.Complete)
 }
 
 func buildAsyncReplicaTopology(topology models.MetricGroupValue, variables map[string]string, replicaStatuses []map[string]interface{}) models.MetricGroupValue {
