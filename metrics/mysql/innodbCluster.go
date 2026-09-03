@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -10,12 +11,14 @@ import (
 	"strings"
 
 	"github.com/Releem/mysqlconfigurer/models"
+	drivermysql "github.com/go-sql-driver/mysql"
 )
 
 const (
 	innodbMetadataSchema        = "mysql_innodb_cluster_metadata"
 	clusterSetChannelName       = "clusterset_replication"
 	metadataSchemaQuery         = `SELECT SCHEMA_NAME FROM information_schema.schemata WHERE SCHEMA_NAME = ?`
+	metadataSchemaProbeQuery    = "SHOW TABLES FROM `mysql_innodb_cluster_metadata`"
 	metadataColumnsQuery        = `SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION`
 	metadataSchemaVersion       = "schema_version"
 	metadataV1Clusters          = "clusters"
@@ -25,6 +28,7 @@ const (
 	metadataV2Instances         = "v2_instances"
 	metadataV2ClusterSets       = "v2_cs_clustersets"
 	metadataV2ClusterSetMembers = "v2_cs_members"
+	mysqlErrorUnknownDatabase   = 1049
 )
 
 // InnoDBMetadata is a generation-neutral snapshot of MySQL Shell metadata.
@@ -87,8 +91,14 @@ func DiscoverInnoDBMetadata(query topologyRowsQuery) (InnoDBMetadata, error) {
 		return metadata, fmt.Errorf("check InnoDB metadata schema: %w", err)
 	}
 	if len(schemaRows) == 0 {
-		metadata.Complete = true
-		return metadata, nil
+		_, probeErr := query(metadataSchemaProbeQuery)
+		if isMySQLErrorNumber(probeErr, mysqlErrorUnknownDatabase) {
+			metadata.Complete = true
+			return metadata, nil
+		}
+		if probeErr != nil {
+			return metadata, fmt.Errorf("probe InnoDB metadata schema: %w", probeErr)
+		}
 	}
 
 	columnRows, err := query(metadataColumnsQuery, innodbMetadataSchema)
@@ -317,36 +327,29 @@ func BuildInnoDBRelations(base models.MetricGroupValue, metadata InnoDBMetadata)
 func buildInnoDBClusterRelation(base models.MetricGroupValue, version string, cluster InnoDBCluster, instance InnoDBInstance) models.MetricGroupValue {
 	memberKey := innodbMemberKey(base, instance)
 	memberHost, memberPort, memberPortOK := topologyEndpoint(base, instance.Address)
+	isGroupReplication := topologyString(base, "Type") == "group_replication"
 	state := topologyString(base, "ReplicationState")
-	if topologyString(base, "Type") != "group_replication" || state == "" {
+	if !isGroupReplication || state == "" {
 		state = "unknown"
 	}
 	isHealthy := state == "healthy"
-	isMultiPrimary := strings.EqualFold(cluster.PrimaryMode, "mm") || strings.EqualFold(cluster.PrimaryMode, "multi-primary")
 	role := "secondary"
-	if isMultiPrimary {
-		role = "multi_primary"
-	} else if topologyString(base, "Role") == "primary" {
-		role = "primary"
+	if isGroupReplication {
+		switch topologyString(base, "Role") {
+		case "multi_primary":
+			role = "multi_primary"
+		case "primary":
+			role = "primary"
+		}
 	}
 
-	primaryMemberKey := base["PrimaryMemberKey"]
-	primaryHost := base["PrimaryHost"]
-	primaryPort := base["PrimaryPort"]
-	if isMultiPrimary {
-		primaryMemberKey = nil
-		primaryHost = nil
-		primaryPort = nil
-	} else if role == "primary" && isHealthy && firstNonEmpty(stringValue(primaryMemberKey), memberKey) == memberKey {
-		if stringValue(primaryMemberKey) == "" {
-			primaryMemberKey = memberKey
-		}
-		if stringValue(primaryHost) == "" {
-			primaryHost = nullableString(memberHost)
-		}
-		if _, ok := optionalInt64(stringValue(primaryPort)); !ok {
-			primaryPort = nullableInt64(memberPort, memberPortOK)
-		}
+	var primaryMemberKey any
+	var primaryHost any
+	var primaryPort any
+	if isGroupReplication && role != "multi_primary" {
+		primaryMemberKey = base["PrimaryMemberKey"]
+		primaryHost = base["PrimaryHost"]
+		primaryPort = base["PrimaryPort"]
 	}
 	isWriterRole := role == "primary" || role == "multi_primary"
 
@@ -441,9 +444,6 @@ func buildInnoDBClusterSetRelation(clusterRelation models.MetricGroupValue, vers
 		relation["PrimaryHost"] = nil
 		relation["PrimaryPort"] = nil
 		relation["IsWriter"] = false
-		if topologyString(clusterRelation, "ReplicationState") == "healthy" {
-			relation["ReplicationState"] = firstNonEmpty(clusterSet.ReplicationState, "unknown")
-		}
 	}
 	if clusterSet.Role != "primary_cluster" {
 		relation["IsWriter"] = false
@@ -464,6 +464,11 @@ func buildInnoDBClusterSetRelation(clusterRelation models.MetricGroupValue, vers
 		"ChannelState":     clusterSet.ReplicationState,
 	}
 	return relation
+}
+
+func isMySQLErrorNumber(err error, number uint16) bool {
+	var mysqlErr *drivermysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == number
 }
 
 func currentInnoDBInstance(base models.MetricGroupValue, instances []InnoDBInstance, clusters map[string]InnoDBCluster) (InnoDBInstance, bool) {

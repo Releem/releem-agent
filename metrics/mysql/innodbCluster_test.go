@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Releem/mysqlconfigurer/models"
+	drivermysql "github.com/go-sql-driver/mysql"
 )
 
 type innodbMetadataFixture struct {
@@ -23,10 +24,21 @@ func TestDiscoverInnoDBMetadataSchemaAbsentIsCompleteEmpty(t *testing.T) {
 	queries := 0
 	metadata, err := DiscoverInnoDBMetadata(func(query string, args ...any) ([]map[string]string, error) {
 		queries++
-		if !strings.Contains(strings.ToLower(query), "information_schema.schemata") {
-			t.Fatalf("first metadata query = %q, want schema existence check", query)
+		switch queries {
+		case 1:
+			if !strings.Contains(strings.ToLower(query), "information_schema.schemata") {
+				t.Fatalf("DiscoverInnoDBMetadata() query 1 = %q, want schema visibility check", query)
+			}
+			return []map[string]string{}, nil
+		case 2:
+			if !strings.Contains(strings.ToLower(query), "show tables from") {
+				t.Fatalf("DiscoverInnoDBMetadata() query 2 = %q, want direct metadata schema probe", query)
+			}
+			return nil, &drivermysql.MySQLError{Number: 1049, Message: "Unknown database"}
+		default:
+			t.Fatalf("DiscoverInnoDBMetadata() unexpected query %d = %q", queries, query)
+			return nil, nil
 		}
-		return []map[string]string{}, nil
 	})
 
 	if err != nil {
@@ -38,8 +50,41 @@ func TestDiscoverInnoDBMetadataSchemaAbsentIsCompleteEmpty(t *testing.T) {
 	if len(metadata.Clusters) != 0 || len(metadata.Instances) != 0 || len(metadata.ClusterSets) != 0 {
 		t.Fatalf("DiscoverInnoDBMetadata() = %#v, want complete empty metadata", metadata)
 	}
-	if queries != 1 {
-		t.Fatalf("DiscoverInnoDBMetadata() queries = %d, want only schema existence check", queries)
+	if queries != 2 {
+		t.Fatalf("DiscoverInnoDBMetadata() queries = %d, want visibility check and direct probe", queries)
+	}
+}
+
+func TestDiscoverInnoDBMetadataPermissionHiddenSchemaIsIncomplete(t *testing.T) {
+	queries := 0
+	denied := &drivermysql.MySQLError{Number: 1044, Message: "Access denied for database"}
+	metadata, err := DiscoverInnoDBMetadata(func(query string, _ ...any) ([]map[string]string, error) {
+		queries++
+		switch queries {
+		case 1:
+			if !strings.Contains(strings.ToLower(query), "information_schema.schemata") {
+				t.Fatalf("DiscoverInnoDBMetadata() query 1 = %q, want schema visibility check", query)
+			}
+			return []map[string]string{}, nil
+		case 2:
+			if !strings.Contains(strings.ToLower(query), "show tables from") {
+				t.Fatalf("DiscoverInnoDBMetadata() query 2 = %q, want direct metadata schema probe", query)
+			}
+			return nil, denied
+		default:
+			t.Fatalf("DiscoverInnoDBMetadata() unexpected query %d = %q", queries, query)
+			return nil, nil
+		}
+	})
+
+	if !errors.Is(err, denied) {
+		t.Fatalf("DiscoverInnoDBMetadata() error = %v, want wrapped typed access denial", err)
+	}
+	if metadata.Complete {
+		t.Fatal("DiscoverInnoDBMetadata() Complete = true for permission-hidden metadata")
+	}
+	if queries != 2 {
+		t.Fatalf("DiscoverInnoDBMetadata() queries = %d, want visibility check and direct probe", queries)
 	}
 }
 
@@ -136,6 +181,8 @@ func TestDiscoverInnoDBMetadataSchemaV2MissingClusterSetShapeIsIncomplete(t *tes
 func TestBuildInnoDBClusterRelationsSchemaV1(t *testing.T) {
 	metadata := discoverInnoDBFixture(t, "schema_v1.json")
 	base := groupReplicationBase("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "primary", "healthy")
+	base["PrimaryHost"] = "legacy-1.example.com"
+	base["PrimaryPort"] = int64(3306)
 
 	relations := BuildInnoDBRelations(base, metadata)
 	if len(relations) != 1 {
@@ -185,9 +232,9 @@ func TestBuildInnoDBClusterRelationsSchemaV2SinglePrimary(t *testing.T) {
 	})
 }
 
-func TestBuildInnoDBClusterRelationsMultiPrimary(t *testing.T) {
+func TestBuildInnoDBClusterRelationsLiveMultiPrimaryOverridesMetadataSinglePrimary(t *testing.T) {
 	metadata := discoverInnoDBFixture(t, "schema_v2.json")
-	metadata.Clusters[0].PrimaryMode = "mm"
+	metadata.Clusters[0].PrimaryMode = "pm"
 	base := groupReplicationBase("cccccccc-cccc-cccc-cccc-cccccccccccc", "multi_primary", "healthy")
 	base["PrimaryMemberKey"] = "must-be-cleared"
 	base["PrimaryHost"] = "must-be-cleared.example.com"
@@ -212,7 +259,31 @@ func TestBuildInnoDBClusterRelationsMultiPrimary(t *testing.T) {
 	}
 }
 
-func TestBuildInnoDBClusterRelationsGatesWriterOnMetadataRole(t *testing.T) {
+func TestBuildInnoDBClusterRelationsLiveSinglePrimaryOverridesMetadataMultiPrimary(t *testing.T) {
+	metadata := discoverInnoDBFixture(t, "schema_v2.json")
+	metadata.Clusters[0].PrimaryMode = "mm"
+	memberID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	base := groupReplicationBase(memberID, "primary", "healthy")
+	base["PrimaryMemberKey"] = memberID
+	base["PrimaryHost"] = "live-primary.example.com"
+	base["PrimaryPort"] = int64(4406)
+
+	relation := relationByType(t, BuildInnoDBRelations(base, metadata), "innodb_cluster")
+	assertTopologyFields(t, relation, map[string]any{
+		"Role":             "primary",
+		"PrimaryMemberKey": memberID,
+		"PrimaryHost":      "live-primary.example.com",
+		"PrimaryPort":      int64(4406),
+		"IsWriter":         true,
+		"IsReader":         true,
+	})
+	facts := relation["Facts"].(models.MetricGroupValue)
+	if facts["PrimaryMode"] != "mm" {
+		t.Fatalf("BuildInnoDBRelations() Facts.PrimaryMode = %#v, want diagnostic metadata value", facts["PrimaryMode"])
+	}
+}
+
+func TestBuildInnoDBClusterRelationsGatesWriterOnLiveRole(t *testing.T) {
 	metadata := discoverInnoDBFixture(t, "schema_v2.json")
 	base := groupReplicationBase("cccccccc-cccc-cccc-cccc-cccccccccccc", "replica", "healthy")
 	base["IsWriter"] = true
@@ -277,7 +348,7 @@ func TestBuildClusterSetRelations(t *testing.T) {
 			wantParent:  "22222222-2222-2222-2222-222222222222",
 			wantWriter:  false,
 			wantPrimary: nil,
-			wantState:   "unknown",
+			wantState:   "healthy",
 		},
 	}
 
@@ -298,6 +369,7 @@ func TestBuildClusterSetRelations(t *testing.T) {
 				"MetadataVersion": "2.1.0",
 				"ClusterSetName":  "productionSet",
 				"ChannelName":     "clusterset_replication",
+				"ChannelState":    "unknown",
 			})
 		})
 	}
@@ -399,6 +471,50 @@ func TestBuildTopologyFromFactsPreservesInnoDBClusterSetAndAsyncRelations(t *tes
 	clusterSetFacts := clusterSet["Facts"].(models.MetricGroupValue)
 	if clusterSetFacts["ChannelState"] != "healthy" {
 		t.Fatalf("BuildTopologyFromFacts() ClusterSet ChannelState = %#v, want healthy", clusterSetFacts["ChannelState"])
+	}
+}
+
+func TestBuildTopologyFromFactsKeepsGRStateWhenClusterSetChannelStopped(t *testing.T) {
+	metadata := discoverInnoDBFixture(t, "schema_v2.json")
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":                           "dddddddd-dddd-dddd-dddd-dddddddddddd",
+			"group_replication_group_name":          "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb",
+			"group_replication_single_primary_mode": "ON",
+			"read_only":                             "ON",
+		},
+		GroupMembers: []map[string]interface{}{
+			{
+				"MEMBER_ID":    "dddddddd-dddd-dddd-dddd-dddddddddddd",
+				"MEMBER_HOST":  "replica-1.example.com",
+				"MEMBER_PORT":  "3306",
+				"MEMBER_STATE": "ONLINE",
+				"MEMBER_ROLE":  "PRIMARY",
+			},
+		},
+		ReplicaStatus: []map[string]interface{}{
+			{
+				"Channel_Name":        "clusterset_replication",
+				"Source_Host":         "primary-1.example.com",
+				"Source_UUID":         "cccccccc-cccc-cccc-cccc-cccccccccccc",
+				"Replica_IO_Running":  "No",
+				"Replica_SQL_Running": "Yes",
+			},
+		},
+		InnoDBMetadata: &metadata,
+	})
+
+	facts := topology["Facts"].(models.MetricGroupValue)
+	relations := facts["Relations"].([]models.MetricGroupValue)
+	clusterSet := relationByType(t, relations, "innodb_clusterset")
+	assertTopologyFields(t, clusterSet, map[string]any{
+		"ReplicationState": "healthy",
+		"IsReader":         true,
+		"IsWriter":         false,
+	})
+	clusterSetFacts := clusterSet["Facts"].(models.MetricGroupValue)
+	if clusterSetFacts["ChannelState"] != "stopped" {
+		t.Fatalf("BuildTopologyFromFacts() ClusterSet Facts.ChannelState = %#v, want stopped", clusterSetFacts["ChannelState"])
 	}
 }
 
