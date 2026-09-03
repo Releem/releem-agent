@@ -719,6 +719,13 @@ function create_mysql_user() {
                 printf "\033[33m\n Group Replication topology metrics are unavailable on this database version.\033[0m\n"
             fi
 
+            if mysql_root_exec "GRANT SELECT ON mysql_innodb_cluster_metadata.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
+            then
+                echo "Successfully GRANT" > /dev/null
+            else
+                printf "\033[33m\n InnoDB Cluster metadata topology metrics are unavailable. The mysql_innodb_cluster_metadata schema may not exist yet or the grant was rejected; initialize the schema or grant SELECT to enable these metrics.\033[0m\n"
+            fi
+
             if mysql_root_exec "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '${RELEEM_MYSQL_LOGIN}'@'${mysql_user_host}';" 2>/dev/null
             then
                 echo "Successfully GRANT" > /dev/null

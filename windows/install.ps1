@@ -570,6 +570,10 @@ if ($env:RELEEM_MYSQL_PASSWORD -and $env:RELEEM_MYSQL_LOGIN) {
         $null = Invoke-MySQLRoot -e "GRANT SELECT ON performance_schema.table_io_waits_summary_by_index_usage TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         $null = Invoke-MySQLRoot -e "GRANT SELECT ON performance_schema.file_summary_by_instance TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
         $null = Invoke-MySQLRoot -e "GRANT SELECT ON performance_schema.replication_group_members TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        $null = Invoke-MySQLRoot -e "GRANT SELECT ON mysql_innodb_cluster_metadata.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log 'WARNING: InnoDB Cluster metadata topology metrics are unavailable. The mysql_innodb_cluster_metadata schema may not exist yet or the grant was rejected; initialize the schema or grant SELECT to enable these metrics.'
+        }
 
         # SYSTEM_VARIABLES_ADMIN or SUPER (non-fatal)
         $null = Invoke-MySQLRoot -e "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '$ReleemMysqlLogin'$at'$MysqlUserHost';"

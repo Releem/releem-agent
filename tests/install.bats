@@ -1103,6 +1103,40 @@ exit 0
     [ "$status" -eq 0 ]
 }
 
+@test "topology metadata grants are non-fatal on Linux and Windows installers" {
+    load_install_functions
+    set -e
+    create_mock_cmd "mysqladmin" 'echo "mysqld is alive"'
+    create_mock_cmd "mysql" '
+printf "%s\n" "$*" >> "${MYSQL_ARGS_LOG}"
+if [[ "$*" == *"mysql_innodb_cluster_metadata"* ]]; then
+  exit 1
+fi
+exit 0
+'
+
+    export MYSQL_ARGS_LOG="${TEST_TMPDIR}/mysql.args"
+    mysqladmincmd="${MOCK_BIN}/mysqladmin"
+    mysqlcmd="${MOCK_BIN}/mysql"
+    root_connection_string="--host=127.0.0.1 --port=3306"
+    connection_string="--host=127.0.0.1 --port=3306"
+    mysql_user_host="127.0.0.1"
+    unset RELEEM_MYSQL_ROOT_PASSWORD RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD RELEEM_QUERY_OPTIMIZATION
+
+    run create_mysql_user
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"InnoDB Cluster metadata topology metrics are unavailable"* ]]
+    run grep -F "GRANT SELECT ON mysql_innodb_cluster_metadata.*" "${TEST_TMPDIR}/mysql.args"
+    [ "$status" -eq 0 ]
+
+    run sed -n '/# Non-fatal performance_schema grants/,/# SYSTEM_VARIABLES_ADMIN/p' "${REPO_ROOT}/windows/install.ps1"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GRANT SELECT ON mysql_innodb_cluster_metadata.*"* ]]
+    [[ "$output" == *'if ($LASTEXITCODE -ne 0)'* ]]
+    [[ "$output" == *"InnoDB Cluster metadata topology metrics are unavailable"* ]]
+}
+
 @test "create_mysql_user keeps empty root password option when root password env is set to empty string" {
     load_install_functions
     set -e
