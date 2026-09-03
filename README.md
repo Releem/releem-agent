@@ -60,6 +60,28 @@ The easiest way to get started with Releem is with [our managed service in the c
 
 To start using Releem just sign up at [https://releem.com](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#) and install Releem Agent on your server.
 
+### Aurora parameter groups
+
+Releem supports Amazon Aurora MySQL and Aurora PostgreSQL. Configure one Agent
+for each DB instance endpoint. Aurora onboarding requires both a custom DB
+parameter group for the instance and a custom DB cluster parameter group for
+the cluster. Their configured names must match the groups attached in AWS, and
+both groups must be ready before the Agent applies recommendations. This is
+required because a recommendation can target either parameter group. Only the
+Agent that targets the writer modifies cluster parameters, so it must have
+`rds:ModifyDBClusterParameterGroup` permission.
+
+For a non-Aurora RDS instance, only the DB parameter group is required; leave
+`DBClusterParameterGroup` empty. AWS-managed default groups cannot be modified
+and are not valid Aurora onboarding targets.
+
+`DatabaseType` defaults to `mysql`, preserving existing RDS and Aurora MySQL
+stacks. Select `postgresql` for Aurora PostgreSQL. The same `DBUser`,
+`DBPassword`/`DBPasswordArn`, and `DBSSLMode` inputs are then exposed to the
+container as PostgreSQL (`PG_*`) settings so the Agent starts its PostgreSQL
+collector; the default `mysql` selection continues exposing the existing
+MySQL (`DB_*`) settings.
+
 ## Security
 
 Releem does not collect any user data.
@@ -84,7 +106,7 @@ Join the Releem Community on [Slack](https://join.slack.com/t/releem-community/s
 - PostgreSQL 15, PostgreSQL 16, PostgreSQL 17, PostgreSQL 18
 - Centos, CloudLinux, Debian, Ubuntu, RockyLinux
 - Windows Server 2012, Windows Server 2016, Windows Server 2019, Windows Server 2022, Windows Server 2025
-- Amazon RDS MySQL, Amazon RDS Aurora, Amazon RDS MariaDB
+- Amazon RDS MySQL, Amazon RDS Aurora MySQL, Amazon RDS Aurora PostgreSQL, Amazon RDS MariaDB
 - Google Cloud SQL MySQL, Google Cloud SQL PostgreSQL
 
 *** MINIMAL REQUIREMENTS ***
@@ -116,4 +138,3 @@ You can help us by reporting problems, suggestions or contributing to the code.
 Go to our [issue tracker](https://github.com/releem/mysqlconfigurer/issues) and check if your problem is already reported. If not, create a new issue with a descriptive title and detail your suggestion or steps to reproduce the problem.
 
 If you have suggestions or want to discuss potential improvements, please visit our [Discussions](https://github.com/releem/mysqlconfigurer/discussions) page. We value your input and look forward to engaging with the community to enhance our product.
-

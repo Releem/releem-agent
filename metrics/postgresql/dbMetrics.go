@@ -38,6 +38,25 @@ type pgDatabaseConnection interface {
 	Close() error
 }
 
+// pgManagedInternalDatabaseByInstanceType maps managed providers to the
+// maintenance database that they keep for themselves. These names remain
+// valid customer database names on local PostgreSQL installations.
+var pgManagedInternalDatabaseByInstanceType = map[string]string{
+	"aws/rds":          "rdsadmin",
+	"gcp/cloudsql":     "cloudsqladmin",
+	"azure/postgresql": "azure_maintenance",
+}
+
+func isPGManagedInstanceType(instanceType string) bool {
+	_, managed := pgManagedInternalDatabaseByInstanceType[strings.ToLower(strings.TrimSpace(instanceType))]
+	return managed
+}
+
+func isPGManagedInternalDatabase(instanceType, database string) bool {
+	internalDatabase, managed := pgManagedInternalDatabaseByInstanceType[strings.ToLower(strings.TrimSpace(instanceType))]
+	return managed && internalDatabase == strings.ToLower(strings.TrimSpace(database))
+}
+
 func forEachPGDatabase(databases []string, connect func(string) pgDatabaseConnection, collect func(string, pgDatabaseConnection) error, logError func(string, error)) {
 	for _, database := range databases {
 		db := connect(database)
@@ -115,7 +134,11 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 	{
 		var database string
 		var output []string
-		rows, err := models.DB.Query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+		rows, err := models.DB.Query(`
+			SELECT datname
+			FROM pg_database
+			WHERE datistemplate = false
+			ORDER BY datname`)
 		if err != nil {
 			DBMetricsBase.logger.Error(err)
 			return err
@@ -127,6 +150,10 @@ func (DBMetricsBase *DBMetricsBaseGatherer) GetMetrics(metrics *models.Metrics) 
 			if err != nil {
 				DBMetricsBase.logger.Error(err)
 				return err
+			}
+			if isPGManagedInternalDatabase(DBMetricsBase.configuration.InstanceType, database) {
+				DBMetricsBase.logger.V(5).Info("Skipping provider-managed database ", database)
+				continue
 			}
 			output = append(output, database)
 		}

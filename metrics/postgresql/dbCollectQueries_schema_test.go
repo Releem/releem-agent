@@ -14,6 +14,7 @@ import (
 	"github.com/Releem/mysqlconfigurer/models"
 	u "github.com/Releem/mysqlconfigurer/utils"
 	logging "github.com/google/logger"
+	"github.com/lib/pq"
 )
 
 func TestGetMetricsClearsLightweightQueriesWhenFullCollectionFails(t *testing.T) {
@@ -64,6 +65,8 @@ func TestPostgresqlExplainableStatementsMatchPostgresqlCommands(t *testing.T) {
 		"TABLE orders":                                     false,
 		"DELETE FROM orders WHERE id = 1":                  false,
 		"INSERT INTO orders(id) VALUES (1)":                false,
+		"WITH ranked AS (SELECT 1) INSERT INTO orders(id) SELECT 1 FROM ranked": true,
+		"WITH ranked AS (INSERT INTO orders(id) VALUES (1) RETURNING id) SELECT * FROM ranked": true,
 		"UPDATE orders SET status = 'done'":                false,
 		"COPY orders TO STDOUT":                            false,
 		"EXPLAIN SELECT * FROM orders":                     false,
@@ -523,6 +526,110 @@ func recordedQueryContains(queries []string, fragment string) bool {
 func TestPostgresqlExplainRejectsMerge(t *testing.T) {
 	if isPgExplainableStatement("MERGE INTO target USING source ON false WHEN NOT MATCHED THEN INSERT DEFAULT VALUES") {
 		t.Fatalf("MERGE must not be eligible for EXPLAIN")
+	}
+}
+
+func TestExecuteExplainDoesNotMapInsertPermissionDeniedToNeedGrantPermission(t *testing.T) {
+	permissionDenied := &pq.Error{
+		Code:    "42501",
+		Message: "permission denied for table spam_fp_review_backlog",
+	}
+	query := `WITH ranked AS (
+  SELECT site_url, gf_entry_id, tier, flagged_at FROM spam_fp_review_queue
+  WHERE timing_present AND tier <> $1
+)
+INSERT INTO spam_fp_review_backlog (site_url, gf_entry_id, batch, release_at)
+SELECT site_url, gf_entry_id, 1, now() FROM ranked
+ON CONFLICT (site_url, gf_entry_id) DO NOTHING`
+
+	logger := *logging.Init("postgresql-explain-insert-permission-test", false, false, io.Discard)
+	defer logger.Close()
+	recorder := &pgExplainRecordingDriver{
+		explainHandler: func(string) (driver.Rows, error) {
+			return nil, permissionDenied
+		},
+	}
+	driverName := "releem_pg_explain_insert_permission_test"
+	sql.Register(driverName, recorder)
+	db, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = ExecuteExplain(db, "8934404694650911581", query, true, logger)
+	if err == nil {
+		t.Fatal("expected EXPLAIN permission error for INSERT CTE")
+	}
+	if err.Error() == "need_grant_permission" {
+		t.Fatal("INSERT permission denied must not be classified as need_grant_permission")
+	}
+	if !strings.Contains(err.Error(), "permission denied for table spam_fp_review_backlog") {
+		t.Fatalf("original INSERT permission error should be returned, got %v", err)
+	}
+}
+
+func TestExecuteExplainMapsSelectPermissionDeniedToNeedGrantPermission(t *testing.T) {
+	permissionDenied := &pq.Error{
+		Code:    "42501",
+		Message: "permission denied for table orders",
+	}
+	logger := *logging.Init("postgresql-explain-select-permission-test", false, false, io.Discard)
+	defer logger.Close()
+	recorder := &pgExplainRecordingDriver{
+		explainHandler: func(string) (driver.Rows, error) {
+			return nil, permissionDenied
+		},
+	}
+	driverName := "releem_pg_explain_select_permission_test"
+	sql.Register(driverName, recorder)
+	db, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = ExecuteExplain(db, "42", "SELECT * FROM orders WHERE id = $1", true, logger)
+	if err == nil || err.Error() != "need_grant_permission" {
+		t.Fatalf("SELECT permission denied should be need_grant_permission, got %v", err)
+	}
+}
+
+func TestPgContainsDataModifyingCommand(t *testing.T) {
+	for query, want := range map[string]bool{
+		"SELECT * FROM orders": false,
+		"WITH ranked AS (SELECT 1) SELECT * FROM ranked": false,
+		"WITH ranked AS (SELECT 1) INSERT INTO orders(id) SELECT 1 FROM ranked": true,
+		"WITH ranked AS (INSERT INTO orders(id) VALUES (1) RETURNING id) SELECT * FROM ranked": true,
+		"WITH upd AS (UPDATE orders SET status = 'done' RETURNING id) SELECT * FROM upd": true,
+		"UPDATE orders o SET status = 'done'": true,
+		"WITH update AS (SELECT 1) SELECT * FROM update": false,
+		"SELECT 'INSERT INTO orders(id) VALUES (1)'": false,
+		"DELETE FROM orders WHERE id = 1": true,
+		"WITH x AS (INSERT target VALUES (1) RETURNING *) SELECT * FROM x": true,
+		"INSERT target (id) VALUES (1)": true,
+		"INSERT target DEFAULT VALUES": true,
+		"INSERT target SELECT 1": true,
+		"INSERT INTO orders AS o VALUES (1)": true,
+		"INSERT INTO orders o VALUES (1)": true,
+		"INSERT INTO orders o (id) VALUES (1)": true,
+		"WITH ins AS (INSERT INTO orders o VALUES (1) RETURNING *) SELECT * FROM ins": true,
+		"INSERT INTO ONLY foo (id) VALUES (1)": true,
+		"INSERT INTO ONLY (foo) VALUES (1)": true,
+		"WITH ins AS (INSERT INTO ONLY foo VALUES (1) RETURNING *) SELECT * FROM ins": true,
+		"WITH insert AS (SELECT 1) SELECT * FROM insert": false,
+		"SELECT insert FROM orders": false,
+		"WITH ranked AS (SELECT 1) INSERT INTO dest WITH extra AS (SELECT * FROM ranked) SELECT * FROM extra": true,
+		"INSERT INTO dest TABLE src": true,
+		"WITH x AS (INSERT INTO dest TABLE src RETURNING *) SELECT * FROM x": true,
+		"UPDATE ONLY (orders) SET status = 'done'": true,
+		"UPDATE orders * SET status = 'done'": true,
+		"WITH upd AS (UPDATE ONLY (orders) SET status = 'done' RETURNING id) SELECT * FROM upd": true,
+		"WITH upd AS (UPDATE orders * SET status = 'done' RETURNING id) SELECT * FROM upd": true,
+	} {
+		if got := pgContainsDataModifyingCommand(query); got != want {
+			t.Fatalf("pgContainsDataModifyingCommand(%q) = %v, want %v", query, got, want)
+		}
 	}
 }
 

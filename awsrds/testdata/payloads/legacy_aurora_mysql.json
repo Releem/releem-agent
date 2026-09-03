@@ -1,0 +1,19 @@
+{
+  "System": {
+    "Info": {
+      "Host": {}
+    }
+  },
+  "DB": {
+    "Conf": {
+      "Variables": {
+        "aurora_version": "3.06"
+      }
+    }
+  },
+  "ReleemAgent": {
+    "Conf": {
+      "AwsRDSParameterGroup": "legacy-mysql-instance-pg"
+    }
+  }
+}

@@ -37,15 +37,16 @@ func (e *Executor) dryRunPTOSC(options ExecuteOptions) error {
 		return fmt.Errorf("config is required for pt-online-schema-change")
 	}
 
-	ptosc := options.Config.PTOSCPath
+	configuration := options.Config
+	ptosc := configuration.PTOSCPath
 	if ptosc == "" {
 		ptosc = "pt-online-schema-change"
 	}
 
-	host := options.Config.MysqlHost
-	port := options.Config.MysqlPort
-	user := options.Config.MysqlUser
-	password := options.Config.MysqlPassword
+	host := configuration.MysqlHost
+	port := configuration.MysqlPort
+	user := configuration.MysqlUser
+	password := configuration.MysqlPassword
 	if host == "" {
 		return fmt.Errorf("mysql_host is required for pt-online-schema-change")
 	}
@@ -87,15 +88,16 @@ func (e *Executor) runPTOSC(options ExecuteOptions) error {
 		return fmt.Errorf("config is required for pt-online-schema-change")
 	}
 
-	ptosc := options.Config.PTOSCPath
+	configuration := options.Config
+	ptosc := configuration.PTOSCPath
 	if ptosc == "" {
 		ptosc = "pt-online-schema-change"
 	}
 
-	host := options.Config.MysqlHost
-	port := options.Config.MysqlPort
-	user := options.Config.MysqlUser
-	password := options.Config.MysqlPassword
+	host := configuration.MysqlHost
+	port := configuration.MysqlPort
+	user := configuration.MysqlUser
+	password := configuration.MysqlPassword
 	if host == "" {
 		return fmt.Errorf("mysql_host is required for pt-online-schema-change")
 	}

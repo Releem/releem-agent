@@ -218,3 +218,12 @@
 - Configurable thresholds/TTL: `table_size_cache_table_threshold`, `table_size_cache_ram_multiplier`, `table_size_cache_ttl_seconds`
 - Stale snapshot fallback on refresh failure; AWS RDS physical RAM KiB→bytes for eligibility
 - Bumped agent, installer, configurer, and Windows script versions to 1.25.1
+
+## 1.25.2
+- Added Aurora MySQL and Aurora PostgreSQL topology discovery, including writer/reader roles and attached instance and cluster parameter groups
+- Added scope-aware application of Aurora recommendations to instance and cluster parameter groups, with readiness validation, writer-only cluster changes, result verification, and structured audit details
+- Added Aurora configuration support to the Linux installer, Docker template, and public and private CloudFormation templates; Aurora onboarding requires matching custom instance and cluster parameter groups
+- Added conversion of PostgreSQL recommendations to AWS parameter units and preserved pending-reboot apply behavior
+- Improved managed PostgreSQL collection by skipping only provider-owned maintenance databases and suppressing only expected managed-provider `pg_hba_file_rules` limitations, while preserving actionable errors for local installations
+- Expanded Go, installer, Docker, CloudFormation, and AWS payload contract coverage
+- Bumped agent, installer, configurer, and Windows script versions to 1.25.2

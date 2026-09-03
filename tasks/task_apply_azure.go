@@ -241,45 +241,27 @@ func mysqlConfigValueToString(value interface{}) string {
 		return ""
 	case string:
 		return strings.TrimSpace(v)
-	case float64:
-		if math.Trunc(v) == v {
-			return strconv.FormatInt(int64(v), 10)
-		}
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	case float32:
-		value64 := float64(v)
-		if math.Trunc(value64) == value64 {
-			return strconv.FormatInt(int64(value64), 10)
-		}
-		return strconv.FormatFloat(value64, 'f', -1, 32)
-	case int:
-		return strconv.Itoa(v)
-	case int8:
-		return strconv.FormatInt(int64(v), 10)
-	case int16:
-		return strconv.FormatInt(int64(v), 10)
-	case int32:
-		return strconv.FormatInt(int64(v), 10)
-	case int64:
-		return strconv.FormatInt(v, 10)
-	case uint:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint8:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint16:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint32:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint64:
-		return strconv.FormatUint(v, 10)
 	case bool:
 		if v {
 			return "ON"
 		}
 		return "OFF"
-	default:
-		return strings.TrimSpace(fmt.Sprintf("%v", v))
 	}
+
+	switch number := utils.AsNumber(value); number.Kind {
+	case utils.SignedNumber:
+		return strconv.FormatInt(number.Int, 10)
+	case utils.UnsignedNumber:
+		return strconv.FormatUint(number.Uint, 10)
+	case utils.FloatNumber:
+		// Integral floats keep their integer spelling so a recommendation of
+		// 100 is not submitted to Azure as "100.0".
+		if math.Trunc(number.Float) == number.Float {
+			return strconv.FormatInt(int64(number.Float), 10)
+		}
+		return strconv.FormatFloat(number.Float, 'f', -1, number.FloatBits)
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", value))
 }
 
 func azureMySQLConfigValuesEqual(current string, recommended string) bool {

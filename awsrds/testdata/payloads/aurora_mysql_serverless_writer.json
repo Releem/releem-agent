@@ -1,0 +1,30 @@
+{
+  "System": {
+    "Info": {
+      "Host": {
+        "Engine": "aurora-mysql",
+        "ServerlessDatabaseCapacity": 8,
+        "DBInstanceIdentifier": "orders-serverless-writer",
+        "DBInstanceResourceID": "db-resource-mysql-serverless-writer",
+        "DBInstanceClass": "db.serverless",
+        "DBParameterGroup": "orders-serverless-instance-pg",
+        "DBClusterIdentifier": "orders-serverless-cluster",
+        "DBClusterParameterGroup": "orders-serverless-cluster-pg",
+        "IsClusterWriter": true,
+        "EngineMode": "provisioned"
+      }
+    }
+  },
+  "DB": {
+    "Conf": {
+      "Variables": {}
+    }
+  },
+  "ReleemAgent": {
+    "Conf": {
+      "AwsRDSDB": "orders-serverless-writer",
+      "AwsRDSParameterGroup": "orders-serverless-instance-pg",
+      "AwsRDSClusterParameterGroup": "orders-serverless-cluster-pg"
+    }
+  }
+}

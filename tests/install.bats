@@ -1244,7 +1244,38 @@ promptedpwd"
     [[ "$output" == *"Couldn't find mysqladmin/mariadb-admin"* ]]
 }
 
-@test "aws/rds mode writes aws keys and releem_dir to releem.conf" {
+@test "Aurora aws/rds mode writes both required parameter groups to releem.conf" {
+    prepare_common_install_mocks
+    local workdir="${TEST_TMPDIR}/workdir"
+    local conf="${workdir}/releem.conf"
+    mkdir -p "${workdir}"
+    PATH="${MOCK_BIN}:${PATH}" run env \
+        RELEEM_TEST_MODE=1 \
+        RELEEM_WORKDIR="${workdir}" \
+        RELEEM_CONF_FILE="${conf}" \
+        RELEEM_API_KEY="k1" \
+        RELEEM_INSTANCE_TYPE="aws/rds" \
+        RELEEM_AWS_REGION="eu-west-1" \
+        RELEEM_AWS_RDS_DB="db-1" \
+        RELEEM_AWS_RDS_PARAMETER_GROUP="releem-agent" \
+        RELEEM_AWS_RDS_CLUSTER_PARAMETER_GROUP="aurora-cluster-custom" \
+        RELEEM_MYSQL_LOGIN="releem" \
+        RELEEM_MYSQL_PASSWORD="pwd" \
+        RELEEM_DB_MEMORY_LIMIT="0" \
+        RELEEM_CRON_ENABLE="1" \
+        RELEEM_AGENT_DISABLE="1" \
+        bash "${INSTALL_SH}"
+
+    [ "$status" -eq 0 ]
+    run grep -E "^(releem_dir|instance_type|aws_region|aws_rds_db|aws_rds_parameter_group|aws_rds_cluster_parameter_group)=" "${conf}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"releem_dir=\"${workdir}\""* ]]
+    [[ "$output" == *'instance_type="aws/rds"'* ]]
+    [[ "$output" == *'aws_region="eu-west-1"'* ]]
+    [[ "$output" == *'aws_rds_cluster_parameter_group="aurora-cluster-custom"'* ]]
+}
+
+@test "ordinary non-Aurora RDS mode does not write a cluster parameter group" {
     prepare_common_install_mocks
     local workdir="${TEST_TMPDIR}/workdir"
     local conf="${workdir}/releem.conf"
@@ -1266,11 +1297,8 @@ promptedpwd"
         bash "${INSTALL_SH}"
 
     [ "$status" -eq 0 ]
-    run grep -E "^(releem_dir|instance_type|aws_region|aws_rds_db|aws_rds_parameter_group)=" "${conf}"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"releem_dir=\"${workdir}\""* ]]
-    [[ "$output" == *'instance_type="aws/rds"'* ]]
-    [[ "$output" == *'aws_region="eu-west-1"'* ]]
+    run grep -F 'aws_rds_cluster_parameter_group=' "${conf}"
+    [ "$status" -eq 1 ]
 }
 
 @test "aws/rds mode fails when mandatory aws vars are missing" {

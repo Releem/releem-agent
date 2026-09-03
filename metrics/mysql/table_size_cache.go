@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Releem/mysqlconfigurer/models"
+	"github.com/Releem/mysqlconfigurer/utils"
 )
 
 type tableSizeSnapshot struct {
@@ -62,51 +63,28 @@ func effectiveTableSizeRAM(metrics *models.Metrics) uint64 {
 }
 
 func tableSizeUint64(value interface{}) uint64 {
-	switch value := value.(type) {
-	case uint:
-		return uint64(value)
-	case uint8:
-		return uint64(value)
-	case uint16:
-		return uint64(value)
-	case uint32:
-		return uint64(value)
-	case uint64:
-		return value
-	case int:
-		if value > 0 {
-			return uint64(value)
-		}
-	case int8:
-		if value > 0 {
-			return uint64(value)
-		}
-	case int16:
-		if value > 0 {
-			return uint64(value)
-		}
-	case int32:
-		if value > 0 {
-			return uint64(value)
-		}
-	case int64:
-		if value > 0 {
-			return uint64(value)
-		}
-	case float32:
-		return tableSizeFloat64(float64(value))
-	case float64:
-		return tableSizeFloat64(value)
-	case string:
-		value = strings.TrimSpace(value)
-		if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+	if text, isString := value.(string); isString {
+		text = strings.TrimSpace(text)
+		if parsed, err := strconv.ParseUint(text, 10, 64); err == nil {
 			return parsed
 		}
-		if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+		if parsed, err := strconv.ParseFloat(text, 64); err == nil {
 			return tableSizeFloat64(parsed)
 		}
+		return 0
 	}
 
+	switch number := utils.AsNumber(value); number.Kind {
+	case utils.UnsignedNumber:
+		return number.Uint
+	case utils.SignedNumber:
+		// A negative size is nonsense from information_schema; treat it as 0.
+		if number.Int > 0 {
+			return uint64(number.Int)
+		}
+	case utils.FloatNumber:
+		return tableSizeFloat64(number.Float)
+	}
 	return 0
 }
 

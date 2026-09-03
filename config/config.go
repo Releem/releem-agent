@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	ReleemAgentVersion                  = "1.25.1"
+	ReleemAgentVersion                  = "1.25.2"
 	DefaultTableSizeCacheTableThreshold = int64(10000)
 	DefaultTableSizeCacheRAMMultiplier  = int64(4)
 	DefaultTableSizeCacheTTLSeconds     = time.Duration(604800)
@@ -50,6 +50,7 @@ type Config struct {
 	AwsRegion                    string        `hcl:"aws_region"`
 	AwsRDSDB                     string        `hcl:"aws_rds_db"`
 	AwsRDSParameterGroup         string        `hcl:"aws_rds_parameter_group"`
+	AwsRDSClusterParameterGroup  string        `hcl:"aws_rds_cluster_parameter_group"`
 	GcpProjectId                 string        `hcl:"gcp_project_id"`
 	GcpRegion                    string        `hcl:"gcp_region"`
 	GcpCloudSqlInstance          string        `hcl:"gcp_cloudsql_instance"`
