@@ -123,6 +123,91 @@ func TestAuroraPayloadContract(t *testing.T) {
 	}
 }
 
+func TestMetadataLogFieldsOmitSensitiveTopologyData(t *testing.T) {
+	t.Parallel()
+
+	metadata := awsrds.Metadata{
+		DBInstanceIdentifier:    "orders-writer",
+		DBInstanceARN:           "arn:aws:rds:us-east-1:123456789012:db:orders-writer",
+		DBInstanceResourceID:    "db-private-resource",
+		Endpoint:                "orders-writer.private.internal",
+		DBClusterIdentifier:     "orders-cluster",
+		DBClusterARN:            "arn:aws:rds:us-east-1:123456789012:cluster:orders-cluster",
+		DBClusterResourceID:     "cluster-private-resource",
+		ClusterEndpoint:         "orders-cluster.private.internal",
+		ClusterReaderEndpoint:   "orders-cluster-ro.private.internal",
+		GlobalClusterIdentifier: "orders-global",
+		GlobalClusterARN:        "arn:aws:rds::123456789012:global-cluster:orders-global",
+		GlobalClusterResourceID: "global-private-resource",
+		ClusterMembers: []awsrds.ClusterMember{{
+			DBInstanceIdentifier: "orders-reader",
+			DBInstanceARN:        "arn:aws:rds:us-east-1:123456789012:db:orders-reader",
+			DBInstanceResourceID: "db-reader-private-resource",
+			Endpoint:             "orders-reader.private.internal",
+		}},
+		GlobalClusterMembers: []awsrds.GlobalClusterMember{{
+			DBClusterARN: "arn:aws:rds:us-west-2:123456789012:cluster:orders-secondary",
+		}},
+		HasReadReplicaSource: true,
+		ReadReplicaSource: awsrds.RelatedDBInstance{
+			DBInstanceARN:        "arn:aws:rds:us-east-1:123456789012:db:orders-source",
+			DBInstanceResourceID: "db-source-private-resource",
+			Endpoint:             "orders-source.private.internal",
+		},
+		ReadReplicas: []awsrds.RelatedDBInstance{{
+			DBInstanceARN:        "arn:aws:rds:us-east-1:123456789012:db:orders-child",
+			DBInstanceResourceID: "db-child-private-resource",
+			Endpoint:             "orders-child.private.internal",
+		}},
+	}
+
+	fields := metadata.LogFields()
+	assertExactKeys(t, "Metadata.LogFields", fields, []string{
+		"cluster_member_count",
+		"db_cluster_identifier",
+		"db_cluster_parameter_group",
+		"db_cluster_parameter_group_status",
+		"db_instance_class",
+		"db_instance_identifier",
+		"db_parameter_group",
+		"db_parameter_group_status",
+		"engine",
+		"engine_mode",
+		"global_cluster_identifier",
+		"global_cluster_member_count",
+		"has_read_replica_source",
+		"instance_status",
+		"is_cluster_writer",
+		"is_serverless_v2",
+		"multi_az",
+		"partition",
+		"read_replica_count",
+		"region",
+		"serverless_v2_max_capacity",
+		"serverless_v2_min_capacity",
+	})
+
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("json.Marshal(Metadata.LogFields()) unexpected error: %v", err)
+	}
+	normalized := strings.ToLower(string(encoded))
+	for _, forbidden := range []string{
+		"123456789012",
+		"arn:aws",
+		"private.internal",
+		"private-resource",
+		"endpoint",
+		"credential",
+		"password",
+		"raw_payload",
+	} {
+		if strings.Contains(normalized, forbidden) {
+			t.Errorf("Metadata.LogFields() JSON contains forbidden fragment %q: %s", forbidden, encoded)
+		}
+	}
+}
+
 func newContractCase(identifier, resourceID, instanceClass, engine, instanceGroup, clusterID, clusterGroup string, writer bool, capacity float64) contractCase {
 	return contractCase{
 		metadata: awsrds.Metadata{

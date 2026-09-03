@@ -1,0 +1,15 @@
+{
+  "TargetIdentifier": "orders-multi-az",
+  "DBInstances": [
+    {
+      "DBInstanceIdentifier": "orders-multi-az",
+      "DBInstanceArn": "arn:aws:rds:us-east-1:123456789012:db:orders-multi-az",
+      "DbiResourceId": "db-multi-az-resource",
+      "DBInstanceClass": "db.m7g.large",
+      "DBInstanceStatus": "available",
+      "Engine": "mysql",
+      "Endpoint": {"Address": "orders-multi-az.internal", "Port": 3306},
+      "MultiAZ": true
+    }
+  ]
+}

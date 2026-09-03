@@ -184,6 +184,10 @@ func (f *awsApplyClientFake) DescribeDBClusters(_ context.Context, _ *rds.Descri
 	return f.clusterOutput, nil
 }
 
+func (f *awsApplyClientFake) DescribeGlobalClusters(context.Context, *rds.DescribeGlobalClustersInput, ...func(*rds.Options)) (*rds.DescribeGlobalClustersOutput, error) {
+	return nil, errors.New("awsApplyClientFake: DescribeGlobalClusters not implemented")
+}
+
 func (f *awsApplyClientFake) DescribeDBParameters(_ context.Context, input *rds.DescribeDBParametersInput, _ ...func(*rds.Options)) (*rds.DescribeDBParametersOutput, error) {
 	group := aws.ToString(input.DBParameterGroupName)
 	f.instanceDescribeGroups = append(f.instanceDescribeGroups, group)
@@ -1857,7 +1861,7 @@ func auroraApplyClient(writer bool, instanceGroup, clusterGroup string) *awsAppl
 func mysqlApplyClient(instanceGroup string) *awsApplyClientFake {
 	return &awsApplyClientFake{
 		instanceOutput: &rds.DescribeDBInstancesOutput{DBInstances: []types.DBInstance{{
-			DBInstanceIdentifier: aws.String("mysql-1"),
+			DBInstanceIdentifier: aws.String("orders-1"),
 			DBInstanceStatus:     aws.String("available"),
 			Engine:               aws.String("mysql"),
 			DBParameterGroups: []types.DBParameterGroupStatus{{

@@ -56,6 +56,10 @@ func (f *parameterClientFake) DescribeDBClusters(context.Context, *rds.DescribeD
 	return nil, errors.New("parameterClientFake: DescribeDBClusters not implemented")
 }
 
+func (f *parameterClientFake) DescribeGlobalClusters(context.Context, *rds.DescribeGlobalClustersInput, ...func(*rds.Options)) (*rds.DescribeGlobalClustersOutput, error) {
+	return nil, errors.New("parameterClientFake: DescribeGlobalClusters not implemented")
+}
+
 func (f *parameterClientFake) ModifyDBParameterGroup(context.Context, *rds.ModifyDBParameterGroupInput, ...func(*rds.Options)) (*rds.ModifyDBParameterGroupOutput, error) {
 	return nil, errors.New("parameterClientFake: ModifyDBParameterGroup not implemented")
 }

@@ -1,0 +1,76 @@
+{
+  "TargetIdentifier": "global-secondary-writer",
+  "DBInstances": [
+    {
+      "DBInstanceIdentifier": "global-secondary-writer",
+      "DBInstanceArn": "arn:aws:rds:us-west-2:123456789012:db:global-secondary-writer",
+      "DbiResourceId": "db-global-secondary-writer",
+      "DBInstanceClass": "db.r7g.large",
+      "DBClusterIdentifier": "global-secondary",
+      "DBInstanceStatus": "available",
+      "Engine": "aurora-mysql",
+      "Endpoint": {"Address": "global-secondary-writer.internal", "Port": 3306}
+    },
+    {
+      "DBInstanceIdentifier": "global-secondary-reader",
+      "DBInstanceArn": "arn:aws:rds:us-west-2:123456789012:db:global-secondary-reader",
+      "DbiResourceId": "db-global-secondary-reader",
+      "DBInstanceClass": "db.r7g.large",
+      "DBClusterIdentifier": "global-secondary",
+      "DBInstanceStatus": "available",
+      "Engine": "aurora-mysql",
+      "Endpoint": {"Address": "global-secondary-reader.internal", "Port": 3306}
+    }
+  ],
+  "DBClusters": [
+    {
+      "DBClusterIdentifier": "global-secondary",
+      "DBClusterArn": "arn:aws:rds:us-west-2:123456789012:cluster:global-secondary",
+      "DbClusterResourceId": "cluster-global-secondary-resource",
+      "DBClusterParameterGroup": "global-secondary-pg",
+      "Endpoint": "global-secondary.cluster.internal",
+      "ReaderEndpoint": "global-secondary-ro.cluster.internal",
+      "Engine": "aurora-mysql",
+      "EngineMode": "provisioned",
+      "GlobalClusterIdentifier": "orders-global",
+      "DBClusterMembers": [
+        {
+          "DBInstanceIdentifier": "global-secondary-writer",
+          "DBClusterParameterGroupStatus": "in-sync",
+          "IsClusterWriter": true,
+          "PromotionTier": 0
+        },
+        {
+          "DBInstanceIdentifier": "global-secondary-reader",
+          "DBClusterParameterGroupStatus": "in-sync",
+          "IsClusterWriter": false,
+          "PromotionTier": 1
+        }
+      ]
+    }
+  ],
+  "GlobalClusters": [
+    {
+      "GlobalClusterIdentifier": "orders-global",
+      "GlobalClusterArn": "arn:aws:rds::123456789012:global-cluster:orders-global",
+      "GlobalClusterResourceId": "cluster-global-resource",
+      "Engine": "aurora-mysql",
+      "Status": "available",
+      "GlobalClusterMembers": [
+        {
+          "DBClusterArn": "arn:aws:rds:us-east-1:123456789012:cluster:global-primary",
+          "IsWriter": true,
+          "Readers": ["arn:aws:rds:us-west-2:123456789012:cluster:global-secondary"],
+          "SynchronizationStatus": "connected",
+          "GlobalWriteForwardingStatus": "enabled"
+        },
+        {
+          "DBClusterArn": "arn:aws:rds:us-west-2:123456789012:cluster:global-secondary",
+          "IsWriter": false,
+          "SynchronizationStatus": "connected",
+          "GlobalWriteForwardingStatus": "disabled"
+        }
+      ]
+    }
+  ]
+}
