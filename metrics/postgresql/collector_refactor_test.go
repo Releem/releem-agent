@@ -198,7 +198,11 @@ func TestPostgresQueryPayloadModes(t *testing.T) {
 }
 
 func TestSerializedMetricsModelHasNoPostgresFormatEnvelopeFields(t *testing.T) {
-	databaseMetricsType := reflect.TypeOf(models.Metrics{}).Field(1).Type
+	databaseMetricsField, found := reflect.TypeOf(models.Metrics{}).FieldByName("DB")
+	if !found {
+		t.Fatal("serialized metrics model must contain DB")
+	}
+	databaseMetricsType := databaseMetricsField.Type
 	for _, field := range []string{"QueriesFormat", "DatabaseSchemaFormat"} {
 		if _, found := databaseMetricsType.FieldByName(field); found {
 			t.Fatalf("serialized metrics model must not contain %s", field)
