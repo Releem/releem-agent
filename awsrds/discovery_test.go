@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -86,7 +87,7 @@ func (f *fakeClient) ModifyDBClusterParameterGroup(context.Context, *rds.ModifyD
 	return nil, errors.New("unexpected ModifyDBClusterParameterGroup call")
 }
 
-func TestDiscoverInstance(t *testing.T) {
+func TestDiscoverInstanceForApply(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -347,17 +348,17 @@ func TestDiscoverInstance(t *testing.T) {
 				clustersErr:     tt.clustersErr,
 			}
 
-			got, err := DiscoverInstance(context.Background(), client, tt.identifier)
+			got, err := DiscoverInstanceForApply(context.Background(), client, tt.identifier)
 			if tt.wantErrContains != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErrContains) {
-					t.Fatalf("DiscoverInstance() error = %v, want containing %q", err, tt.wantErrContains)
+					t.Fatalf("DiscoverInstanceForApply() error = %v, want containing %q", err, tt.wantErrContains)
 				}
 			} else {
 				if err != nil {
-					t.Fatalf("DiscoverInstance() unexpected error: %v", err)
+					t.Fatalf("DiscoverInstanceForApply() unexpected error: %v", err)
 				}
 				if !reflect.DeepEqual(got, tt.want) {
-					t.Fatalf("DiscoverInstance() = %#v, want %#v", got, tt.want)
+					t.Fatalf("DiscoverInstanceForApply() = %#v, want %#v", got, tt.want)
 				}
 			}
 
@@ -373,6 +374,211 @@ func TestDiscoverInstance(t *testing.T) {
 			}
 			if !equalStrings(client.describeGlobalIDs, tt.wantGlobalCalls) {
 				t.Fatalf("DescribeGlobalClusters calls = %v, want %v", client.describeGlobalIDs, tt.wantGlobalCalls)
+			}
+		})
+	}
+}
+
+func TestDiscoverInstanceAcceptsCaseVariantIdentifier(t *testing.T) {
+	t.Parallel()
+
+	fixture := loadDiscoveryFixture(t, "rds_multi_az.json")
+	client := &fakeClient{instancesOutput: &rds.DescribeDBInstancesOutput{
+		DBInstances: []types.DBInstance{fixture.DBInstances[0]},
+	}}
+	identifier := strings.ToUpper(fixture.TargetIdentifier)
+
+	got, err := DiscoverInstance(context.Background(), client, identifier)
+	if err != nil {
+		t.Fatalf("DiscoverInstance(%q) unexpected error: %v", identifier, err)
+	}
+	if got.DBInstanceIdentifier != fixture.TargetIdentifier {
+		t.Errorf("DiscoverInstance(%q) DBInstanceIdentifier = %q, want %q", identifier, got.DBInstanceIdentifier, fixture.TargetIdentifier)
+	}
+	if !equalStrings(client.describeInstanceIDs, []string{identifier}) {
+		t.Errorf("DiscoverInstance(%q) DescribeDBInstances calls = %v, want original case variant", identifier, client.describeInstanceIDs)
+	}
+}
+
+func TestDiscoverInstanceAcceptsDBInstanceARN(t *testing.T) {
+	t.Parallel()
+
+	fixture := loadDiscoveryFixture(t, "rds_multi_az.json")
+	client := &fakeClient{instancesOutput: &rds.DescribeDBInstancesOutput{
+		DBInstances: []types.DBInstance{fixture.DBInstances[0]},
+	}}
+	identifier := aws.ToString(fixture.DBInstances[0].DBInstanceArn)
+
+	got, err := DiscoverInstance(context.Background(), client, identifier)
+	if err != nil {
+		t.Fatalf("DiscoverInstance(%q) unexpected error: %v", identifier, err)
+	}
+	if got.DBInstanceIdentifier != fixture.TargetIdentifier {
+		t.Errorf("DiscoverInstance(%q) DBInstanceIdentifier = %q, want %q", identifier, got.DBInstanceIdentifier, fixture.TargetIdentifier)
+	}
+	if !equalStrings(client.describeInstanceIDs, []string{identifier}) {
+		t.Errorf("DiscoverInstance(%q) DescribeDBInstances calls = %v, want original ARN", identifier, client.describeInstanceIDs)
+	}
+}
+
+func TestDiscoverInstanceAuroraRequiresExactlyOneLocalWriter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		writerCount int
+	}{
+		{name: "no writer", writerCount: 0},
+		{name: "two writers", writerCount: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := loadDiscoveryFixture(t, "aurora_global_primary.json")
+			for i := range fixture.DBClusters[0].DBClusterMembers {
+				fixture.DBClusters[0].DBClusterMembers[i].IsClusterWriter = aws.Bool(i < tt.writerCount)
+			}
+			client := fakeClientFromFixture(fixture)
+
+			_, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
+			want := fmt.Sprintf("has %d local writers", tt.writerCount)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("DiscoverInstance(%q) error = %v, want containing %q", fixture.TargetIdentifier, err, want)
+			}
+		})
+	}
+}
+
+func TestDiscoverInstanceRequiresStableTopologyIdentities(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		fixtureName     string
+		mutate          func(*discoveryFixture)
+		wantErrContains string
+	}{
+		{
+			name:        "target ARN",
+			fixtureName: "rds_multi_az.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBInstances[0].DBInstanceArn = nil
+			},
+			wantErrContains: "has no ARN",
+		},
+		{
+			name:        "target resource ID",
+			fixtureName: "rds_multi_az.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBInstances[0].DbiResourceId = nil
+			},
+			wantErrContains: "has no resource ID",
+		},
+		{
+			name:        "target region",
+			fixtureName: "rds_multi_az.json",
+			mutate: func(fixture *discoveryFixture) {
+				value := strings.Replace(aws.ToString(fixture.DBInstances[0].DBInstanceArn), ":us-east-1:", "::", 1)
+				fixture.DBInstances[0].DBInstanceArn = aws.String(value)
+			},
+			wantErrContains: "ARN has no region",
+		},
+		{
+			name:        "Aurora member ARN",
+			fixtureName: "aurora_global_primary.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBInstances[1].DBInstanceArn = nil
+			},
+			wantErrContains: "has no ARN",
+		},
+		{
+			name:        "Aurora member resource ID",
+			fixtureName: "aurora_global_primary.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBInstances[1].DbiResourceId = nil
+			},
+			wantErrContains: "has no resource ID",
+		},
+		{
+			name:        "Aurora member region",
+			fixtureName: "aurora_global_primary.json",
+			mutate: func(fixture *discoveryFixture) {
+				value := strings.Replace(aws.ToString(fixture.DBInstances[1].DBInstanceArn), ":us-east-1:", "::", 1)
+				fixture.DBInstances[1].DBInstanceArn = aws.String(value)
+			},
+			wantErrContains: "ARN has no region",
+		},
+		{
+			name:        "Aurora cluster ARN",
+			fixtureName: "aurora_global_primary.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBClusters[0].DBClusterArn = nil
+			},
+			wantErrContains: "has no ARN",
+		},
+		{
+			name:        "Aurora cluster resource ID",
+			fixtureName: "aurora_global_primary.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBClusters[0].DbClusterResourceId = nil
+			},
+			wantErrContains: "has no resource ID",
+		},
+		{
+			name:        "global cluster ARN",
+			fixtureName: "aurora_global_primary.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.GlobalClusters[0].GlobalClusterArn = nil
+			},
+			wantErrContains: "has no ARN",
+		},
+		{
+			name:        "global cluster resource ID",
+			fixtureName: "aurora_global_primary.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.GlobalClusters[0].GlobalClusterResourceId = nil
+			},
+			wantErrContains: "has no resource ID",
+		},
+		{
+			name:        "read-replica source ARN",
+			fixtureName: "rds_read_replica.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBInstances[1].DBInstanceArn = nil
+			},
+			wantErrContains: "has no ARN",
+		},
+		{
+			name:        "read-replica source resource ID",
+			fixtureName: "rds_read_replica.json",
+			mutate: func(fixture *discoveryFixture) {
+				fixture.DBInstances[1].DbiResourceId = nil
+			},
+			wantErrContains: "has no resource ID",
+		},
+		{
+			name:        "read-replica source region",
+			fixtureName: "rds_read_replica.json",
+			mutate: func(fixture *discoveryFixture) {
+				value := strings.Replace(aws.ToString(fixture.DBInstances[1].DBInstanceArn), ":us-east-1:", "::", 1)
+				fixture.DBInstances[1].DBInstanceArn = aws.String(value)
+			},
+			wantErrContains: "ARN has no region",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := loadDiscoveryFixture(t, tt.fixtureName)
+			tt.mutate(&fixture)
+			client := fakeClientFromFixture(fixture)
+
+			_, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrContains) {
+				t.Fatalf("DiscoverInstance(%q) error = %v, want containing %q", fixture.TargetIdentifier, err, tt.wantErrContains)
 			}
 		})
 	}
@@ -494,6 +700,7 @@ func TestDiscoverInstanceAuroraServerlessV2(t *testing.T) {
 			{identifier: instanceID}: {DBInstances: []types.DBInstance{{
 				DBInstanceIdentifier: aws.String(instanceID),
 				DBInstanceArn:        aws.String("arn:aws:rds:us-east-1:123456789012:db:orders-serverless-writer"),
+				DbiResourceId:        aws.String("db-orders-serverless-writer"),
 				DBInstanceClass:      aws.String("db.serverless"),
 				DBClusterIdentifier:  aws.String(clusterID),
 				DBInstanceStatus:     aws.String("available"),
@@ -505,6 +712,7 @@ func TestDiscoverInstanceAuroraServerlessV2(t *testing.T) {
 			{identifier: clusterID}: {DBClusters: []types.DBCluster{{
 				DBClusterIdentifier: aws.String(clusterID),
 				DBClusterArn:        aws.String("arn:aws:rds:us-east-1:123456789012:cluster:orders-serverless"),
+				DbClusterResourceId: aws.String("cluster-orders-serverless"),
 				EngineMode:          aws.String("provisioned"),
 				ServerlessV2ScalingConfiguration: &types.ServerlessV2ScalingConfigurationInfo{
 					MinCapacity:           aws.Float64(0),

@@ -118,6 +118,72 @@ func TestApplyConfAwsRdsIgnoresRecommendationRepeaterErrorWithValidJSON(t *testi
 	}
 }
 
+func TestApplyConfAwsRdsAncillaryTopologyFailuresDoNotChangeOutcome(t *testing.T) {
+	tests := []struct {
+		name          string
+		client        *awsApplyClientFake
+		configuration *config.Config
+		mutate        func(*awsApplyClientFake)
+	}{
+		{
+			name:          "unavailable unrelated Aurora member",
+			client:        auroraApplyClient(true, "instance-custom", "cluster-custom"),
+			configuration: awsApplyConfig("instance-custom", "cluster-custom"),
+			mutate: func(client *awsApplyClientFake) {
+				client.clusterOutput.DBClusters[0].DBClusterMembers = append(
+					client.clusterOutput.DBClusters[0].DBClusterMembers,
+					types.DBClusterMember{
+						DBInstanceIdentifier: aws.String("unavailable-reader"),
+						IsClusterWriter:      aws.Bool(false),
+					},
+				)
+			},
+		},
+		{
+			name:          "unavailable Aurora global metadata",
+			client:        auroraApplyClient(true, "instance-custom", "cluster-custom"),
+			configuration: awsApplyConfig("instance-custom", "cluster-custom"),
+			mutate: func(client *awsApplyClientFake) {
+				client.clusterOutput.DBClusters[0].GlobalClusterIdentifier = aws.String("unavailable-global")
+			},
+		},
+		{
+			name:          "unavailable ordinary RDS source and child",
+			client:        mysqlApplyClient("instance-custom"),
+			configuration: awsApplyConfig("instance-custom", ""),
+			mutate: func(client *awsApplyClientFake) {
+				client.instanceOutput.DBInstances[0].ReadReplicaSourceDBInstanceIdentifier = aws.String("unavailable-source")
+				client.instanceOutput.DBInstances[0].ReadReplicaDBInstanceIdentifiers = []string{"unavailable-child"}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.mutate(tt.client)
+			installAWSApplyTestDependencies(t, tt.client, nil)
+
+			exitCode, status, output := ApplyConfAwsRds(
+				&awsApplyRepeater{recommendations: `{}`},
+				[]models.MetricsGatherer{&awsApplyGatherer{current: map[string]interface{}{}}},
+				testAWSApplyLogger(),
+				tt.configuration,
+				AWSApplyAll,
+			)
+
+			if exitCode != awsApplyExitSuccess || status != awsApplyTaskStatusSuccess {
+				t.Fatalf("ApplyConfAwsRds(%s) = exit %d status %d, want %d/%d; output %s", tt.name, exitCode, status, awsApplyExitSuccess, awsApplyTaskStatusSuccess, output)
+			}
+			if tt.client.describeInstanceCalls != 1 {
+				t.Errorf("ApplyConfAwsRds(%s) DescribeDBInstances calls = %d, want target only", tt.name, tt.client.describeInstanceCalls)
+			}
+			if tt.client.describeGlobalCalls != 0 {
+				t.Errorf("ApplyConfAwsRds(%s) DescribeGlobalClusters calls = %d, want 0", tt.name, tt.client.describeGlobalCalls)
+			}
+		})
+	}
+}
+
 func TestApplyConfAwsRdsSerializationFailureCannotReturnSuccess(t *testing.T) {
 	client := mysqlApplyClient("instance-custom")
 	client.instancePages = map[string]*rds.DescribeDBParametersOutput{"": {}}
@@ -163,6 +229,7 @@ type awsApplyClientFake struct {
 
 	describeInstanceCalls  int
 	describeClusterCalls   int
+	describeGlobalCalls    int
 	instanceDescribeGroups []string
 	clusterDescribeGroups  []string
 	instanceModifyCalls    []awsModifyCall
@@ -185,6 +252,7 @@ func (f *awsApplyClientFake) DescribeDBClusters(_ context.Context, _ *rds.Descri
 }
 
 func (f *awsApplyClientFake) DescribeGlobalClusters(context.Context, *rds.DescribeGlobalClustersInput, ...func(*rds.Options)) (*rds.DescribeGlobalClustersOutput, error) {
+	f.describeGlobalCalls++
 	return nil, errors.New("awsApplyClientFake: DescribeGlobalClusters not implemented")
 }
 

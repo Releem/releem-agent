@@ -165,7 +165,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
 	}
 
-	metadata, err := awsrds.DiscoverInstance(ctx, client, configuration.AwsRDSDB)
+	metadata, err := awsrds.DiscoverInstanceForApply(ctx, client, configuration.AwsRDSDB)
 	if err != nil {
 		recordAWSApplyFailure(&result, awsrds.ScopeInstance, nil, err)
 		return finish(awsApplyExitCode(err), awsApplyTaskStatusFailure)
