@@ -688,6 +688,107 @@ func TestDiscoverInstanceAuroraProvisionedMembers(t *testing.T) {
 	}
 }
 
+func TestDescribeDBInstancePagesFollowsPagination(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeClient{instancePages: map[describePageKey]*rds.DescribeDBInstancesOutput{
+		{identifier: "orders"}: {
+			Marker: aws.String("instance-next"),
+		},
+		{identifier: "orders", marker: "instance-next"}: {
+			DBInstances: []types.DBInstance{{DBInstanceIdentifier: aws.String("orders")}},
+		},
+	}}
+
+	instances, err := describeDBInstancePages(context.Background(), client, "orders")
+	if err != nil {
+		t.Fatalf("describeDBInstancePages() error = %v", err)
+	}
+	if len(instances) != 1 || aws.ToString(instances[0].DBInstanceIdentifier) != "orders" {
+		t.Fatalf("describeDBInstancePages() = %#v, want paginated orders instance", instances)
+	}
+	if !equalStrings(client.describeInstanceIDs, []string{"orders", "orders"}) {
+		t.Fatalf("DescribeDBInstances calls = %v, want both pages", client.describeInstanceIDs)
+	}
+}
+
+func TestDescribeGlobalClusterPagesFollowsPagination(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeClient{globalPages: map[describePageKey]*rds.DescribeGlobalClustersOutput{
+		{identifier: "orders-global"}: {
+			Marker: aws.String("global-next"),
+		},
+		{identifier: "orders-global", marker: "global-next"}: {
+			GlobalClusters: []types.GlobalCluster{{GlobalClusterIdentifier: aws.String("orders-global")}},
+		},
+	}}
+
+	clusters, err := describeGlobalClusterPages(context.Background(), client, "orders-global")
+	if err != nil {
+		t.Fatalf("describeGlobalClusterPages() error = %v", err)
+	}
+	if len(clusters) != 1 || aws.ToString(clusters[0].GlobalClusterIdentifier) != "orders-global" {
+		t.Fatalf("describeGlobalClusterPages() = %#v, want paginated orders-global cluster", clusters)
+	}
+	if !equalStrings(client.describeGlobalIDs, []string{"orders-global", "orders-global"}) {
+		t.Fatalf("DescribeGlobalClusters calls = %v, want both pages", client.describeGlobalIDs)
+	}
+}
+
+func TestDescribeTopologyPagesRejectRepeatedMarkers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		run  func(*fakeClient) error
+	}{
+		{
+			name: "DB instance",
+			run: func(client *fakeClient) error {
+				client.instancePages = map[describePageKey]*rds.DescribeDBInstancesOutput{
+					{identifier: "orders"}:                   {Marker: aws.String("repeat")},
+					{identifier: "orders", marker: "repeat"}: {Marker: aws.String("repeat")},
+				}
+				_, err := describeDBInstancePages(context.Background(), client, "orders")
+				return err
+			},
+		},
+		{
+			name: "DB cluster",
+			run: func(client *fakeClient) error {
+				client.clusterPages = map[describePageKey]*rds.DescribeDBClustersOutput{
+					{identifier: "orders"}:                   {Marker: aws.String("repeat")},
+					{identifier: "orders", marker: "repeat"}: {Marker: aws.String("repeat")},
+				}
+				_, err := describeDBClusterPages(context.Background(), client, "orders")
+				return err
+			},
+		},
+		{
+			name: "global cluster",
+			run: func(client *fakeClient) error {
+				client.globalPages = map[describePageKey]*rds.DescribeGlobalClustersOutput{
+					{identifier: "orders-global"}:                   {Marker: aws.String("repeat")},
+					{identifier: "orders-global", marker: "repeat"}: {Marker: aws.String("repeat")},
+				}
+				_, err := describeGlobalClusterPages(context.Background(), client, "orders-global")
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			err := test.run(&fakeClient{})
+			if err == nil || !strings.Contains(err.Error(), `repeated marker "repeat"`) {
+				t.Fatalf("describe pages error = %v, want repeated-marker rejection", err)
+			}
+		})
+	}
+}
+
 func TestDiscoverInstanceAuroraServerlessV2(t *testing.T) {
 	t.Parallel()
 

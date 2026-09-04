@@ -178,15 +178,19 @@ func discoverInnoDBMetadataV1(query topologyRowsQuery, columns map[string]map[st
 		if !ok || clusterRow["default_replicaset"] != row["replicaset_id"] {
 			continue
 		}
-		groupID := metadataJSONField(row["attributes"], "group_replication_group_name")
+		rawGroupID := metadataJSONField(row["attributes"], "group_replication_group_name")
+		groupID := rawGroupID
 		if groupID == "" {
 			groupID = CompositeTopologyKey("innodb-cluster", []string{row["cluster_id"], clusterRow["cluster_name"]})
+		} else if len(groupID) > maxTopologyKeyLength {
+			groupID = CompositeTopologyKey("innodb-cluster", []string{groupID})
 		}
+		groupName := firstNonEmpty(rawGroupID, groupID)
 		metadata.Clusters = append(metadata.Clusters, InnoDBCluster{
 			ID:           groupID,
 			MetadataID:   row["cluster_id"],
 			Name:         clusterRow["cluster_name"],
-			GroupName:    groupID,
+			GroupName:    groupName,
 			PrimaryMode:  row["topology_type"],
 			ReplicaSetID: row["replicaset_id"],
 		})

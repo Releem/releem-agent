@@ -141,6 +141,34 @@ func TestDiscoverInnoDBMetadataSchemaV1(t *testing.T) {
 	}
 }
 
+func TestDiscoverInnoDBMetadataSchemaV1BoundsGroupReplicationIdentity(t *testing.T) {
+	fixture := loadInnoDBMetadataFixture(t, "schema_v1.json")
+	rawGroupName := strings.Repeat("legacy-group-", maxTopologyKeyLength)
+	attributes, err := json.Marshal(map[string]string{
+		"group_replication_group_name": rawGroupName,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	fixture.Rows[metadataV1ReplicaSets][0]["attributes"] = string(attributes)
+
+	metadata, err := DiscoverInnoDBMetadata(fixture.query(t))
+	if err != nil {
+		t.Fatalf("DiscoverInnoDBMetadata() error = %v", err)
+	}
+
+	wantGroupKey := CompositeTopologyKey("innodb-cluster", []string{rawGroupName})
+	if metadata.Clusters[0].ID != wantGroupKey {
+		t.Fatalf("DiscoverInnoDBMetadata() cluster ID = %q, want bounded identity %q", metadata.Clusters[0].ID, wantGroupKey)
+	}
+	if len(metadata.Clusters[0].ID) > maxTopologyKeyLength {
+		t.Fatalf("DiscoverInnoDBMetadata() cluster ID length = %d, want at most %d", len(metadata.Clusters[0].ID), maxTopologyKeyLength)
+	}
+	if metadata.Clusters[0].GroupName != rawGroupName {
+		t.Fatalf("DiscoverInnoDBMetadata() GroupName = %q, want raw metadata value", metadata.Clusters[0].GroupName)
+	}
+}
+
 func TestDiscoverInnoDBMetadataSchemaV2(t *testing.T) {
 	fixture := loadInnoDBMetadataFixture(t, "schema_v2.json")
 	metadata, err := DiscoverInnoDBMetadata(fixture.query(t))

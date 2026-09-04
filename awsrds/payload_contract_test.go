@@ -251,6 +251,7 @@ func TestGoldenPayloadSafetyValidation(t *testing.T) {
 		{name: "IPv6 endpoint", payload: map[string]interface{}{"Endpoint": "[2001:db8::10]:3306"}, wantErr: true},
 		{name: "AWS account ARN", payload: map[string]interface{}{"DBClusterARN": "arn:aws:rds:us-east-1:123456789012:cluster:inventory"}, wantErr: true},
 		{name: "non-synthetic ARN", payload: map[string]interface{}{"DBClusterARN": "arn:aws:rds:us-east-1:customer:cluster:inventory"}, wantErr: true},
+		{name: "non-synthetic ARN in generic identity field", payload: map[string]interface{}{"ParentGroupKey": "arn:aws:rds:us-east-1:customer:cluster:inventory"}, wantErr: true},
 		{name: "AWS access key ID", payload: map[string]interface{}{"Value": "AKIAABCDEFGHIJKLMNOP"}, wantErr: true},
 		{name: "AWS secret-shaped value", payload: map[string]interface{}{"Value": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}, wantErr: true},
 		{name: "credential field", payload: map[string]interface{}{"Password": "fixture-password"}, wantErr: true},
@@ -627,7 +628,8 @@ func validateOfflineGoldenValue(value interface{}, path, field string) error {
 				return fmt.Errorf("golden payload field %s: %w", path, err)
 			}
 		}
-		if isGoldenARNField(field) && !goldenSyntheticARNPattern.MatchString(typed) {
+		isARNValue := strings.HasPrefix(strings.ToLower(strings.TrimSpace(typed)), "arn:")
+		if (isGoldenARNField(field) || isARNValue) && !goldenSyntheticARNPattern.MatchString(typed) {
 			return fmt.Errorf("golden payload field %s contains non-synthetic ARN %q", path, typed)
 		}
 	}
