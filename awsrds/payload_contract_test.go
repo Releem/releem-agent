@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -217,11 +219,55 @@ func TestAuroraGlobalServerlessV2GoldenContract(t *testing.T) {
 	if err := awsrds.NewTopologyRelationsGatherer(logger).GetMetrics(metrics); err != nil {
 		t.Fatalf("build Aurora topology contract: %v", err)
 	}
+	assertGoldenRelationContract(t, metrics.DB.Topology, []goldenRelationIdentity{
+		{relationType: "aurora_cluster", groupKey: "aurora:cluster-inventory-secondary", memberKey: "db-inventory-secondary-writer"},
+		{relationType: "aurora_global_database", groupKey: "aurora-global:global-inventory", memberKey: "db-inventory-secondary-writer"},
+		{relationType: "standalone", groupKey: "aurora-secondary-writer-engine-uuid", memberKey: "aurora-secondary-writer-engine-uuid"},
+	})
 	payload := map[string]interface{}{
 		"DB": map[string]interface{}{"Topology": metrics.DB.Topology},
 	}
 	assertSecretFree(t, payload)
 	assertGoldenSemanticJSON(t, filepath.Join("testdata", "contracts", "aurora_global_serverless_v2.json"), payload)
+}
+
+func TestGoldenPayloadSafetyValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload map[string]interface{}
+		wantErr bool
+	}{
+		{
+			name: "valid synthetic topology",
+			payload: map[string]interface{}{
+				"MemberHost":      "writer.db.example",
+				"InstanceAddress": "writer.db.example:3306",
+				"ClusterEndpoint": "writer.cluster.example",
+				"DBClusterARN":    "arn:aws:rds:us-east-1:fixture:cluster:inventory",
+			},
+		},
+		{name: "live DNS name", payload: map[string]interface{}{"MemberHost": "writer.production.example.com"}, wantErr: true},
+		{name: "IPv4 endpoint", payload: map[string]interface{}{"Endpoint": "192.0.2.10"}, wantErr: true},
+		{name: "IPv6 endpoint", payload: map[string]interface{}{"Endpoint": "[2001:db8::10]:3306"}, wantErr: true},
+		{name: "AWS account ARN", payload: map[string]interface{}{"DBClusterARN": "arn:aws:rds:us-east-1:123456789012:cluster:inventory"}, wantErr: true},
+		{name: "non-synthetic ARN", payload: map[string]interface{}{"DBClusterARN": "arn:aws:rds:us-east-1:customer:cluster:inventory"}, wantErr: true},
+		{name: "AWS access key ID", payload: map[string]interface{}{"Value": "AKIAABCDEFGHIJKLMNOP"}, wantErr: true},
+		{name: "AWS secret-shaped value", payload: map[string]interface{}{"Value": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}, wantErr: true},
+		{name: "credential field", payload: map[string]interface{}{"Password": "fixture-password"}, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(test.payload)
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			err = validateOfflineGoldenPayload(payload)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateOfflineGoldenPayload() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
 }
 
 func TestMetadataLogFieldsOmitSensitiveTopologyData(t *testing.T) {
@@ -445,6 +491,45 @@ func assertSecretFree(t *testing.T, value any) {
 	}
 }
 
+type goldenRelationIdentity struct {
+	relationType string
+	groupKey     string
+	memberKey    string
+}
+
+func assertGoldenRelationContract(t *testing.T, topology models.MetricGroupValue, want []goldenRelationIdentity) {
+	t.Helper()
+	canonical, ok := topology["Relations"].([]models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("generated topology Relations = %#v, want []models.MetricGroupValue", topology["Relations"])
+	}
+	got := make([]goldenRelationIdentity, 0, len(canonical))
+	for index, relation := range canonical {
+		relationType, typeOK := relation["Type"].(string)
+		groupKey, groupOK := relation["GroupKey"].(string)
+		memberKey, memberOK := relation["MemberKey"].(string)
+		if !typeOK || !groupOK || !memberOK {
+			t.Fatalf("generated topology Relations[%d] identity = %#v, want string Type/GroupKey/MemberKey", index, relation)
+		}
+		got = append(got, goldenRelationIdentity{relationType: relationType, groupKey: groupKey, memberKey: memberKey})
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated topology relation identities = %#v, want exact ordered identities %#v", got, want)
+	}
+
+	facts, ok := topology["Facts"].(models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("generated topology Facts = %#v, want models.MetricGroupValue", topology["Facts"])
+	}
+	compatibility, ok := facts["Relations"].([]models.MetricGroupValue)
+	if !ok {
+		t.Fatalf("generated topology Facts.Relations = %#v, want []models.MetricGroupValue", facts["Relations"])
+	}
+	if !reflect.DeepEqual(compatibility, canonical) {
+		t.Fatalf("generated topology Facts.Relations = %#v, want exact canonical Relations mirror %#v", compatibility, canonical)
+	}
+}
+
 func assertGoldenSemanticJSON(t *testing.T, path string, generatedValue interface{}) {
 	t.Helper()
 	generated, err := json.MarshalIndent(generatedValue, "", "  ")
@@ -481,16 +566,134 @@ func assertGoldenSemanticJSON(t *testing.T, path string, generatedValue interfac
 
 func assertOfflineGoldenPayload(t *testing.T, payload []byte) {
 	t.Helper()
-	normalized := strings.ToLower(string(payload))
-	for _, forbidden := range []string{
-		"apikey", "credential", "password", "secret", "token", "access_key",
-		".amazonaws.com", ".internal",
-	} {
-		if strings.Contains(normalized, forbidden) {
-			t.Fatalf("golden payload contains forbidden live or sensitive fragment %q", forbidden)
+	if err := validateOfflineGoldenPayload(payload); err != nil {
+		t.Fatal(err)
+	}
+}
+
+var (
+	goldenAccountIDPattern         = regexp.MustCompile(`(^|[^0-9])[0-9]{12}([^0-9]|$)`)
+	goldenAWSAccessKeyIDPattern    = regexp.MustCompile(`\b(AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[A-Z0-9]{16}\b`)
+	goldenSecretValuePattern       = regexp.MustCompile(`^[A-Za-z0-9/+=]{40}$`)
+	goldenSyntheticARNPattern      = regexp.MustCompile(`^arn:aws(-[a-z0-9-]+)?:rds:[a-z0-9-]*:fixture:(db|cluster|global-cluster):[A-Za-z0-9._/-]+$`)
+	goldenSyntheticHostnamePattern = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+example$`)
+)
+
+func validateOfflineGoldenPayload(payload []byte) error {
+	var value interface{}
+	if err := json.Unmarshal(payload, &value); err != nil {
+		return fmt.Errorf("decode generated golden payload for offline validation: %w", err)
+	}
+	if goldenAccountIDPattern.Match(payload) {
+		return fmt.Errorf("golden payload contains a 12-digit account identifier")
+	}
+	return validateOfflineGoldenValue(value, "$", "")
+}
+
+func validateOfflineGoldenValue(value interface{}, path, field string) error {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if isGoldenCredentialField(key) {
+				return fmt.Errorf("golden payload field %s.%s is credential-bearing", path, key)
+			}
+			if err := validateOfflineGoldenValue(typed[key], path+"."+key, key); err != nil {
+				return err
+			}
+		}
+	case []interface{}:
+		for index, item := range typed {
+			if err := validateOfflineGoldenValue(item, fmt.Sprintf("%s[%d]", path, index), field); err != nil {
+				return err
+			}
+		}
+	case string:
+		if goldenAWSAccessKeyIDPattern.MatchString(typed) {
+			return fmt.Errorf("golden payload field %s contains an AWS access key ID", path)
+		}
+		if goldenSecretValuePattern.MatchString(typed) || strings.Contains(typed, "-----BEGIN ") {
+			return fmt.Errorf("golden payload field %s contains a credential-shaped value", path)
+		}
+		if isGoldenIPAddress(typed) {
+			return fmt.Errorf("golden payload field %s contains an IP address", path)
+		}
+		if isGoldenHostField(field) {
+			if err := validateSyntheticGoldenHost(typed); err != nil {
+				return fmt.Errorf("golden payload field %s: %w", path, err)
+			}
+		}
+		if isGoldenARNField(field) && !goldenSyntheticARNPattern.MatchString(typed) {
+			return fmt.Errorf("golden payload field %s contains non-synthetic ARN %q", path, typed)
 		}
 	}
-	if regexp.MustCompile(`[0-9]{12}`).Match(payload) {
-		t.Fatal("golden payload contains a 12-digit account identifier")
+	return nil
+}
+
+func normalizeGoldenFieldName(field string) string {
+	field = strings.ToLower(field)
+	field = strings.ReplaceAll(field, "_", "")
+	return strings.ReplaceAll(field, "-", "")
+}
+
+func isGoldenCredentialField(field string) bool {
+	field = normalizeGoldenFieldName(field)
+	for _, marker := range []string{"apikey", "credential", "password", "secret", "token", "accesskey", "privatekey"} {
+		if strings.Contains(field, marker) {
+			return true
+		}
 	}
+	return false
+}
+
+func isGoldenHostField(field string) bool {
+	field = normalizeGoldenFieldName(field)
+	return strings.HasSuffix(field, "host") || strings.HasSuffix(field, "hostname") ||
+		strings.HasSuffix(field, "endpoint") || strings.HasSuffix(field, "address")
+}
+
+func isGoldenARNField(field string) bool {
+	field = normalizeGoldenFieldName(field)
+	return strings.HasSuffix(field, "arn") || strings.HasSuffix(field, "arns")
+}
+
+func isGoldenIPAddress(value string) bool {
+	value = strings.TrimSpace(value)
+	if net.ParseIP(strings.Trim(value, "[]")) != nil {
+		return true
+	}
+	host, _, err := net.SplitHostPort(value)
+	return err == nil && net.ParseIP(strings.Trim(host, "[]")) != nil
+}
+
+func validateSyntheticGoldenHost(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("synthetic host is empty")
+	}
+	host := value
+	if strings.Contains(value, ":") {
+		var port string
+		var err error
+		host, port, err = net.SplitHostPort(value)
+		if err != nil {
+			return fmt.Errorf("synthetic endpoint %q is malformed", value)
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return fmt.Errorf("synthetic endpoint %q has invalid port", value)
+		}
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if net.ParseIP(host) != nil {
+		return fmt.Errorf("synthetic host %q must not be an IP address", value)
+	}
+	if !goldenSyntheticHostnamePattern.MatchString(host) {
+		return fmt.Errorf("host %q must use the reserved .example suffix", value)
+	}
+	return nil
 }
