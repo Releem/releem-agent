@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
 	metricspkg "github.com/Releem/mysqlconfigurer/metrics"
+	mysqlmetrics "github.com/Releem/mysqlconfigurer/metrics/mysql"
 	"github.com/Releem/mysqlconfigurer/metrics/system"
 	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -121,6 +124,104 @@ func TestAuroraPayloadContract(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuroraGlobalServerlessV2GoldenContract(t *testing.T) {
+	metrics := &models.Metrics{}
+	metrics.DB.Topology = mysqlmetrics.BuildTopologyFromFacts(mysqlmetrics.TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":     "aurora-secondary-writer-engine-uuid",
+			"hostname":        "aurora-secondary-writer.db.example",
+			"port":            "3306",
+			"read_only":       "OFF",
+			"super_read_only": "OFF",
+		},
+	})
+	metadata := awsrds.Metadata{
+		Partition:                     "aws",
+		Region:                        "us-west-2",
+		DBInstanceIdentifier:          "inventory-secondary-writer",
+		DBInstanceResourceID:          "db-inventory-secondary-writer",
+		DBInstanceClass:               "db.serverless",
+		Endpoint:                      "aurora-secondary-writer.db.example",
+		EndpointPort:                  3306,
+		Engine:                        "aurora-mysql",
+		EngineMode:                    "provisioned",
+		DBClusterIdentifier:           "inventory-secondary",
+		DBClusterARN:                  "arn:aws:rds:us-west-2:fixture:cluster:inventory-secondary",
+		DBClusterResourceID:           "cluster-inventory-secondary",
+		DBClusterParameterGroup:       "inventory-secondary-cluster-pg",
+		DBClusterParameterGroupStatus: "in-sync",
+		ClusterEndpoint:               "aurora-secondary.cluster.example",
+		ClusterReaderEndpoint:         "aurora-secondary-ro.cluster.example",
+		ClusterMembers: []awsrds.ClusterMember{
+			{
+				DBInstanceIdentifier:          "inventory-secondary-writer",
+				DBInstanceResourceID:          "db-inventory-secondary-writer",
+				DBInstanceClass:               "db.serverless",
+				Endpoint:                      "aurora-secondary-writer.db.example",
+				EndpointPort:                  3306,
+				InstanceStatus:                "available",
+				IsClusterWriter:               true,
+				IsServerlessV2:                true,
+				PromotionTier:                 0,
+				DBClusterParameterGroupStatus: "in-sync",
+			},
+			{
+				DBInstanceIdentifier:          "inventory-secondary-reader",
+				DBInstanceResourceID:          "db-inventory-secondary-reader",
+				DBInstanceClass:               "db.serverless",
+				Endpoint:                      "aurora-secondary-reader.db.example",
+				EndpointPort:                  3306,
+				InstanceStatus:                "available",
+				IsServerlessV2:                true,
+				PromotionTier:                 1,
+				DBClusterParameterGroupStatus: "in-sync",
+			},
+		},
+		IsClusterWriter:                     true,
+		IsServerlessV2:                      true,
+		HasServerlessV2ScalingConfiguration: true,
+		ServerlessV2ScalingConfiguration: awsrds.ServerlessV2ScalingConfiguration{
+			MinCapacity:           0.5,
+			MaxCapacity:           16,
+			SecondsUntilAutoPause: 900,
+		},
+		PromotionTier:                    0,
+		InstanceStatus:                   "available",
+		GlobalClusterIdentifier:          "inventory-global",
+		GlobalClusterARN:                 "arn:aws:rds::fixture:global-cluster:inventory-global",
+		GlobalClusterResourceID:          "global-inventory",
+		GlobalClusterPrimaryDBClusterARN: "arn:aws:rds:us-east-1:fixture:cluster:inventory-primary",
+		GlobalClusterPrimaryRegion:       "us-east-1",
+		GlobalClusterMembers: []awsrds.GlobalClusterMember{
+			{
+				DBClusterIdentifier:         "inventory-primary",
+				DBClusterARN:                "arn:aws:rds:us-east-1:fixture:cluster:inventory-primary",
+				Region:                      "us-east-1",
+				IsWriter:                    true,
+				SynchronizationStatus:       "connected",
+				GlobalWriteForwardingStatus: "enabled",
+			},
+			{
+				DBClusterIdentifier:         "inventory-secondary",
+				DBClusterARN:                "arn:aws:rds:us-west-2:fixture:cluster:inventory-secondary",
+				Region:                      "us-west-2",
+				SynchronizationStatus:       "connected",
+				GlobalWriteForwardingStatus: "enabled",
+			},
+		},
+	}
+	awsrds.AttachReportMetadata(metrics, metadata, true)
+	logger := *logging.Init("aurora-global-golden-contract-test", false, false, io.Discard)
+	if err := awsrds.NewTopologyRelationsGatherer(logger).GetMetrics(metrics); err != nil {
+		t.Fatalf("build Aurora topology contract: %v", err)
+	}
+	payload := map[string]interface{}{
+		"DB": map[string]interface{}{"Topology": metrics.DB.Topology},
+	}
+	assertSecretFree(t, payload)
+	assertGoldenSemanticJSON(t, filepath.Join("testdata", "contracts", "aurora_global_serverless_v2.json"), payload)
 }
 
 func TestMetadataLogFieldsOmitSensitiveTopologyData(t *testing.T) {
@@ -341,5 +442,55 @@ func assertSecretFree(t *testing.T, value any) {
 		if strings.Contains(normalized, forbidden) {
 			t.Errorf("fixture contains forbidden secret field fragment %q", forbidden)
 		}
+	}
+}
+
+func assertGoldenSemanticJSON(t *testing.T, path string, generatedValue interface{}) {
+	t.Helper()
+	generated, err := json.MarshalIndent(generatedValue, "", "  ")
+	if err != nil {
+		t.Fatalf("encode generated golden payload: %v", err)
+	}
+	generated = append(generated, '\n')
+	assertOfflineGoldenPayload(t, generated)
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("create golden fixture directory: %v", err)
+		}
+		if err := os.WriteFile(path, generated, 0644); err != nil {
+			t.Fatalf("write golden fixture %q: %v", path, err)
+		}
+	}
+
+	wantBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden fixture %q: %v", path, err)
+	}
+	var want interface{}
+	if err := json.Unmarshal(wantBytes, &want); err != nil {
+		t.Fatalf("decode golden fixture %q: %v", path, err)
+	}
+	var got interface{}
+	if err := json.Unmarshal(generated, &got); err != nil {
+		t.Fatalf("decode generated golden payload: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated payload does not match golden fixture %q\ngot:\n%s\nwant:\n%s", path, generated, wantBytes)
+	}
+}
+
+func assertOfflineGoldenPayload(t *testing.T, payload []byte) {
+	t.Helper()
+	normalized := strings.ToLower(string(payload))
+	for _, forbidden := range []string{
+		"apikey", "credential", "password", "secret", "token", "access_key",
+		".amazonaws.com", ".internal",
+	} {
+		if strings.Contains(normalized, forbidden) {
+			t.Fatalf("golden payload contains forbidden live or sensitive fragment %q", forbidden)
+		}
+	}
+	if regexp.MustCompile(`[0-9]{12}`).Match(payload) {
+		t.Fatal("golden payload contains a 12-digit account identifier")
 	}
 }

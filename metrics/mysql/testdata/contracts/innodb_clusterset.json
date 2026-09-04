@@ -1,0 +1,305 @@
+{
+  "DB": {
+    "Topology": {
+      "Facts": {
+        "GroupMembers": [
+          {
+            "MEMBER_HOST": "secondary-writer.db.example",
+            "MEMBER_ID": "secondary-writer-uuid",
+            "MEMBER_PORT": "3306",
+            "MEMBER_ROLE": "PRIMARY",
+            "MEMBER_STATE": "ONLINE"
+          },
+          {
+            "MEMBER_HOST": "secondary-reader.db.example",
+            "MEMBER_ID": "secondary-reader-uuid",
+            "MEMBER_PORT": "3306",
+            "MEMBER_ROLE": "SECONDARY",
+            "MEMBER_STATE": "ONLINE"
+          }
+        ],
+        "Relations": [
+          {
+            "Facts": {
+              "ReplicaChannels": [
+                {
+                  "Channel_Name": "clusterset_replication",
+                  "Replica_IO_Running": "Yes",
+                  "Replica_SQL_Running": "Yes",
+                  "Seconds_Behind_Source": "4",
+                  "Source_Host": "primary-writer.db.example",
+                  "Source_Port": "3306",
+                  "Source_UUID": "primary-writer-uuid"
+                }
+              ],
+              "ReplicaStatus": {
+                "Channel_Name": "clusterset_replication",
+                "Replica_IO_Running": "Yes",
+                "Replica_SQL_Running": "Yes",
+                "Seconds_Behind_Source": "4",
+                "Source_Host": "primary-writer.db.example",
+                "Source_Port": "3306",
+                "Source_UUID": "primary-writer-uuid"
+              }
+            },
+            "GroupKey": "primary-writer-uuid",
+            "IsReader": true,
+            "IsWriter": false,
+            "MemberHost": "secondary-writer.db.example",
+            "MemberKey": "secondary-writer-uuid",
+            "MemberPort": 3306,
+            "PrimaryHost": "primary-writer.db.example",
+            "PrimaryMemberKey": "primary-writer-uuid",
+            "PrimaryPort": 3306,
+            "ReadOnly": true,
+            "ReplicationLagSeconds": 4,
+            "ReplicationState": "lagging",
+            "Role": "replica",
+            "SuperReadOnly": true,
+            "Type": "async_replication"
+          },
+          {
+            "Facts": {
+              "GroupMembers": [
+                {
+                  "MEMBER_HOST": "secondary-writer.db.example",
+                  "MEMBER_ID": "secondary-writer-uuid",
+                  "MEMBER_PORT": "3306",
+                  "MEMBER_ROLE": "PRIMARY",
+                  "MEMBER_STATE": "ONLINE"
+                },
+                {
+                  "MEMBER_HOST": "secondary-reader.db.example",
+                  "MEMBER_ID": "secondary-reader-uuid",
+                  "MEMBER_PORT": "3306",
+                  "MEMBER_ROLE": "SECONDARY",
+                  "MEMBER_STATE": "ONLINE"
+                }
+              ]
+            },
+            "GroupKey": "group-secondary",
+            "IsReader": true,
+            "IsWriter": false,
+            "MemberHost": "secondary-writer.db.example",
+            "MemberKey": "secondary-writer-uuid",
+            "MemberPort": 3306,
+            "PrimaryHost": "secondary-writer.db.example",
+            "PrimaryMemberKey": "secondary-writer-uuid",
+            "PrimaryPort": 3306,
+            "ReadOnly": true,
+            "ReplicationLagSeconds": null,
+            "ReplicationState": "healthy",
+            "Role": "primary",
+            "SuperReadOnly": true,
+            "Type": "group_replication"
+          },
+          {
+            "Facts": {
+              "ClusterName": "inventory-secondary",
+              "ClusterSetID": "clusterset-inventory",
+              "GroupName": "group-secondary",
+              "InstanceAddress": "secondary-writer.db.example:3306",
+              "InstanceID": "instance-secondary-writer",
+              "InstanceLabel": "secondary-writer",
+              "MetadataClusterID": "metadata-cluster-secondary",
+              "MetadataVersion": "2.1.0",
+              "PrimaryMode": "pm",
+              "ServerUUID": "secondary-writer-uuid"
+            },
+            "GroupKey": "cluster-secondary",
+            "IsReader": true,
+            "IsWriter": false,
+            "MemberHost": "secondary-writer.db.example",
+            "MemberKey": "secondary-writer-uuid",
+            "MemberPort": 3306,
+            "ParentGroupKey": null,
+            "PrimaryHost": "secondary-writer.db.example",
+            "PrimaryMemberKey": "secondary-writer-uuid",
+            "PrimaryPort": 3306,
+            "ReadOnly": true,
+            "ReplicationLagSeconds": null,
+            "ReplicationState": "healthy",
+            "Role": "primary",
+            "SuperReadOnly": true,
+            "Type": "innodb_cluster"
+          },
+          {
+            "Facts": {
+              "ChannelName": "clusterset_replication",
+              "ChannelState": "lagging",
+              "ClusterID": "cluster-secondary",
+              "ClusterSetID": "clusterset-inventory",
+              "ClusterSetName": "inventory-clusterset",
+              "MetadataVersion": "2.1.0",
+              "PrimaryClusterID": "cluster-primary"
+            },
+            "GroupKey": "clusterset-inventory",
+            "IsReader": true,
+            "IsWriter": false,
+            "MemberHost": "secondary-writer.db.example",
+            "MemberKey": "secondary-writer-uuid",
+            "MemberPort": 3306,
+            "ParentGroupKey": "cluster-primary",
+            "PrimaryHost": null,
+            "PrimaryMemberKey": null,
+            "PrimaryPort": null,
+            "ReadOnly": true,
+            "ReplicationLagSeconds": null,
+            "ReplicationState": "healthy",
+            "Role": "replica_cluster",
+            "SuperReadOnly": true,
+            "Type": "innodb_clusterset"
+          }
+        ]
+      },
+      "GroupKey": "group-secondary",
+      "IsReader": true,
+      "IsWriter": false,
+      "MemberHost": "secondary-writer.db.example",
+      "MemberKey": "secondary-writer-uuid",
+      "MemberPort": 3306,
+      "PrimaryHost": "secondary-writer.db.example",
+      "PrimaryMemberKey": "secondary-writer-uuid",
+      "PrimaryPort": 3306,
+      "ReadOnly": true,
+      "Relations": [
+        {
+          "Facts": {
+            "ReplicaChannels": [
+              {
+                "Channel_Name": "clusterset_replication",
+                "Replica_IO_Running": "Yes",
+                "Replica_SQL_Running": "Yes",
+                "Seconds_Behind_Source": "4",
+                "Source_Host": "primary-writer.db.example",
+                "Source_Port": "3306",
+                "Source_UUID": "primary-writer-uuid"
+              }
+            ],
+            "ReplicaStatus": {
+              "Channel_Name": "clusterset_replication",
+              "Replica_IO_Running": "Yes",
+              "Replica_SQL_Running": "Yes",
+              "Seconds_Behind_Source": "4",
+              "Source_Host": "primary-writer.db.example",
+              "Source_Port": "3306",
+              "Source_UUID": "primary-writer-uuid"
+            }
+          },
+          "GroupKey": "primary-writer-uuid",
+          "IsReader": true,
+          "IsWriter": false,
+          "MemberHost": "secondary-writer.db.example",
+          "MemberKey": "secondary-writer-uuid",
+          "MemberPort": 3306,
+          "PrimaryHost": "primary-writer.db.example",
+          "PrimaryMemberKey": "primary-writer-uuid",
+          "PrimaryPort": 3306,
+          "ReadOnly": true,
+          "ReplicationLagSeconds": 4,
+          "ReplicationState": "lagging",
+          "Role": "replica",
+          "SuperReadOnly": true,
+          "Type": "async_replication"
+        },
+        {
+          "Facts": {
+            "GroupMembers": [
+              {
+                "MEMBER_HOST": "secondary-writer.db.example",
+                "MEMBER_ID": "secondary-writer-uuid",
+                "MEMBER_PORT": "3306",
+                "MEMBER_ROLE": "PRIMARY",
+                "MEMBER_STATE": "ONLINE"
+              },
+              {
+                "MEMBER_HOST": "secondary-reader.db.example",
+                "MEMBER_ID": "secondary-reader-uuid",
+                "MEMBER_PORT": "3306",
+                "MEMBER_ROLE": "SECONDARY",
+                "MEMBER_STATE": "ONLINE"
+              }
+            ]
+          },
+          "GroupKey": "group-secondary",
+          "IsReader": true,
+          "IsWriter": false,
+          "MemberHost": "secondary-writer.db.example",
+          "MemberKey": "secondary-writer-uuid",
+          "MemberPort": 3306,
+          "PrimaryHost": "secondary-writer.db.example",
+          "PrimaryMemberKey": "secondary-writer-uuid",
+          "PrimaryPort": 3306,
+          "ReadOnly": true,
+          "ReplicationLagSeconds": null,
+          "ReplicationState": "healthy",
+          "Role": "primary",
+          "SuperReadOnly": true,
+          "Type": "group_replication"
+        },
+        {
+          "Facts": {
+            "ClusterName": "inventory-secondary",
+            "ClusterSetID": "clusterset-inventory",
+            "GroupName": "group-secondary",
+            "InstanceAddress": "secondary-writer.db.example:3306",
+            "InstanceID": "instance-secondary-writer",
+            "InstanceLabel": "secondary-writer",
+            "MetadataClusterID": "metadata-cluster-secondary",
+            "MetadataVersion": "2.1.0",
+            "PrimaryMode": "pm",
+            "ServerUUID": "secondary-writer-uuid"
+          },
+          "GroupKey": "cluster-secondary",
+          "IsReader": true,
+          "IsWriter": false,
+          "MemberHost": "secondary-writer.db.example",
+          "MemberKey": "secondary-writer-uuid",
+          "MemberPort": 3306,
+          "ParentGroupKey": null,
+          "PrimaryHost": "secondary-writer.db.example",
+          "PrimaryMemberKey": "secondary-writer-uuid",
+          "PrimaryPort": 3306,
+          "ReadOnly": true,
+          "ReplicationLagSeconds": null,
+          "ReplicationState": "healthy",
+          "Role": "primary",
+          "SuperReadOnly": true,
+          "Type": "innodb_cluster"
+        },
+        {
+          "Facts": {
+            "ChannelName": "clusterset_replication",
+            "ChannelState": "lagging",
+            "ClusterID": "cluster-secondary",
+            "ClusterSetID": "clusterset-inventory",
+            "ClusterSetName": "inventory-clusterset",
+            "MetadataVersion": "2.1.0",
+            "PrimaryClusterID": "cluster-primary"
+          },
+          "GroupKey": "clusterset-inventory",
+          "IsReader": true,
+          "IsWriter": false,
+          "MemberHost": "secondary-writer.db.example",
+          "MemberKey": "secondary-writer-uuid",
+          "MemberPort": 3306,
+          "ParentGroupKey": "cluster-primary",
+          "PrimaryHost": null,
+          "PrimaryMemberKey": null,
+          "PrimaryPort": null,
+          "ReadOnly": true,
+          "ReplicationLagSeconds": null,
+          "ReplicationState": "healthy",
+          "Role": "replica_cluster",
+          "SuperReadOnly": true,
+          "Type": "innodb_clusterset"
+        }
+      ],
+      "ReplicationLagSeconds": null,
+      "ReplicationState": "healthy",
+      "Role": "primary",
+      "SuperReadOnly": true,
+      "Type": "group_replication"
+    }
+  }
+}

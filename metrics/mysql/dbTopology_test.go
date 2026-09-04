@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -1169,6 +1172,143 @@ func TestBuildTopologyFromFactsReturnsStandaloneForNoReplicationFacts(t *testing
 	}
 	if topology["MemberHost"] != "standalone.example.com" || topology["MemberPort"] != int64(3310) {
 		t.Fatalf("BuildTopologyFromFacts(standalone) member endpoint = %#v:%#v, want standalone.example.com:3310", topology["MemberHost"], topology["MemberPort"])
+	}
+}
+
+func TestInnoDBClusterSetGoldenContract(t *testing.T) {
+	metadata := InnoDBMetadata{
+		SchemaVersion: "2.1.0",
+		Complete:      true,
+		Clusters: []InnoDBCluster{
+			{
+				ID:           "cluster-primary",
+				MetadataID:   "metadata-cluster-primary",
+				Name:         "inventory-primary",
+				GroupName:    "group-primary",
+				PrimaryMode:  "pm",
+				ClusterSetID: "clusterset-inventory",
+			},
+			{
+				ID:           "cluster-secondary",
+				MetadataID:   "metadata-cluster-secondary",
+				Name:         "inventory-secondary",
+				GroupName:    "group-secondary",
+				PrimaryMode:  "pm",
+				ClusterSetID: "clusterset-inventory",
+			},
+		},
+		Instances: []InnoDBInstance{
+			{
+				ID:         "instance-secondary-writer",
+				ClusterID:  "cluster-secondary",
+				ServerUUID: "secondary-writer-uuid",
+				Label:      "secondary-writer",
+				Address:    "secondary-writer.db.example:3306",
+			},
+		},
+		ClusterSets: []InnoDBClusterSet{
+			{
+				ID:               "clusterset-inventory",
+				Name:             "inventory-clusterset",
+				ClusterID:        "cluster-secondary",
+				PrimaryClusterID: "cluster-primary",
+				Role:             "replica_cluster",
+				ChannelName:      "clusterset_replication",
+			},
+		},
+	}
+	topology := BuildTopologyFromFacts(TopologyFacts{
+		Variables: map[string]interface{}{
+			"server_uuid":                           "secondary-writer-uuid",
+			"hostname":                              "secondary-writer.db.example",
+			"port":                                  "3306",
+			"group_replication_group_name":          "group-secondary",
+			"group_replication_single_primary_mode": "ON",
+			"read_only":                             "ON",
+			"super_read_only":                       "ON",
+		},
+		GroupMembers: []map[string]interface{}{
+			{
+				"MEMBER_ID":    "secondary-writer-uuid",
+				"MEMBER_HOST":  "secondary-writer.db.example",
+				"MEMBER_PORT":  "3306",
+				"MEMBER_STATE": "ONLINE",
+				"MEMBER_ROLE":  "PRIMARY",
+			},
+			{
+				"MEMBER_ID":    "secondary-reader-uuid",
+				"MEMBER_HOST":  "secondary-reader.db.example",
+				"MEMBER_PORT":  "3306",
+				"MEMBER_STATE": "ONLINE",
+				"MEMBER_ROLE":  "SECONDARY",
+			},
+		},
+		ReplicaStatus: []map[string]interface{}{
+			{
+				"Channel_Name":          "clusterset_replication",
+				"Source_Host":           "primary-writer.db.example",
+				"Source_Port":           "3306",
+				"Source_UUID":           "primary-writer-uuid",
+				"Replica_IO_Running":    "Yes",
+				"Replica_SQL_Running":   "Yes",
+				"Seconds_Behind_Source": "4",
+			},
+		},
+		InnoDBMetadata: &metadata,
+	})
+
+	assertGoldenSemanticJSON(t, filepath.Join("testdata", "contracts", "innodb_clusterset.json"), map[string]interface{}{
+		"DB": map[string]interface{}{"Topology": topology},
+	})
+}
+
+func assertGoldenSemanticJSON(t *testing.T, path string, generatedValue interface{}) {
+	t.Helper()
+	generated, err := json.MarshalIndent(generatedValue, "", "  ")
+	if err != nil {
+		t.Fatalf("encode generated golden payload: %v", err)
+	}
+	generated = append(generated, '\n')
+	assertOfflineGoldenPayload(t, generated)
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("create golden fixture directory: %v", err)
+		}
+		if err := os.WriteFile(path, generated, 0644); err != nil {
+			t.Fatalf("write golden fixture %q: %v", path, err)
+		}
+	}
+
+	wantBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden fixture %q: %v", path, err)
+	}
+	var want interface{}
+	if err := json.Unmarshal(wantBytes, &want); err != nil {
+		t.Fatalf("decode golden fixture %q: %v", path, err)
+	}
+	var got interface{}
+	if err := json.Unmarshal(generated, &got); err != nil {
+		t.Fatalf("decode generated golden payload: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generated payload does not match golden fixture %q\ngot:\n%s\nwant:\n%s", path, generated, wantBytes)
+	}
+}
+
+func assertOfflineGoldenPayload(t *testing.T, payload []byte) {
+	t.Helper()
+	normalized := strings.ToLower(string(payload))
+	for _, forbidden := range []string{
+		"apikey", "credential", "password", "secret", "token", "access_key",
+		".amazonaws.com", ".internal",
+	} {
+		if strings.Contains(normalized, forbidden) {
+			t.Fatalf("golden payload contains forbidden live or sensitive fragment %q", forbidden)
+		}
+	}
+	if regexp.MustCompile(`[0-9]{12}`).Match(payload) {
+		t.Fatal("golden payload contains a 12-digit account identifier")
 	}
 }
 
