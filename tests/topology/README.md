@@ -24,7 +24,9 @@ in `description`; the NAT is accepted only as the exact child configuration of
 the owned router. Existing or partial resources fail closed unless every
 available resource has the expected ownership and semantics. Firewall
 inventory covers every rule attached to the dedicated VPC and rejects anything
-other than the exact internal and IAP rules.
+other than the exact internal and IAP rules. Both rules must have no source
+tags, source service accounts, target service accounts, or other additive
+source/target selectors.
 
 Instances and disks use GCP labels. Resumed instances must all use one
 supported machine type, the selected zone, and the exact run subnet and
@@ -117,11 +119,15 @@ non-repository parent directory; this changes build metadata only.
 `configure` inspects AdminAPI metadata, topology mode, member status, and
 read/write mode. It adds absent members, attempts bounded rejoin for supported
 OFFLINE/MISSING states, rejects incompatible or unsafe states, and requires the
-exact ONLINE member set and single-primary or multi-primary semantics before
-continuing. State evidence is accepted only after the real AdminAPI status for
-all four clusters and the ClusterSet passes exact member, mode, health, primary
-count, read/write, and ClusterSet role checks. Expected stopped-member and
-stopped-ClusterSet-replication transition states are validated explicitly.
+exact ONLINE member set and member-role semantics before continuing. An
+ordinary single-primary cluster and the ClusterSet primary cluster require one
+R/W internal primary; a ClusterSet replica requires all three members,
+including its internal primary, to be fenced R/O. Multi-primary requires all
+three ONLINE members to be R/W primaries. State evidence is accepted only when
+the ClusterSet primary-cluster identity, cluster roles, global primary instance,
+member roles, and writer availability agree. The expected primary cluster is
+checked before ClusterSet transitions and after controlled switchover. Expected
+stopped-member and stopped-ClusterSet-replication states are also validated.
 
 `exercise` records UTC transition markers, restarts each Agent for immediate
 collection, waits for current-state persistence, and queries every matching

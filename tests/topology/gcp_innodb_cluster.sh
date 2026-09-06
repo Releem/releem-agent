@@ -247,9 +247,18 @@ validate_network_stack() {
   ' "$nat_file" >/dev/null || die "Cloud NAT ownership or semantics mismatch"
   jq -e --arg network "$NETWORK_NAME" --arg internal "releem-ic-internal-${RUN_LABEL}" --arg iap "releem-ic-iap-ssh-${RUN_LABEL}" \
     --arg internal_tag "$INTERNAL_TAG" --arg iap_tag "$IAP_SSH_TAG" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$firewall_required" '
+    def has_no_extra_selectors:
+      ((.sourceTags // []) == []) and
+      ((.sourceServiceAccounts // []) == []) and
+      ((.targetServiceAccounts // []) == []) and
+      ((.destinationRanges // []) == []) and
+      ((.sourceSecureTags // []) == []) and
+      ((.targetSecureTags // []) == []) and
+      ((.params.resourceManagerTags // {}) == {}) and
+      ((.denied // []) == []);
     ((($required == true) and length == 2) or (($required == false) and length <= 2)) and
     all(.description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and .direction == "INGRESS" and
-        (.priority // 1000) == 1000 and (.disabled // false) == false) and
+        (.priority // 1000) == 1000 and (.disabled // false) == false and has_no_extra_selectors) and
     (if length == 0 then true else
       (map(select(.name == $internal and .sourceRanges == [$cidr] and .targetTags == [$internal_tag] and
         .allowed == [{"IPProtocol":"tcp","ports":["3306","33060","33061"]}]))|length) == (if $required then 1 else (map(select(.name==$internal))|length) end) and
@@ -773,19 +782,30 @@ assert_cluster_compatible() {
 }
 
 assert_cluster_online() {
-  local status="$1" cluster="$2" mode="$3"; shift 3
+  local status="$1" cluster="$2" mode="$3" writer_policy="$4"; shift 4
   local expected_mode expected_json
   [[ "$mode" == single ]] && expected_mode=Single-Primary || expected_mode=Multi-Primary
   expected_json="$(printf '%s\n' "$@" | jq -Rsc 'split("\n")|map(select(length>0))|sort')"
-  jq -e --arg cluster "$cluster" --arg mode "$expected_mode" --argjson expected "$expected_json" '
+  jq -e --arg cluster "$cluster" --arg mode "$expected_mode" --arg writers "$writer_policy" --argjson expected "$expected_json" '
     .clusterName == $cluster and .defaultReplicaSet.topologyMode == $mode and
     ((.defaultReplicaSet.topology|keys|map(sub(":3306$";""))|sort) == $expected) and
     (.defaultReplicaSet.topology|to_entries|all(.value.status == "ONLINE")) and
     (if $mode == "Single-Primary" then
-       ([.defaultReplicaSet.topology[]|select(.mode == "R/W")]|length) == 1 and
-       ([.defaultReplicaSet.topology[]|select(.mode == "R/O")]|length) == 2 and
-       (.defaultReplicaSet.primary as $p | .defaultReplicaSet.topology[$p].mode == "R/W")
-     else [.defaultReplicaSet.topology[].mode]|all(. == "R/W") end)
+       (.defaultReplicaSet.primary as $p |
+         (.defaultReplicaSet.topology | has($p)) and
+         .defaultReplicaSet.topology[$p].memberRole == "PRIMARY" and
+         ([.defaultReplicaSet.topology|to_entries[]|select(.key != $p)|.value.memberRole]|all(. == "SECONDARY")) and
+         (if $writers == "writable" then
+            .defaultReplicaSet.topology[$p].mode == "R/W" and
+            ([.defaultReplicaSet.topology[]|select(.mode == "R/W")]|length) == 1 and
+            ([.defaultReplicaSet.topology[]|select(.mode == "R/O")]|length) == 2
+          elif $writers == "fenced" then
+            [.defaultReplicaSet.topology[].mode]|all(. == "R/O")
+          else false end))
+     else
+       $writers == "writable" and
+       ([.defaultReplicaSet.topology[]]|all(.mode == "R/W" and .memberRole == "PRIMARY"))
+     end)
   ' <<<"$status" >/dev/null || die "cluster $cluster did not reach its exact ONLINE $expected_mode topology"
 }
 
@@ -803,7 +823,7 @@ assert_cluster_state_for_label() {
       expected_rw=2
       ;;
     *)
-      assert_cluster_online "$status" "$cluster" "$mode" "$@"
+      assert_cluster_online "$status" "$cluster" "$mode" writable "$@"
       return
       ;;
   esac
@@ -816,15 +836,22 @@ assert_cluster_state_for_label() {
     ([.defaultReplicaSet.topology[]|select(.status == "ONLINE" and .mode == "R/W")]|length) == $rw and
     ([.defaultReplicaSet.topology[]|select(.status != "ONLINE" and
       (.status == "OFFLINE" or .status == "MISSING" or .status == "(MISSING)" or .status == "UNREACHABLE"))]|length) == (3-$online) and
-    (.defaultReplicaSet.primary as $p | .defaultReplicaSet.topology[$p].status == "ONLINE" and .defaultReplicaSet.topology[$p].mode == "R/W")
+    (if $mode == "Single-Primary" then
+       (.defaultReplicaSet.primary as $p |
+         .defaultReplicaSet.topology[$p].status == "ONLINE" and
+         .defaultReplicaSet.topology[$p].mode == "R/W" and
+         .defaultReplicaSet.topology[$p].memberRole == "PRIMARY" and
+         ([.defaultReplicaSet.topology|to_entries[]|select(.key != $p)|.value.memberRole]|all(. == "SECONDARY")))
+     else ([.defaultReplicaSet.topology[].memberRole]|all(. == "PRIMARY")) end)
   ' <<<"$status" >/dev/null || die "cluster $cluster has invalid expected transition state for $label"
 }
 
 assert_clusterset_state() {
-  local status="$1" label="$2"
-  jq -e --arg label "$label" '
+  local status="$1" label="$2" expected_primary="$3"
+  jq -e --arg label "$label" --arg expected_primary "$expected_primary" '
     .domainName == "releem_clusterset" and
-    (.primaryCluster == "releem_cs_primary" or .primaryCluster == "releem_cs_replica") and
+    .primaryCluster == $expected_primary and
+    ($expected_primary == "releem_cs_primary" or $expected_primary == "releem_cs_replica") and
     ((.clusters|keys|sort) == ["releem_cs_primary","releem_cs_replica"]) and
     (.primaryCluster as $primary |
       (if $primary == "releem_cs_primary" then "releem_cs_replica" else "releem_cs_primary" end) as $replica |
@@ -843,9 +870,34 @@ assert_clusterset_state() {
   ' <<<"$status" >/dev/null || die "ClusterSet has invalid health or role semantics for $label"
 }
 
+assert_clusterset_clusters() {
+  local clusterset="$1" cs_primary="$2" cs_replica="$3" primary
+  primary="$(jq -r '.primaryCluster' <<<"$clusterset")"
+  if [[ "$primary" == releem_cs_primary ]]; then
+    assert_cluster_online "$cs_primary" releem_cs_primary single writable \
+      releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
+    assert_cluster_online "$cs_replica" releem_cs_replica single fenced \
+      releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3
+  else
+    assert_cluster_online "$cs_primary" releem_cs_primary single fenced \
+      releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
+    assert_cluster_online "$cs_replica" releem_cs_replica single writable \
+      releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3
+  fi
+  jq -e --arg primary "$primary" --argjson cs_primary "$cs_primary" --argjson cs_replica "$cs_replica" '
+    (if $primary == "releem_cs_primary" then $cs_primary else $cs_replica end) as $primary_status |
+    .globalPrimaryInstance == $primary_status.defaultReplicaSet.primary
+  ' <<<"$clusterset" >/dev/null || die "ClusterSet global primary does not match its primary cluster writer"
+}
+
 ensure_cluster() {
-  local cluster="$1" seed="$2" mode="$3" node status member_status
-  shift 3
+  local cluster="$1" seed="$2" mode="$3" writer_policy=writable node status member_status
+  if [[ "${4:-}" == writable || "${4:-}" == fenced ]]; then
+    writer_policy="$4"
+    shift 4
+  else
+    shift 3
+  fi
   if ! adminapi_cluster_exists "$cluster" "$seed"; then
     adminapi_create_cluster "$cluster" "$seed" "$mode"
   fi
@@ -862,7 +914,7 @@ ensure_cluster() {
     esac
   done
   status="$(adminapi_cluster_status "$cluster")"
-  assert_cluster_online "$status" "$cluster" "$mode" "$@"
+  assert_cluster_online "$status" "$cluster" "$mode" "$writer_policy" "$@"
 }
 
 adminapi_clusterset_exists() {
@@ -895,15 +947,32 @@ ensure_clusterset() {
 }
 
 configure_clusters() {
-  ensure_cluster releem_single releem-ic-single-1 single \
+  local clusterset_primary
+  ensure_cluster releem_single releem-ic-single-1 single writable \
     releem-ic-single-1 releem-ic-single-2 releem-ic-single-3
-  ensure_cluster releem_multi releem-ic-multi-1 multi \
+  ensure_cluster releem_multi releem-ic-multi-1 multi writable \
     releem-ic-multi-1 releem-ic-multi-2 releem-ic-multi-3
-  ensure_cluster releem_cs_primary releem-ic-cs-primary-1 single \
-    releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
+  if ! adminapi_clusterset_exists; then
+    ensure_cluster releem_cs_primary releem-ic-cs-primary-1 single writable \
+      releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
+  fi
   ensure_clusterset
-  ensure_cluster releem_cs_replica releem-ic-cs-replica-1 single \
-    releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3
+  clusterset_primary="$(clusterset_primary_name)"
+  case "$clusterset_primary" in
+    releem_cs_primary)
+      ensure_cluster releem_cs_primary releem-ic-cs-primary-1 single writable \
+        releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
+      ensure_cluster releem_cs_replica releem-ic-cs-replica-1 single fenced \
+        releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3
+      ;;
+    releem_cs_replica)
+      ensure_cluster releem_cs_primary releem-ic-cs-primary-1 single fenced \
+        releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
+      ensure_cluster releem_cs_replica releem-ic-cs-replica-1 single writable \
+        releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3
+      ;;
+    *) die "unknown ClusterSet primary cluster" ;;
+  esac
 }
 
 configure() {
@@ -917,7 +986,7 @@ configure() {
   validate_live_network_stack "$STATE_REGION" required
   require_running_inventory
 
-  local binary=/tmp/releem-agent-db-topology-x86_64 checksum hosts='' node ip index=0
+  local binary=/tmp/releem-agent-db-topology-x86_64 checksum hosts='' node ip index=0 clusterset_primary
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -buildvcs=false -o "$binary" .
   chmod 755 "$binary"
   checksum="$(sha256sum "$binary" | awk '{print $1}')"
@@ -936,7 +1005,8 @@ configure() {
     [[ "$remote_checksum" == "$checksum" ]] || die "binary checksum mismatch on $node"
   done
   configure_clusters
-  verify_cluster_state healthy-configured
+  clusterset_primary="$(clusterset_primary_name)"
+  verify_cluster_state healthy-configured "$clusterset_primary"
   inventory
 }
 
@@ -968,7 +1038,7 @@ trigger_collection() {
 }
 
 verify_cluster_state() {
-  local label="$1" out captured_at single multi cs_primary cs_replica clusterset
+  local label="$1" expected_clusterset_primary="$2" out captured_at single multi cs_primary cs_replica clusterset
   out="$EVIDENCE_DIR/$RUN_LABEL/${label}.json"
   mkdir -p "$EVIDENCE_DIR/$RUN_LABEL"
   single="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_single'); print(JSON.stringify(c.status({extended:1})))" releem-ic-single-1 releem-ic-single-2 releem-ic-single-3 | grep -E '^\{' | tail -n1)"
@@ -981,11 +1051,8 @@ verify_cluster_state() {
     releem-ic-single-1 releem-ic-single-2 releem-ic-single-3
   assert_cluster_state_for_label "$multi" releem_multi multi "$label" \
     releem-ic-multi-1 releem-ic-multi-2 releem-ic-multi-3
-  assert_cluster_online "$cs_primary" releem_cs_primary single \
-    releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
-  assert_cluster_online "$cs_replica" releem_cs_replica single \
-    releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3
-  assert_clusterset_state "$clusterset" "$label"
+  assert_clusterset_state "$clusterset" "$label" "$expected_clusterset_primary"
+  assert_clusterset_clusters "$clusterset" "$cs_primary" "$cs_replica"
 
   captured_at="$(date -u +%FT%TZ)"
   jq -n --arg label "$label" --arg captured_at "$captured_at" \
@@ -1264,12 +1331,12 @@ collect() {
 }
 
 exercise_step() {
-  local name="$1"; shift
+  local name="$1" expected_clusterset_primary="$2"; shift 2
   local mark
   mark="$(marker "$name")"
   "$@"
   sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"
-  verify_cluster_state "$name"
+  verify_cluster_state "$name" "$expected_clusterset_primary"
   collect "$mark"
 }
 
@@ -1350,50 +1417,50 @@ exercise() {
   local single_primary single_primary_uuid single_new_primary single_new_uuid single_rejoin_source mark expectation
   local multi_target= replica_cluster= releem_cs_current= releem_cs_target= replica_seed= replica_primary= replica_sid=
   local old_cs_primary_host= old_cs_primary_sid=
+  releem_cs_current="$(clusterset_primary_name)"
+  [[ "$releem_cs_current" == releem_cs_primary || "$releem_cs_current" == releem_cs_replica ]] || die "unknown ClusterSet primary cluster"
   single_primary="$(cluster_primary_host releem_single releem-ic-single-1)"
   [[ "$single_primary" =~ ^releem-ic-single-[1-3]$ ]] || die "could not identify the single-primary writer"
   single_primary_uuid="$(server_uuid "$single_primary")"
   single_rejoin_source=releem-ic-single-1
   [[ "$single_rejoin_source" != "$single_primary" ]] || single_rejoin_source=releem-ic-single-2
 
-  exercise_step single-healthy true
+  exercise_step single-healthy "$releem_cs_current" true
   mark="$(marker single-primary-stopped)"
   ssh_node "$single_primary" sudo mysql -e 'STOP GROUP_REPLICATION'
   single_new_primary="$(wait_for_new_primary "$single_rejoin_source" "$single_primary")"
   single_new_uuid="$(server_uuid "$single_new_primary")"
   expectation="$(jq -n --arg transition single-primary-stopped --arg target "$single_primary" --arg old "$single_primary_uuid" --arg new "$single_new_uuid" '{transition:$transition,target_hostname:$target,target_member_key:$old,old_primary_member_key:$old,new_primary_member_key:$new}')"
   write_expectation "$mark" "$expectation"
-  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state single-primary-stopped; collect "$mark"
+  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state single-primary-stopped "$releem_cs_current"; collect "$mark"
 
   mark="$(marker single-secondary-promoted)"
   expectation="$(jq -n --arg transition single-secondary-promoted --arg target "$single_new_primary" --arg old "$single_primary_uuid" --arg new "$single_new_uuid" '{transition:$transition,target_hostname:$target,old_primary_member_key:$old,new_primary_member_key:$new}')"
   write_expectation "$mark" "$expectation"
-  verify_cluster_state single-secondary-promoted; collect "$mark"
+  verify_cluster_state single-secondary-promoted "$releem_cs_current"; collect "$mark"
 
   mark="$(marker single-old-primary-rejoined)"
   mysqlsh_on "$single_rejoin_source" \
     "var c=dba.getCluster('releem_single'); c.rejoinInstance('${MYSQL_ADMIN_USER}@${single_primary}:3306',{recoveryMethod:'incremental'}); print(JSON.stringify(c.status({extended:1})))"
   expectation="$(jq -n --arg transition single-old-primary-rejoined --arg hostname "$single_primary" --arg target "$single_primary_uuid" --arg new "$single_new_uuid" '{transition:$transition,target_hostname:$hostname,target_member_key:$target,new_primary_member_key:$new}')"
   write_expectation "$mark" "$expectation"
-  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state single-old-primary-rejoined; collect "$mark"
+  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state single-old-primary-rejoined "$releem_cs_current"; collect "$mark"
 
-  exercise_step multi-healthy true
+  exercise_step multi-healthy "$releem_cs_current" true
   multi_target="$(server_uuid releem-ic-multi-2)"
   mark="$(marker multi-writer-offline)"
   ssh_node releem-ic-multi-2 sudo mysql -e 'STOP GROUP_REPLICATION'
   expectation="$(jq -n --arg transition multi-writer-offline --arg hostname releem-ic-multi-2 --arg target "$multi_target" '{transition:$transition,target_hostname:$hostname,target_member_key:$target}')"
   write_expectation "$mark" "$expectation"
-  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state multi-writer-offline; collect "$mark"
+  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state multi-writer-offline "$releem_cs_current"; collect "$mark"
   mark="$(marker multi-writer-rejoined)"
   mysqlsh_on releem-ic-multi-1 \
     "var c=dba.getCluster('releem_multi'); c.rejoinInstance('${MYSQL_ADMIN_USER}@releem-ic-multi-2:3306',{recoveryMethod:'incremental'}); print(JSON.stringify(c.status({extended:1})))"
   expectation="$(jq -n --arg transition multi-writer-rejoined --arg hostname releem-ic-multi-2 --arg target "$multi_target" '{transition:$transition,target_hostname:$hostname,target_member_key:$target}')"
   write_expectation "$mark" "$expectation"
-  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state multi-writer-rejoined; collect "$mark"
+  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state multi-writer-rejoined "$releem_cs_current"; collect "$mark"
 
-  exercise_step clusterset-healthy true
-  releem_cs_current="$(clusterset_primary_name)"
-  [[ "$releem_cs_current" == releem_cs_primary || "$releem_cs_current" == releem_cs_replica ]] || die "unknown ClusterSet primary cluster"
+  exercise_step clusterset-healthy "$releem_cs_current" true
   if [[ "$releem_cs_current" == releem_cs_primary ]]; then replica_cluster=releem_cs_replica; replica_seed=releem-ic-cs-replica-1; else replica_cluster=releem_cs_primary; replica_seed=releem-ic-cs-primary-1; fi
   replica_primary="$(cluster_primary_host "$replica_cluster" "$replica_seed")"
   replica_sid="$(sid_for_hostname "$replica_primary")"
@@ -1403,14 +1470,14 @@ exercise() {
   wait_for_replica_channel_state "$replica_primary" stopped
   expectation="$(jq -n --arg transition clusterset-replication-stopped --argjson sid "$replica_sid" '{transition:$transition,target_sid:$sid}')"
   write_expectation "$mark" "$expectation"
-  verify_cluster_state clusterset-replication-stopped; collect "$mark"
+  verify_cluster_state clusterset-replication-stopped "$releem_cs_current"; collect "$mark"
 
   mark="$(marker clusterset-replication-resumed)"
   ssh_node "$replica_primary" sudo mysql -e "START REPLICA FOR CHANNEL 'clusterset_replication'"
   wait_for_replica_channel_state "$replica_primary" healthy
   expectation="$(jq -n --arg transition clusterset-replication-resumed --argjson sid "$replica_sid" '{transition:$transition,target_sid:$sid}')"
   write_expectation "$mark" "$expectation"
-  verify_cluster_state clusterset-replication-resumed; collect "$mark"
+  verify_cluster_state clusterset-replication-resumed "$releem_cs_current"; collect "$mark"
 
   mark="$(marker clusterset-primary-switchover)"
   [[ "$releem_cs_current" == releem_cs_primary ]] && releem_cs_target=releem_cs_replica || releem_cs_target=releem_cs_primary
@@ -1423,7 +1490,7 @@ exercise() {
     --argjson new_replica_sid "$old_cs_primary_sid" \
     '{transition:$transition,old_primary_cluster:$old,new_primary_cluster:$new,new_replica_sid:$new_replica_sid}')"
   write_expectation "$mark" "$expectation"
-  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state clusterset-primary-switchover; collect "$mark"
+  sleep "${TOPOLOGY_SETTLE_SECONDS:-20}"; verify_cluster_state clusterset-primary-switchover "$releem_cs_target"; collect "$mark"
 }
 
 inventory() {
