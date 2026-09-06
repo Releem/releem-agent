@@ -167,6 +167,18 @@ is_expected_node() {
   return 1
 }
 
+expected_resource_records() {
+  local record name
+  while IFS= read -r record; do
+    [[ -n "$record" ]] || continue
+    name="${record%%|*}"
+    if is_expected_node "$name"; then
+      printf '%s\n' "$record"
+    fi
+  done
+  return 0
+}
+
 validate_disk_inventory() {
   local instances="$1" disks="$2" name zone owner managed users instance_zone
   declare -A instance_zones=()
@@ -333,11 +345,11 @@ preflight() {
   [[ "$lifecycle" == "ACTIVE" ]] || die "project $PROJECT is not ACTIVE"
 
   instances="$(gcloud_project compute instances list \
-    --filter='name~^releem-ic-(single|multi|cs-primary|cs-replica)-[1-3]$' \
-    --format="csv[no-heading,separator='|'](name,zone.basename(),status,labels.${LABEL_KEY},labels.releem-topology-managed,machineType.basename(),networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].network.basename(),networkInterfaces[0].subnetwork.basename())")"
+    --format="csv[no-heading,separator='|'](name,zone.basename(),status,labels.${LABEL_KEY},labels.releem-topology-managed,machineType.basename(),networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].network.basename(),networkInterfaces[0].subnetwork.basename())" |
+    expected_resource_records)"
   disks="$(gcloud_project compute disks list \
-    --filter='name~^releem-ic-(single|multi|cs-primary|cs-replica)-[1-3]$' \
-    --format="csv[no-heading,separator='|'](name,zone.basename(),status,labels.${LABEL_KEY},labels.releem-topology-managed,users)")"
+    --format="csv[no-heading,separator='|'](name,zone.basename(),status,labels.${LABEL_KEY},labels.releem-topology-managed,users)" |
+    expected_resource_records)"
   stack_dir="$EVIDENCE_DIR/$RUN_LABEL/preflight-network"
   inventory_network_stack '' "$stack_dir"
   stack_region="$(jq -r 'if length == 1 then .[0].region|split("/")[-1] else "" end' "$stack_dir/subnet.json")"
@@ -577,8 +589,8 @@ wait_for_ssh() {
 require_running_inventory() {
   local records name status owner managed count=0 expected
   records="$(gcloud_project compute instances list \
-    --filter='name~^releem-ic-(single|multi|cs-primary|cs-replica)-[1-3]$' \
-    --format="csv[no-heading,separator='|'](name,status,labels.${LABEL_KEY},labels.releem-topology-managed)")"
+    --format="csv[no-heading,separator='|'](name,status,labels.${LABEL_KEY},labels.releem-topology-managed)" |
+    expected_resource_records)"
   while IFS='|' read -r name status owner managed; do
     [[ -n "$name" ]] || continue
     expected=0
