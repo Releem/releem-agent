@@ -232,7 +232,8 @@ validate_network_stack() {
   jq -e --arg name "$SUBNET_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$network_required" '
     (length == 1 or ($required == false and length == 0)) and
     all(.name == $name and .description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and
-        (.region|endswith("/"+$region)) and .ipCidrRange == $cidr and .privateIpGoogleAccess == true)
+        (.region|endswith("/"+$region)) and .ipCidrRange == $cidr and .privateIpGoogleAccess == true and
+        ((.secondaryIpRanges // []) == []))
   ' "$subnet_file" >/dev/null || die "subnet ownership or semantics mismatch"
   jq -e --arg name "$ROUTER_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg owner "$(ownership_description)" --argjson required "$network_required" '
     (length == 1 or ($required == false and length == 0)) and
@@ -243,7 +244,8 @@ validate_network_stack() {
     all(.name == $name and .natIpAllocateOption == "AUTO_ONLY" and
         .sourceSubnetworkIpRangesToNat == "LIST_OF_SUBNETWORKS" and
         (.subnetworks|length) == 1 and (.subnetworks[0].name|endswith("/"+$subnet)) and
-        (.subnetworks[0].sourceIpRangesToNat == ["ALL_IP_RANGES"]))
+        ((.subnetworks[0].sourceIpRangesToNat == ["PRIMARY_IP_RANGE"]) or
+         (.subnetworks[0].sourceIpRangesToNat == ["ALL_IP_RANGES"])))
   ' "$nat_file" >/dev/null || die "Cloud NAT ownership or semantics mismatch"
   jq -e --arg network "$NETWORK_NAME" --arg internal "releem-ic-internal-${RUN_LABEL}" --arg iap "releem-ic-iap-ssh-${RUN_LABEL}" \
     --arg internal_tag "$INTERNAL_TAG" --arg iap_tag "$IAP_SSH_TAG" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$firewall_required" '

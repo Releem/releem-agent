@@ -21,8 +21,11 @@ The harness is resumable. `preflight` is always read-only and must pass before
 `10.212.0.0/24` regional subnet, Cloud Router, Cloud NAT, and two firewall
 rules. Network, subnet, router, and firewall ownership uses an exact run marker
 in `description`; the NAT is accepted only as the exact child configuration of
-the owned router. Existing or partial resources fail closed unless every
-available resource has the expected ownership and semantics. Firewall
+the owned router and primary-only subnet. The subnet must have no secondary IP
+ranges, so GCP's `PRIMARY_IP_RANGE` and `ALL_IP_RANGES` NAT representations are
+equivalent without broadening address coverage. Existing or partial resources
+fail closed unless every available resource has the expected ownership and
+semantics. Firewall
 inventory covers every rule attached to the dedicated VPC and rejects anything
 other than the exact internal and IAP rules. Both rules must have no source
 tags, source service accounts, target service accounts, or other additive
