@@ -22,7 +22,9 @@ The harness is resumable. `preflight` is always read-only and must pass before
 rules. Network, subnet, router, and firewall ownership uses an exact run marker
 in `description`; the NAT is accepted only as the exact child configuration of
 the owned router. Existing or partial resources fail closed unless every
-available resource has the expected ownership and semantics.
+available resource has the expected ownership and semantics. Firewall
+inventory covers every rule attached to the dedicated VPC and rejects anything
+other than the exact internal and IAP rules.
 
 Instances and disks use GCP labels. Resumed instances must all use one
 supported machine type, the selected zone, and the exact run subnet and
@@ -31,6 +33,11 @@ access for package and installer downloads. Operator SSH and scp always use
 IAP. The only cloud ingress is IAP TCP/22 and subnet-sourced TCP/3306,
 TCP/33060, and TCP/33061 to the run tags; guest UFW restricts the database ports
 to `10.212.0.0/24` as well.
+
+`create` builds and validates the non-billable network components before adding
+Cloud NAT. If network creation or validation fails before the first VM, it
+rolls back only resources created by that invocation, in dependency order;
+pre-existing owned resources are never included in this rollback.
 
 ### Runtime secrets
 
@@ -111,13 +118,18 @@ non-repository parent directory; this changes build metadata only.
 read/write mode. It adds absent members, attempts bounded rejoin for supported
 OFFLINE/MISSING states, rejects incompatible or unsafe states, and requires the
 exact ONLINE member set and single-primary or multi-primary semantics before
-continuing.
+continuing. State evidence is accepted only after the real AdminAPI status for
+all four clusters and the ClusterSet passes exact member, mode, health, primary
+count, read/write, and ClusterSet role checks. Expected stopped-member and
+stopped-ClusterSet-replication transition states are validated explicitly.
 
 `exercise` records UTC transition markers, restarts each Agent for immediate
 collection, waits for current-state persistence, and queries every matching
 ClickHouse row for the exact tenant-scoped SID/current-RID pairs in a bounded
-post-marker window. Validation rejects missing, duplicate, extra, late, or
-relation-mismatched observations; there is no `LIMIT 1 BY sid` selection.
+post-marker window whose lower bound preserves the marker's exact millisecond
+value with `DateTime64`. Validation rejects missing, duplicate, extra, early,
+late, or relation-mismatched observations; there is no `LIMIT 1 BY sid`
+selection.
 Sanitized MySQL/JSON evidence is
 stored under `/tmp/releem-db-topology-evidence/gcp/` with mode `0600` defaults.
 Addresses and credentials are excluded from the evidence and inventory output.

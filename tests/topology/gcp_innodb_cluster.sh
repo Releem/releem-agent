@@ -218,30 +218,35 @@ normalize_json_array() {
 
 validate_network_stack() {
   local region="$1" network_file="$2" subnet_file="$3" router_file="$4" nat_file="$5" firewall_file="$6" mode="$7"
-  local required=false
-  [[ "$mode" == required ]] && required=true
-  jq -e --arg name "$NETWORK_NAME" --arg owner "$(ownership_description)" --argjson required "$required" '
+  local network_required=false nat_required=false nat_forbidden=false firewall_required=false
+  case "$mode" in
+    optional) ;;
+    pre-nat) network_required=true; nat_forbidden=true; firewall_required=true ;;
+    required) network_required=true; nat_required=true; firewall_required=true ;;
+    *) die "invalid network validation mode: $mode" ;;
+  esac
+  jq -e --arg name "$NETWORK_NAME" --arg owner "$(ownership_description)" --argjson required "$network_required" '
     (length == 1 or ($required == false and length == 0)) and
     all(.name == $name and .description == ($owner|rtrimstr("\n")) and .autoCreateSubnetworks == false and .routingConfig.routingMode == "REGIONAL")
   ' "$network_file" >/dev/null || die "network ownership or semantics mismatch"
-  jq -e --arg name "$SUBNET_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$required" '
+  jq -e --arg name "$SUBNET_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$network_required" '
     (length == 1 or ($required == false and length == 0)) and
     all(.name == $name and .description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and
         (.region|endswith("/"+$region)) and .ipCidrRange == $cidr and .privateIpGoogleAccess == true)
   ' "$subnet_file" >/dev/null || die "subnet ownership or semantics mismatch"
-  jq -e --arg name "$ROUTER_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg owner "$(ownership_description)" --argjson required "$required" '
+  jq -e --arg name "$ROUTER_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg owner "$(ownership_description)" --argjson required "$network_required" '
     (length == 1 or ($required == false and length == 0)) and
     all(.name == $name and .description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and (.region|endswith("/"+$region)))
   ' "$router_file" >/dev/null || die "router ownership or semantics mismatch"
-  jq -e --arg name "$NAT_NAME" --arg subnet "$SUBNET_NAME" --argjson required "$required" '
-    (length == 1 or ($required == false and length == 0)) and
+  jq -e --arg name "$NAT_NAME" --arg subnet "$SUBNET_NAME" --argjson required "$nat_required" --argjson forbidden "$nat_forbidden" '
+    (if $forbidden then length == 0 else (length == 1 or ($required == false and length == 0)) end) and
     all(.name == $name and .natIpAllocateOption == "AUTO_ONLY" and
         .sourceSubnetworkIpRangesToNat == "LIST_OF_SUBNETWORKS" and
         (.subnetworks|length) == 1 and (.subnetworks[0].name|endswith("/"+$subnet)) and
         (.subnetworks[0].sourceIpRangesToNat == ["ALL_IP_RANGES"]))
   ' "$nat_file" >/dev/null || die "Cloud NAT ownership or semantics mismatch"
   jq -e --arg network "$NETWORK_NAME" --arg internal "releem-ic-internal-${RUN_LABEL}" --arg iap "releem-ic-iap-ssh-${RUN_LABEL}" \
-    --arg internal_tag "$INTERNAL_TAG" --arg iap_tag "$IAP_SSH_TAG" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$required" '
+    --arg internal_tag "$INTERNAL_TAG" --arg iap_tag "$IAP_SSH_TAG" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$firewall_required" '
     ((($required == true) and length == 2) or (($required == false) and length <= 2)) and
     all(.description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and .direction == "INGRESS" and
         (.priority // 1000) == 1000 and (.disabled // false) == false) and
@@ -261,7 +266,7 @@ inventory_network_stack() {
   value="$(gcloud_project compute networks list --filter="name=${NETWORK_NAME}" --format=json)"; normalize_json_array "$value" >"$dir/network.json"
   value="$(gcloud_project compute networks subnets list --filter="name=${SUBNET_NAME}" --format=json)"; normalize_json_array "$value" >"$dir/subnet.json"
   value="$(gcloud_project compute routers list --filter="name=${ROUTER_NAME}" --format=json)"; normalize_json_array "$value" >"$dir/router.json"
-  value="$(gcloud_project compute firewall-rules list --filter="name=(${INTERNAL_FIREWALL_NAME} ${IAP_FIREWALL_NAME})" --format=json)"; normalize_json_array "$value" >"$dir/firewall.json"
+  value="$(gcloud_project compute firewall-rules list --filter="network=${NETWORK_NAME}" --format=json)"; normalize_json_array "$value" >"$dir/firewall.json"
   if jq -e 'length == 1' "$dir/router.json" >/dev/null; then
     [[ -n "$region" ]] || region="$(jq -r '.[0].region|split("/")[-1]' "$dir/router.json")"
     value="$(gcloud_project compute routers nats list --router="$ROUTER_NAME" --region="$region" --format=json)"
@@ -399,42 +404,100 @@ resource_exists() {
   esac
 }
 
+rollback_created_network_stack() {
+  local region="$1" created_network="$2" created_subnet="$3" created_router="$4"
+  local created_internal="$5" created_iap="$6" created_nat="$7"
+  set +e
+  [[ "$created_nat" == true ]] && gcloud_project compute routers nats delete "$NAT_NAME" --router="$ROUTER_NAME" --region="$region" --quiet
+  [[ "$created_iap" == true ]] && gcloud_project compute firewall-rules delete "$IAP_FIREWALL_NAME" --quiet
+  [[ "$created_internal" == true ]] && gcloud_project compute firewall-rules delete "$INTERNAL_FIREWALL_NAME" --quiet
+  [[ "$created_router" == true ]] && gcloud_project compute routers delete "$ROUTER_NAME" --region="$region" --quiet
+  [[ "$created_subnet" == true ]] && gcloud_project compute networks subnets delete "$SUBNET_NAME" --region="$region" --quiet
+  [[ "$created_network" == true ]] && gcloud_project compute networks delete "$NETWORK_NAME" --quiet
+  set -e
+}
+
 create() {
   validate_run_label
   require_api_key
   preflight
   load_state
-  local node
+  local node created_network=false created_subnet=false created_router=false
+  local created_internal=false created_iap=false created_nat=false nat_preexisting=false
   if ! resource_exists networks "$NETWORK_NAME"; then
-    gcloud_project compute networks create "$NETWORK_NAME" --subnet-mode=custom --bgp-routing-mode=regional \
-      --description="$(ownership_description)"
+    if gcloud_project compute networks create "$NETWORK_NAME" --subnet-mode=custom --bgp-routing-mode=regional \
+      --description="$(ownership_description)"; then
+      created_network=true
+    else
+      die "failed to create dedicated network"
+    fi
   fi
   if ! resource_exists subnetworks "$SUBNET_NAME" "$STATE_REGION"; then
-    gcloud_project compute networks subnets create "$SUBNET_NAME" --network="$NETWORK_NAME" --region="$STATE_REGION" \
-      --range="$SUBNET_CIDR" --enable-private-ip-google-access --description="$(ownership_description)"
+    if gcloud_project compute networks subnets create "$SUBNET_NAME" --network="$NETWORK_NAME" --region="$STATE_REGION" \
+      --range="$SUBNET_CIDR" --enable-private-ip-google-access --description="$(ownership_description)"; then
+      created_subnet=true
+    else
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "failed to create dedicated subnet"
+    fi
   fi
   if ! resource_exists routers "$ROUTER_NAME" "$STATE_REGION"; then
-    gcloud_project compute routers create "$ROUTER_NAME" --network="$NETWORK_NAME" --region="$STATE_REGION" \
-      --description="$(ownership_description)"
-  fi
-  if ! resource_exists nats "$NAT_NAME" "$STATE_REGION"; then
-    gcloud_project compute routers nats create "$NAT_NAME" --router="$ROUTER_NAME" --region="$STATE_REGION" \
-      --nat-custom-subnet-ip-ranges="$SUBNET_NAME" --auto-allocate-nat-external-ips
+    if gcloud_project compute routers create "$ROUTER_NAME" --network="$NETWORK_NAME" --region="$STATE_REGION" \
+      --description="$(ownership_description)"; then
+      created_router=true
+    else
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "failed to create Cloud Router"
+    fi
   fi
   if ! resource_exists firewall-rules "$INTERNAL_FIREWALL_NAME"; then
-    gcloud_project compute firewall-rules create "$INTERNAL_FIREWALL_NAME" \
+    if gcloud_project compute firewall-rules create "$INTERNAL_FIREWALL_NAME" \
       --network="$NETWORK_NAME" --direction=INGRESS --action=ALLOW --priority=1000 \
       --rules=tcp:3306,tcp:33060,tcp:33061 \
       --source-ranges="$SUBNET_CIDR" --target-tags="$INTERNAL_TAG" \
-      --description="$(ownership_description)"
+      --description="$(ownership_description)"; then
+      created_internal=true
+    else
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "failed to create internal database firewall rule"
+    fi
   fi
   if ! resource_exists firewall-rules "$IAP_FIREWALL_NAME"; then
-    gcloud_project compute firewall-rules create "$IAP_FIREWALL_NAME" \
+    if gcloud_project compute firewall-rules create "$IAP_FIREWALL_NAME" \
       --network="$NETWORK_NAME" --direction=INGRESS --action=ALLOW --priority=1000 --rules=tcp:22 \
       --source-ranges=35.235.240.0/20 --target-tags="$IAP_SSH_TAG" \
-      --description="$(ownership_description)"
+      --description="$(ownership_description)"; then
+      created_iap=true
+    else
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "failed to create IAP firewall rule"
+    fi
   fi
-  validate_live_network_stack "$STATE_REGION" required
+  if resource_exists nats "$NAT_NAME" "$STATE_REGION"; then
+    nat_preexisting=true
+  fi
+  if [[ "$nat_preexisting" == true ]]; then
+    if ! (validate_live_network_stack "$STATE_REGION" required); then
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "pre-existing network stack failed validation"
+    fi
+  else
+    if ! (validate_live_network_stack "$STATE_REGION" pre-nat); then
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "non-billable network stack failed validation before Cloud NAT"
+    fi
+    if gcloud_project compute routers nats create "$NAT_NAME" --router="$ROUTER_NAME" --region="$STATE_REGION" \
+      --nat-custom-subnet-ip-ranges="$SUBNET_NAME" --auto-allocate-nat-external-ips; then
+      created_nat=true
+    else
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "failed to create Cloud NAT"
+    fi
+    if ! (validate_live_network_stack "$STATE_REGION" required); then
+      rollback_created_network_stack "$STATE_REGION" "$created_network" "$created_subnet" "$created_router" "$created_internal" "$created_iap" "$created_nat"
+      die "network stack failed validation after Cloud NAT creation"
+    fi
+  fi
 
   for node in "${NODES[@]}"; do
     if resource_exists instances "$node" "$STATE_ZONE"; then
@@ -726,6 +789,60 @@ assert_cluster_online() {
   ' <<<"$status" >/dev/null || die "cluster $cluster did not reach its exact ONLINE $expected_mode topology"
 }
 
+assert_cluster_state_for_label() {
+  local status="$1" cluster="$2" mode="$3" label="$4"; shift 4
+  local expected_mode expected_json expected_online=3 expected_rw
+  [[ "$mode" == single ]] && { expected_mode=Single-Primary; expected_rw=1; } || { expected_mode=Multi-Primary; expected_rw=3; }
+  case "$cluster:$label" in
+    releem_single:single-primary-stopped|releem_single:single-secondary-promoted)
+      expected_online=2
+      expected_rw=1
+      ;;
+    releem_multi:multi-writer-offline)
+      expected_online=2
+      expected_rw=2
+      ;;
+    *)
+      assert_cluster_online "$status" "$cluster" "$mode" "$@"
+      return
+      ;;
+  esac
+  expected_json="$(printf '%s\n' "$@" | jq -Rsc 'split("\n")|map(select(length>0))|sort')"
+  jq -e --arg cluster "$cluster" --arg mode "$expected_mode" --argjson expected "$expected_json" \
+    --argjson online "$expected_online" --argjson rw "$expected_rw" '
+    .clusterName == $cluster and .defaultReplicaSet.topologyMode == $mode and
+    ((.defaultReplicaSet.topology|keys|map(sub(":3306$";""))|sort) == $expected) and
+    ([.defaultReplicaSet.topology[]|select(.status == "ONLINE")]|length) == $online and
+    ([.defaultReplicaSet.topology[]|select(.status == "ONLINE" and .mode == "R/W")]|length) == $rw and
+    ([.defaultReplicaSet.topology[]|select(.status != "ONLINE" and
+      (.status == "OFFLINE" or .status == "MISSING" or .status == "(MISSING)" or .status == "UNREACHABLE"))]|length) == (3-$online) and
+    (.defaultReplicaSet.primary as $p | .defaultReplicaSet.topology[$p].status == "ONLINE" and .defaultReplicaSet.topology[$p].mode == "R/W")
+  ' <<<"$status" >/dev/null || die "cluster $cluster has invalid expected transition state for $label"
+}
+
+assert_clusterset_state() {
+  local status="$1" label="$2"
+  jq -e --arg label "$label" '
+    .domainName == "releem_clusterset" and
+    (.primaryCluster == "releem_cs_primary" or .primaryCluster == "releem_cs_replica") and
+    ((.clusters|keys|sort) == ["releem_cs_primary","releem_cs_replica"]) and
+    (.primaryCluster as $primary |
+      (if $primary == "releem_cs_primary" then "releem_cs_replica" else "releem_cs_primary" end) as $replica |
+      .clusters[$primary].clusterRole == "PRIMARY" and
+      .clusters[$replica].clusterRole == "REPLICA" and
+      (.globalPrimaryInstance|startswith(if $primary == "releem_cs_primary" then "releem-ic-cs-primary-" else "releem-ic-cs-replica-" end)) and
+      (if $label == "clusterset-replication-stopped" then
+         .status == "AVAILABLE" and .clusters[$primary].globalStatus == "OK" and
+         .clusters[$replica].globalStatus == "OK_NOT_REPLICATING" and
+         .clusters[$replica].clusterSetReplicationStatus == "STOPPED"
+       else
+         .status == "HEALTHY" and .clusters[$primary].globalStatus == "OK" and
+         .clusters[$replica].globalStatus == "OK" and
+         .clusters[$replica].clusterSetReplicationStatus == "OK"
+       end))
+  ' <<<"$status" >/dev/null || die "ClusterSet has invalid health or role semantics for $label"
+}
+
 ensure_cluster() {
   local cluster="$1" seed="$2" mode="$3" node status member_status
   shift 3
@@ -851,18 +968,33 @@ trigger_collection() {
 }
 
 verify_cluster_state() {
-  local label="$1" out="$EVIDENCE_DIR/$RUN_LABEL/${label}.json"
+  local label="$1" out captured_at single multi cs_primary cs_replica clusterset
+  out="$EVIDENCE_DIR/$RUN_LABEL/${label}.json"
   mkdir -p "$EVIDENCE_DIR/$RUN_LABEL"
-  {
-    printf '{"label":%s,"captured_at":%s,"clusters":[' "$(jq -Rn --arg x "$label" '$x')" "$(jq -Rn --arg x "$(date -u +%FT%TZ)" '$x')"
-    mysqlsh_on_first_available "var c=dba.getCluster('releem_single'); print(JSON.stringify(c.status({extended:1})))" releem-ic-single-1 releem-ic-single-2 releem-ic-single-3
-    printf ','
-    mysqlsh_on_first_available "var c=dba.getCluster('releem_multi'); print(JSON.stringify(c.status({extended:1})))" releem-ic-multi-1 releem-ic-multi-2 releem-ic-multi-3
-    printf ','
-    mysqlsh_on releem-ic-cs-primary-1 "var c=dba.getCluster('releem_cs_primary'); print(JSON.stringify(c.getClusterSet().status({extended:1})))"
-    printf ']}\n'
-  } | sed -n '/^{/,$p' >"$out"
-  jq -e . "$out" >/dev/null || die "invalid MySQL Shell state evidence for $label"
+  single="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_single'); print(JSON.stringify(c.status({extended:1})))" releem-ic-single-1 releem-ic-single-2 releem-ic-single-3 | grep -E '^\{' | tail -n1)"
+  multi="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_multi'); print(JSON.stringify(c.status({extended:1})))" releem-ic-multi-1 releem-ic-multi-2 releem-ic-multi-3 | grep -E '^\{' | tail -n1)"
+  cs_primary="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_cs_primary'); print(JSON.stringify(c.status({extended:1})))" releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3 | grep -E '^\{' | tail -n1)"
+  cs_replica="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_cs_replica'); print(JSON.stringify(c.status({extended:1})))" releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3 | grep -E '^\{' | tail -n1)"
+  clusterset="$(mysqlsh_on_first_available "var c=dba.getCluster(); print(JSON.stringify(c.getClusterSet().status({extended:1})))" releem-ic-cs-primary-1 releem-ic-cs-replica-1 | grep -E '^\{' | tail -n1)"
+
+  assert_cluster_state_for_label "$single" releem_single single "$label" \
+    releem-ic-single-1 releem-ic-single-2 releem-ic-single-3
+  assert_cluster_state_for_label "$multi" releem_multi multi "$label" \
+    releem-ic-multi-1 releem-ic-multi-2 releem-ic-multi-3
+  assert_cluster_online "$cs_primary" releem_cs_primary single \
+    releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3
+  assert_cluster_online "$cs_replica" releem_cs_replica single \
+    releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3
+  assert_clusterset_state "$clusterset" "$label"
+
+  captured_at="$(date -u +%FT%TZ)"
+  jq -n --arg label "$label" --arg captured_at "$captured_at" \
+    --argjson single "$single" --argjson multi "$multi" \
+    --argjson cs_primary "$cs_primary" --argjson cs_replica "$cs_replica" \
+    --argjson clusterset "$clusterset" \
+    '{label:$label,captured_at:$captured_at,clusters:{releem_single:$single,releem_multi:$multi,releem_cs_primary:$cs_primary,releem_cs_replica:$cs_replica},clusterset:$clusterset}' \
+    >"$out"
+  chmod 600 "$out"
 }
 
 require_persistence_env() {
@@ -1029,7 +1161,7 @@ build_clickhouse_observation_query() {
     first=0
   done
   (( first == 0 )) || die "no SID/RID observation correlations supplied"
-  printf '%s\n' "SELECT sid,rid,toUnixTimestamp64Milli(timestamp) AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= toDateTime(intDiv(${marker_ms},1000)) AND timestamp < toDateTime(intDiv(${marker_ms},1000) + ${CLICKHOUSE_MARKER_WINDOW_SECONDS}) AND (${conditions}) ORDER BY sid,timestamp ASC FORMAT JSONEachRow"
+  printf '%s\n' "SELECT sid,rid,toUnixTimestamp64Milli(timestamp) AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= fromUnixTimestamp64Milli(${marker_ms}) AND timestamp < fromUnixTimestamp64Milli(${marker_ms} + ${CLICKHOUSE_MARKER_WINDOW_SECONDS} * 1000) AND (${conditions}) ORDER BY sid,timestamp ASC FORMAT JSONEachRow"
 }
 
 assert_selected_observations() {
@@ -1041,8 +1173,8 @@ assert_selected_observations() {
     (map(.sid)|unique|length)==$expected and
     (map([.sid,.rid])|unique|length)==$expected and
     (map({sid,rid})|sort_by(.sid,.rid)) == $expected_pairs and
-    all(.observed_epoch_ms >= (($marker_ms / 1000 | floor) * 1000) and
-        .observed_epoch_ms < ((($marker_ms / 1000 | floor) + $window) * 1000)) and
+    all(.observed_epoch_ms >= $marker_ms and
+        .observed_epoch_ms < ($marker_ms + ($window * 1000))) and
     all(. as $observation |
       ($observation.relations|fromjson) as $relations |
       ($current | map(select(.sid == $observation.sid))) as $expected_relations |
