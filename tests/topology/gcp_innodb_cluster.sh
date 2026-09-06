@@ -565,14 +565,19 @@ ssh_node() {
 
 ssh_node_with_timeout() {
   local operation_timeout="$1" node="$2"; shift 2
-  timeout "${operation_timeout}s" gcloud --project="$PROJECT" compute ssh "$node" \
-    --zone="$STATE_ZONE" --tunnel-through-iap --quiet -- "$@"
+  CLOUDSDK_CORE_DISABLE_PROMPTS=1 timeout --foreground --kill-after=5s "${operation_timeout}s" \
+    gcloud --project="$PROJECT" compute ssh "$node" --zone="$STATE_ZONE" \
+    --tunnel-through-iap --quiet --ssh-flag=-oBatchMode=yes \
+    --ssh-flag=-oConnectTimeout=10 --ssh-flag=-oServerAliveInterval=5 \
+    --ssh-flag=-oServerAliveCountMax=2 -- "$@"
 }
 
 scp_node() {
   local source="$1" destination="$2"
-  timeout "${SSH_TIMEOUT_SECONDS}s" gcloud --project="$PROJECT" compute scp "$source" "$destination" \
-    --zone="$STATE_ZONE" --tunnel-through-iap --quiet
+  CLOUDSDK_CORE_DISABLE_PROMPTS=1 timeout --foreground --kill-after=5s "${SSH_TIMEOUT_SECONDS}s" \
+    gcloud --project="$PROJECT" compute scp "$source" "$destination" \
+    --zone="$STATE_ZONE" --tunnel-through-iap --quiet \
+    --scp-flag=-oBatchMode=yes --scp-flag=-oConnectTimeout=10
 }
 
 wait_for_ssh() {
@@ -742,9 +747,11 @@ mysqlsh_on() {
 
 mysqlsh_on_with_timeout() {
   local operation_timeout="$1" node="$2" js="$3"
-  mysql_password_lines 24 | timeout "${operation_timeout}s" \
+  mysql_password_lines 24 | CLOUDSDK_CORE_DISABLE_PROMPTS=1 \
+    timeout --foreground --kill-after=5s "${operation_timeout}s" \
     gcloud --project="$PROJECT" compute ssh "$node" --zone="$STATE_ZONE" --tunnel-through-iap --quiet \
-      --ssh-flag="-o ConnectTimeout=${SSH_TIMEOUT_SECONDS}" -- \
+      --ssh-flag=-oBatchMode=yes --ssh-flag=-oConnectTimeout=10 \
+      --ssh-flag=-oServerAliveInterval=5 --ssh-flag=-oServerAliveCountMax=2 -- \
       mysqlsh --js --quiet-start=2 --passwords-from-stdin --uri "${MYSQL_ADMIN_USER}@${node}:3306" --execute "$js"
 }
 
