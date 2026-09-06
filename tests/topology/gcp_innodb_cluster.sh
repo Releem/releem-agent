@@ -7,8 +7,15 @@ readonly PROJECT="static-mediator-400907"
 readonly LABEL_KEY="releem-topology-run"
 readonly MANAGED_LABEL="releem-topology-managed=true"
 readonly RUN_LABEL="${GCP_TOPOLOGY_RUN_LABEL:-}"
+readonly NETWORK_NAME="releem-ic-net-${RUN_LABEL}"
+readonly SUBNET_NAME="releem-ic-subnet-${RUN_LABEL}"
+readonly ROUTER_NAME="releem-ic-router-${RUN_LABEL}"
+readonly NAT_NAME="releem-ic-nat-${RUN_LABEL}"
+readonly SUBNET_CIDR="10.212.0.0/24"
 readonly INTERNAL_TAG="releem-ic-internal-${RUN_LABEL}"
 readonly IAP_SSH_TAG="releem-ic-iap-ssh-${RUN_LABEL}"
+readonly INTERNAL_FIREWALL_NAME="releem-ic-internal-${RUN_LABEL}"
+readonly IAP_FIREWALL_NAME="releem-ic-iap-ssh-${RUN_LABEL}"
 readonly REQUIRED_NODES=12
 readonly DISK_GB_PER_NODE=20
 readonly EVIDENCE_DIR="${GCP_TOPOLOGY_EVIDENCE_DIR:-/tmp/releem-db-topology-evidence/gcp}"
@@ -22,6 +29,11 @@ readonly ADMINAPI_TIMEOUT_SECONDS="${TOPOLOGY_ADMINAPI_TIMEOUT_SECONDS:-180}"
 readonly SWITCHOVER_TIMEOUT_SECONDS="${TOPOLOGY_SWITCHOVER_TIMEOUT_SECONDS:-180}"
 readonly MYSQL_PERSISTENCE_TIMEOUT_SECONDS="${TOPOLOGY_MYSQL_PERSISTENCE_TIMEOUT_SECONDS:-300}"
 readonly CLICKHOUSE_PERSISTENCE_TIMEOUT_SECONDS="${TOPOLOGY_CLICKHOUSE_PERSISTENCE_TIMEOUT_SECONDS:-300}"
+readonly MYSQL_CONNECT_TIMEOUT_SECONDS="${TOPOLOGY_MYSQL_CONNECT_TIMEOUT_SECONDS:-10}"
+readonly MYSQL_QUERY_TIMEOUT_SECONDS="${TOPOLOGY_MYSQL_QUERY_TIMEOUT_SECONDS:-30}"
+readonly CLICKHOUSE_CONNECT_TIMEOUT_SECONDS="${TOPOLOGY_CLICKHOUSE_CONNECT_TIMEOUT_SECONDS:-10}"
+readonly CLICKHOUSE_QUERY_TIMEOUT_SECONDS="${TOPOLOGY_CLICKHOUSE_QUERY_TIMEOUT_SECONDS:-30}"
+readonly CLICKHOUSE_MARKER_WINDOW_SECONDS="${TOPOLOGY_CLICKHOUSE_MARKER_WINDOW_SECONDS:-900}"
 
 readonly -a MACHINE_TYPES=(e2-small e2-medium)
 
@@ -176,7 +188,7 @@ validate_disk_inventory() {
 
 validate_private_instances() {
   local instances="$1" name nat_ip
-  while IFS='|' read -r name _ _ _ _ _ nat_ip; do
+  while IFS='|' read -r name _ _ _ _ _ nat_ip _ _; do
     [[ -n "$name" ]] || continue
     [[ -z "$nat_ip" ]] || die "owned instance $name has a public address"
   done <<<"$instances"
@@ -193,33 +205,117 @@ firewall_records_json() {
     {name:.[0],ownership_marker:.[1]})'
 }
 
+ownership_description() {
+  printf 'owner=%s:%s; managed-by=tests/topology/gcp_innodb_cluster.sh\n' "$LABEL_KEY" "$RUN_LABEL"
+}
+
+normalize_json_array() {
+  local value="$1"
+  [[ -n "$value" ]] || value='[]'
+  jq -e 'type == "array"' <<<"$value" >/dev/null || die "gcloud returned invalid JSON inventory"
+  printf '%s\n' "$value"
+}
+
+validate_network_stack() {
+  local region="$1" network_file="$2" subnet_file="$3" router_file="$4" nat_file="$5" firewall_file="$6" mode="$7"
+  local required=false
+  [[ "$mode" == required ]] && required=true
+  jq -e --arg name "$NETWORK_NAME" --arg owner "$(ownership_description)" --argjson required "$required" '
+    (length == 1 or ($required == false and length == 0)) and
+    all(.name == $name and .description == ($owner|rtrimstr("\n")) and .autoCreateSubnetworks == false and .routingConfig.routingMode == "REGIONAL")
+  ' "$network_file" >/dev/null || die "network ownership or semantics mismatch"
+  jq -e --arg name "$SUBNET_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$required" '
+    (length == 1 or ($required == false and length == 0)) and
+    all(.name == $name and .description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and
+        (.region|endswith("/"+$region)) and .ipCidrRange == $cidr and .privateIpGoogleAccess == true)
+  ' "$subnet_file" >/dev/null || die "subnet ownership or semantics mismatch"
+  jq -e --arg name "$ROUTER_NAME" --arg network "$NETWORK_NAME" --arg region "$region" --arg owner "$(ownership_description)" --argjson required "$required" '
+    (length == 1 or ($required == false and length == 0)) and
+    all(.name == $name and .description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and (.region|endswith("/"+$region)))
+  ' "$router_file" >/dev/null || die "router ownership or semantics mismatch"
+  jq -e --arg name "$NAT_NAME" --arg subnet "$SUBNET_NAME" --argjson required "$required" '
+    (length == 1 or ($required == false and length == 0)) and
+    all(.name == $name and .natIpAllocateOption == "AUTO_ONLY" and
+        .sourceSubnetworkIpRangesToNat == "LIST_OF_SUBNETWORKS" and
+        (.subnetworks|length) == 1 and (.subnetworks[0].name|endswith("/"+$subnet)) and
+        (.subnetworks[0].sourceIpRangesToNat == ["ALL_IP_RANGES"]))
+  ' "$nat_file" >/dev/null || die "Cloud NAT ownership or semantics mismatch"
+  jq -e --arg network "$NETWORK_NAME" --arg internal "releem-ic-internal-${RUN_LABEL}" --arg iap "releem-ic-iap-ssh-${RUN_LABEL}" \
+    --arg internal_tag "$INTERNAL_TAG" --arg iap_tag "$IAP_SSH_TAG" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$required" '
+    ((($required == true) and length == 2) or (($required == false) and length <= 2)) and
+    all(.description == ($owner|rtrimstr("\n")) and (.network|endswith("/"+$network)) and .direction == "INGRESS" and
+        (.priority // 1000) == 1000 and (.disabled // false) == false) and
+    (if length == 0 then true else
+      (map(select(.name == $internal and .sourceRanges == [$cidr] and .targetTags == [$internal_tag] and
+        .allowed == [{"IPProtocol":"tcp","ports":["3306","33060","33061"]}]))|length) == (if $required then 1 else (map(select(.name==$internal))|length) end) and
+      (map(select(.name == $iap and .sourceRanges == ["35.235.240.0/20"] and .targetTags == [$iap_tag] and
+        .allowed == [{"IPProtocol":"tcp","ports":["22"]}]))|length) == (if $required then 1 else (map(select(.name==$iap))|length) end) and
+      (map(.name)|unique|length) == length and all(.name == $internal or .name == $iap)
+     end)
+  ' "$firewall_file" >/dev/null || die "firewall ownership or semantics mismatch"
+}
+
+inventory_network_stack() {
+  local region="$1" dir="$2" value
+  mkdir -p "$dir"
+  value="$(gcloud_project compute networks list --filter="name=${NETWORK_NAME}" --format=json)"; normalize_json_array "$value" >"$dir/network.json"
+  value="$(gcloud_project compute networks subnets list --filter="name=${SUBNET_NAME}" --format=json)"; normalize_json_array "$value" >"$dir/subnet.json"
+  value="$(gcloud_project compute routers list --filter="name=${ROUTER_NAME}" --format=json)"; normalize_json_array "$value" >"$dir/router.json"
+  value="$(gcloud_project compute firewall-rules list --filter="name=(${INTERNAL_FIREWALL_NAME} ${IAP_FIREWALL_NAME})" --format=json)"; normalize_json_array "$value" >"$dir/firewall.json"
+  if jq -e 'length == 1' "$dir/router.json" >/dev/null; then
+    [[ -n "$region" ]] || region="$(jq -r '.[0].region|split("/")[-1]' "$dir/router.json")"
+    value="$(gcloud_project compute routers nats list --router="$ROUTER_NAME" --region="$region" --format=json)"
+  else
+    value='[]'
+  fi
+  normalize_json_array "$value" >"$dir/nat.json"
+}
+
+validate_live_network_stack() {
+  local region="$1" mode="${2:-required}" dir="$EVIDENCE_DIR/$RUN_LABEL/network-stack"
+  inventory_network_stack "$region" "$dir"
+  validate_network_stack "$region" "$dir/network.json" "$dir/subnet.json" "$dir/router.json" "$dir/nat.json" "$dir/firewall.json" "$mode"
+}
+
+validate_instance_inventory() {
+  local records="$1" zone="$2" machine_type="$3" name instance_zone owner managed found_type nat network subnet
+  local types
+  types="$(awk -F'|' 'NF && $6 != "" {print $6}' <<<"$records" | sort -u)"
+  [[ "$(sed '/^$/d' <<<"$types" | wc -l)" -le 1 ]] || die "owned instances use mixed machine types"
+  while IFS='|' read -r name instance_zone _ owner managed found_type nat network subnet; do
+    [[ -n "$name" ]] || continue
+    is_expected_node "$name" || die "unexpected matching instance: $name"
+    [[ "$owner" == "$RUN_LABEL" && "$managed" == true ]] || die "instance ownership mismatch"
+    [[ "$instance_zone" == "$zone" && "$found_type" == "$machine_type" ]] || die "instance zone or machine type mismatch"
+    [[ "$found_type" == "${MACHINE_TYPES[0]}" || "$found_type" == "${MACHINE_TYPES[1]}" ]] || die "unsupported machine type"
+    [[ -z "$nat" ]] || die "owned instance $name has a public address"
+    [[ "$network" == "$NETWORK_NAME" && "$subnet" == "$SUBNET_NAME" ]] || die "instance network attachment mismatch"
+  done <<<"$records"
+}
+
 preflight() {
   validate_run_label
   require_command gcloud
   require_command jq
   local lifecycle zones zone region quotas machine_type machine_info existing_count missing_count candidate_region candidate_zone candidate_machine
-  local instances disks firewalls evidence existing_zones cpu_required disk_required selected=0
+  local instances disks evidence existing_zones cpu_required disk_required selected=0 stack_dir stack_region
 
   lifecycle="$(gcloud_project projects describe "$PROJECT" --format='value(lifecycleState)')"
   [[ "$lifecycle" == "ACTIVE" ]] || die "project $PROJECT is not ACTIVE"
 
   instances="$(gcloud_project compute instances list \
     --filter='name~^releem-ic-(single|multi|cs-primary|cs-replica)-[1-3]$' \
-    --format="csv[no-heading,separator='|'](name,zone.basename(),status,labels.${LABEL_KEY},labels.releem-topology-managed,machineType.basename(),networkInterfaces[0].accessConfigs[0].natIP)")"
+    --format="csv[no-heading,separator='|'](name,zone.basename(),status,labels.${LABEL_KEY},labels.releem-topology-managed,machineType.basename(),networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].network.basename(),networkInterfaces[0].subnetwork.basename())")"
   disks="$(gcloud_project compute disks list \
     --filter='name~^releem-ic-(single|multi|cs-primary|cs-replica)-[1-3]$' \
     --format="csv[no-heading,separator='|'](name,zone.basename(),status,labels.${LABEL_KEY},labels.releem-topology-managed,users)")"
-  firewalls="$(gcloud_project compute firewall-rules list \
-    --filter="name~^releem-ic-(internal|iap-ssh)-${RUN_LABEL}$" \
-    --format="csv[no-heading,separator='|'](name,description)")"
+  stack_dir="$EVIDENCE_DIR/$RUN_LABEL/preflight-network"
+  inventory_network_stack '' "$stack_dir"
+  stack_region="$(jq -r 'if length == 1 then .[0].region|split("/")[-1] else "" end' "$stack_dir/subnet.json")"
 
   assert_owned_or_absent instance "$instances"
   validate_private_instances "$instances"
   validate_disk_inventory "$instances" "$disks"
-  while IFS='|' read -r firewall_name _; do
-    [[ -n "$firewall_name" ]] || continue
-    firewall_owned "$firewalls" "$firewall_name" || die "firewall ownership collision for another run"
-  done <<<"$firewalls"
 
   zones="$(gcloud_project compute zones list --filter='status=UP' --format='value(name,status)')"
   existing_zones="$(cut -d'|' -f2 <<<"$instances" | sed '/^$/d' | sort -u)"
@@ -250,6 +346,7 @@ preflight() {
     while read -r candidate_zone _; do
       [[ -n "$candidate_zone" ]] || continue
       candidate_region="${candidate_zone%-*}"
+      [[ -z "$stack_region" || "$candidate_region" == "$stack_region" ]] || continue
       if ! quotas="$(gcloud_project compute regions describe "$candidate_region" --format=json 2>/dev/null)"; then continue; fi
       quota_available "$quotas" CPUS "$cpu_required" || continue
       quota_available "$quotas" DISKS_TOTAL_GB "$disk_required" || continue
@@ -266,6 +363,9 @@ preflight() {
     (( selected )) || die "no UP zone has a quota-supported machine type and $disk_required GB disk quota"
   fi
 
+  validate_network_stack "$region" "$stack_dir/network.json" "$stack_dir/subnet.json" "$stack_dir/router.json" "$stack_dir/nat.json" "$stack_dir/firewall.json" optional
+  validate_instance_inventory "$instances" "$zone" "$machine_type"
+
   write_state "$zone" "$region" "$machine_type"
   evidence="$EVIDENCE_DIR/$RUN_LABEL/preflight.json"
   jq -n \
@@ -274,25 +374,29 @@ preflight() {
     --argjson expected_nodes "$REQUIRED_NODES" \
     --argjson existing_instances "$(printf '%s\n' "$instances" | sed '/^$/d' | wc -l)" \
     --argjson existing_disks "$(printf '%s\n' "$disks" | sed '/^$/d' | wc -l)" \
-    --argjson existing_firewalls "$(printf '%s\n' "$firewalls" | sed '/^$/d' | wc -l)" \
+    --argjson existing_firewalls "$(jq length "$stack_dir/firewall.json")" \
     --argjson cpu_quota "$(quota_json "$quotas" CPUS)" \
     --argjson disk_quota "$(quota_json "$quotas" DISKS_TOTAL_GB)" \
     --argjson instance_inventory "$(resource_records_json <<<"$instances")" \
     --argjson disk_inventory "$(resource_records_json <<<"$disks")" \
-    --argjson firewall_inventory "$(firewall_records_json <<<"$firewalls")" \
-    '{project:$project,run_label:$run_label,zone:$zone,region:$region,machine_type:$machine_type,expected_nodes:$expected_nodes,selected_quota:{CPUS:$cpu_quota,DISKS_TOTAL_GB:$disk_quota},existing:{instances:$existing_instances,disks:$existing_disks,firewalls:$existing_firewalls},inventory:{instances:$instance_inventory,disks:$disk_inventory,firewalls:$firewall_inventory},result:"PASS"}' \
+    --argjson network_inventory "$(jq -s '{networks:.[0],subnets:.[1],routers:.[2],nats:.[3],firewalls:.[4]}' "$stack_dir/network.json" "$stack_dir/subnet.json" "$stack_dir/router.json" "$stack_dir/nat.json" "$stack_dir/firewall.json")" \
+    '{project:$project,run_label:$run_label,zone:$zone,region:$region,machine_type:$machine_type,expected_nodes:$expected_nodes,selected_quota:{CPUS:$cpu_quota,DISKS_TOTAL_GB:$disk_quota},existing:{instances:$existing_instances,disks:$existing_disks,firewalls:$existing_firewalls},inventory:{instances:$instance_inventory,disks:$disk_inventory,network_stack:$network_inventory},result:"PASS"}' \
     >"$evidence"
   chmod 600 "$evidence"
   log "preflight passed: project=$PROJECT zone=$zone machine=$machine_type nodes=$REQUIRED_NODES"
 }
 
 resource_exists() {
-  local kind="$1" name="$2" zone="${3:-}"
-  if [[ -n "$zone" ]]; then
-    gcloud_project compute "$kind" describe "$name" --zone="$zone" >/dev/null 2>&1
-  else
-    gcloud_project compute "$kind" describe "$name" >/dev/null 2>&1
-  fi
+  local kind="$1" name="$2" scope="${3:-}"
+  case "$kind" in
+    instances) gcloud_project compute instances describe "$name" --zone="$scope" >/dev/null 2>&1 ;;
+    networks) gcloud_project compute networks describe "$name" >/dev/null 2>&1 ;;
+    subnetworks) gcloud_project compute networks subnets describe "$name" --region="$scope" >/dev/null 2>&1 ;;
+    routers) gcloud_project compute routers describe "$name" --region="$scope" >/dev/null 2>&1 ;;
+    nats) gcloud_project compute routers nats describe "$name" --router="$ROUTER_NAME" --region="$scope" >/dev/null 2>&1 ;;
+    firewall-rules) gcloud_project compute firewall-rules describe "$name" >/dev/null 2>&1 ;;
+    *) die "unsupported resource kind: $kind" ;;
+  esac
 }
 
 create() {
@@ -300,20 +404,37 @@ create() {
   require_api_key
   preflight
   load_state
-  local internal_firewall="releem-ic-internal-${RUN_LABEL}" iap_firewall="releem-ic-iap-ssh-${RUN_LABEL}" node
-  if ! resource_exists firewall-rules "$internal_firewall"; then
-    gcloud_project compute firewall-rules create "$internal_firewall" \
-      --network=default --direction=INGRESS --action=ALLOW \
+  local node
+  if ! resource_exists networks "$NETWORK_NAME"; then
+    gcloud_project compute networks create "$NETWORK_NAME" --subnet-mode=custom --bgp-routing-mode=regional \
+      --description="$(ownership_description)"
+  fi
+  if ! resource_exists subnetworks "$SUBNET_NAME" "$STATE_REGION"; then
+    gcloud_project compute networks subnets create "$SUBNET_NAME" --network="$NETWORK_NAME" --region="$STATE_REGION" \
+      --range="$SUBNET_CIDR" --enable-private-ip-google-access --description="$(ownership_description)"
+  fi
+  if ! resource_exists routers "$ROUTER_NAME" "$STATE_REGION"; then
+    gcloud_project compute routers create "$ROUTER_NAME" --network="$NETWORK_NAME" --region="$STATE_REGION" \
+      --description="$(ownership_description)"
+  fi
+  if ! resource_exists nats "$NAT_NAME" "$STATE_REGION"; then
+    gcloud_project compute routers nats create "$NAT_NAME" --router="$ROUTER_NAME" --region="$STATE_REGION" \
+      --nat-custom-subnet-ip-ranges="$SUBNET_NAME" --auto-allocate-nat-external-ips
+  fi
+  if ! resource_exists firewall-rules "$INTERNAL_FIREWALL_NAME"; then
+    gcloud_project compute firewall-rules create "$INTERNAL_FIREWALL_NAME" \
+      --network="$NETWORK_NAME" --direction=INGRESS --action=ALLOW --priority=1000 \
       --rules=tcp:3306,tcp:33060,tcp:33061 \
-      --source-tags="$INTERNAL_TAG" --target-tags="$INTERNAL_TAG" \
-      --description="owner=${LABEL_KEY}:${RUN_LABEL}; managed-by=tests/topology/gcp_innodb_cluster.sh"
+      --source-ranges="$SUBNET_CIDR" --target-tags="$INTERNAL_TAG" \
+      --description="$(ownership_description)"
   fi
-  if ! resource_exists firewall-rules "$iap_firewall"; then
-    gcloud_project compute firewall-rules create "$iap_firewall" \
-      --network=default --direction=INGRESS --action=ALLOW --rules=tcp:22 \
+  if ! resource_exists firewall-rules "$IAP_FIREWALL_NAME"; then
+    gcloud_project compute firewall-rules create "$IAP_FIREWALL_NAME" \
+      --network="$NETWORK_NAME" --direction=INGRESS --action=ALLOW --priority=1000 --rules=tcp:22 \
       --source-ranges=35.235.240.0/20 --target-tags="$IAP_SSH_TAG" \
-      --description="owner=${LABEL_KEY}:${RUN_LABEL}; managed-by=tests/topology/gcp_innodb_cluster.sh"
+      --description="$(ownership_description)"
   fi
+  validate_live_network_stack "$STATE_REGION" required
 
   for node in "${NODES[@]}"; do
     if resource_exists instances "$node" "$STATE_ZONE"; then
@@ -324,7 +445,7 @@ create() {
       --zone="$STATE_ZONE" --machine-type="$STATE_MACHINE_TYPE" \
       --image-family=ubuntu-2204-lts --image-project=ubuntu-os-cloud \
       --boot-disk-size=20GB --boot-disk-type=pd-standard \
-      --no-address --labels="${LABEL_KEY}=${RUN_LABEL},${MANAGED_LABEL}" \
+      --subnet="$SUBNET_NAME" --no-address --labels="${LABEL_KEY}=${RUN_LABEL},${MANAGED_LABEL}" \
       --tags="$INTERNAL_TAG,$IAP_SSH_TAG" \
       --format='value(name,status)'
     gcloud_project compute disks add-labels "$node" --zone="$STATE_ZONE" \
@@ -478,9 +599,9 @@ SQL
 fi
 
 sudo ufw allow OpenSSH >/dev/null
-sudo ufw allow from 10.0.0.0/8 to any port 3306 proto tcp >/dev/null
-sudo ufw allow from 10.0.0.0/8 to any port 33060 proto tcp >/dev/null
-sudo ufw allow from 10.0.0.0/8 to any port 33061 proto tcp >/dev/null
+sudo ufw allow from 10.212.0.0/24 to any port 3306 proto tcp >/dev/null
+sudo ufw allow from 10.212.0.0/24 to any port 33060 proto tcp >/dev/null
+sudo ufw allow from 10.212.0.0/24 to any port 33061 proto tcp >/dev/null
 sudo ufw --force enable >/dev/null
 
 mysql_version=$(mysql --version)
@@ -552,11 +673,11 @@ adminapi_cluster_exists() {
   mysqlsh_on "$seed" "try { dba.getCluster('${cluster}'); } catch (e) { shell.exit(1); }" >/dev/null 2>&1
 }
 
-adminapi_cluster_members() {
+adminapi_cluster_status() {
   local cluster="$1" seed
   seed="$(cluster_seed "$cluster")"
-  mysqlsh_on "$seed" "var t=dba.getCluster('${cluster}').status().defaultReplicaSet.topology; Object.keys(t).sort().forEach(function(x){print(x.replace(/:3306$/,''));});" |
-    grep -E '^releem-ic-' || true
+  mysqlsh_on "$seed" "print(JSON.stringify(dba.getCluster('${cluster}').status({extended:1})));" |
+    grep -E '^\{' | tail -n1
 }
 
 adminapi_create_cluster() {
@@ -571,16 +692,60 @@ adminapi_add_instance() {
   mysqlsh_on "$seed" "var c=dba.getCluster('${cluster}'); c.addInstance('${MYSQL_ADMIN_USER}@${node}:3306',{recoveryMethod:'clone'}); print(JSON.stringify(c.status({extended:1})));" >/dev/null
 }
 
+adminapi_rejoin_instance() {
+  local cluster="$1" node="$2" seed
+  seed="$(cluster_seed "$cluster")"
+  mysqlsh_on "$seed" "var c=dba.getCluster('${cluster}'); c.rejoinInstance('${MYSQL_ADMIN_USER}@${node}:3306',{recoveryMethod:'incremental'});" >/dev/null
+}
+
+assert_cluster_compatible() {
+  local status="$1" cluster="$2" mode="$3"; shift 3
+  local expected_mode expected_json
+  [[ "$mode" == single ]] && expected_mode=Single-Primary || expected_mode=Multi-Primary
+  expected_json="$(printf '%s\n' "$@" | jq -Rsc 'split("\n")|map(select(length>0))|sort')"
+  jq -e --arg cluster "$cluster" --arg mode "$expected_mode" --argjson expected "$expected_json" '
+    .clusterName == $cluster and .defaultReplicaSet.topologyMode == $mode and
+    ((.defaultReplicaSet.topology|keys|map(sub(":3306$";"")) - $expected)|length == 0)
+  ' <<<"$status" >/dev/null || die "cluster $cluster has incompatible mode or member metadata"
+}
+
+assert_cluster_online() {
+  local status="$1" cluster="$2" mode="$3"; shift 3
+  local expected_mode expected_json
+  [[ "$mode" == single ]] && expected_mode=Single-Primary || expected_mode=Multi-Primary
+  expected_json="$(printf '%s\n' "$@" | jq -Rsc 'split("\n")|map(select(length>0))|sort')"
+  jq -e --arg cluster "$cluster" --arg mode "$expected_mode" --argjson expected "$expected_json" '
+    .clusterName == $cluster and .defaultReplicaSet.topologyMode == $mode and
+    ((.defaultReplicaSet.topology|keys|map(sub(":3306$";""))|sort) == $expected) and
+    (.defaultReplicaSet.topology|to_entries|all(.value.status == "ONLINE")) and
+    (if $mode == "Single-Primary" then
+       ([.defaultReplicaSet.topology[]|select(.mode == "R/W")]|length) == 1 and
+       ([.defaultReplicaSet.topology[]|select(.mode == "R/O")]|length) == 2 and
+       (.defaultReplicaSet.primary as $p | .defaultReplicaSet.topology[$p].mode == "R/W")
+     else [.defaultReplicaSet.topology[].mode]|all(. == "R/W") end)
+  ' <<<"$status" >/dev/null || die "cluster $cluster did not reach its exact ONLINE $expected_mode topology"
+}
+
 ensure_cluster() {
-  local cluster="$1" seed="$2" mode="$3" node existing
+  local cluster="$1" seed="$2" mode="$3" node status member_status
   shift 3
   if ! adminapi_cluster_exists "$cluster" "$seed"; then
     adminapi_create_cluster "$cluster" "$seed" "$mode"
   fi
-  existing="$(adminapi_cluster_members "$cluster")"
+  status="$(adminapi_cluster_status "$cluster")"
+  [[ -n "$status" ]] || die "missing AdminAPI status for $cluster"
+  assert_cluster_compatible "$status" "$cluster" "$mode" "$@"
   for node in "$@"; do
-    grep -Fxq "$node" <<<"$existing" || adminapi_add_instance "$cluster" "$node"
+    member_status="$(jq -r --arg node "${node}:3306" '.defaultReplicaSet.topology[$node].status // "ABSENT"' <<<"$status")"
+    case "$member_status" in
+      ABSENT) adminapi_add_instance "$cluster" "$node" ;;
+      ONLINE) ;;
+      OFFLINE|MISSING|'(MISSING)'|UNREACHABLE) adminapi_rejoin_instance "$cluster" "$node" ;;
+      *) die "cluster $cluster member $node has unsafe AdminAPI state $member_status" ;;
+    esac
   done
+  status="$(adminapi_cluster_status "$cluster")"
+  assert_cluster_online "$status" "$cluster" "$mode" "$@"
 }
 
 adminapi_clusterset_exists() {
@@ -632,6 +797,7 @@ configure() {
   require_command sha256sum
   preflight
   load_state
+  validate_live_network_stack "$STATE_REGION" required
   require_running_inventory
 
   local binary=/tmp/releem-agent-db-topology-x86_64 checksum hosts='' node ip index=0
@@ -640,7 +806,7 @@ configure() {
   checksum="$(sha256sum "$binary" | awk '{print $1}')"
   for node in "${NODES[@]}"; do
     ip="$(private_ip "$node")"
-    [[ "$ip" =~ ^10\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "unexpected private address for $node"
+    [[ "$ip" =~ ^10\.212\.0\.[0-9]+$ ]] || die "unexpected dedicated-subnet address for $node"
     hosts+="$ip $node"$'\n'
   done
 
@@ -722,8 +888,10 @@ tenant_predicate() {
 }
 
 platform_mysql() {
-  local query="$1"
-  MYSQL_PWD="$TOPOLOGY_MYSQL_PASSWORD" mysql --batch --raw --skip-column-names \
+  local query="$1" MYSQL_PWD="$TOPOLOGY_MYSQL_PASSWORD"
+  export MYSQL_PWD
+  timeout "${MYSQL_QUERY_TIMEOUT_SECONDS}s" mysql --batch --raw --skip-column-names \
+    --connect-timeout="$MYSQL_CONNECT_TIMEOUT_SECONDS" \
     --host="$TOPOLOGY_MYSQL_HOST" --port="${TOPOLOGY_MYSQL_PORT:-3306}" \
     --user="$TOPOLOGY_MYSQL_USER" "${TOPOLOGY_MYSQL_DATABASE:-releemdb}" --execute "$query"
 }
@@ -731,7 +899,8 @@ platform_mysql() {
 platform_clickhouse() {
   local query="$1"
   printf 'user = "%s:%s"\n' "$TOPOLOGY_CLICKHOUSE_USER" "$TOPOLOGY_CLICKHOUSE_PASSWORD" |
-    curl --config - --fail --silent --show-error --data-binary "$query" \
+    timeout "$((CLICKHOUSE_QUERY_TIMEOUT_SECONDS + 5))s" curl --config - --fail --silent --show-error \
+      --connect-timeout "$CLICKHOUSE_CONNECT_TIMEOUT_SECONDS" --max-time "$CLICKHOUSE_QUERY_TIMEOUT_SECONDS" --data-binary "$query" \
       "${TOPOLOGY_CLICKHOUSE_SCHEME:-http}://${TOPOLOGY_CLICKHOUSE_HOST}:${TOPOLOGY_CLICKHOUSE_PORT:-8123}/?database=${TOPOLOGY_CLICKHOUSE_DATABASE:-releemdb_dev}"
 }
 
@@ -860,37 +1029,46 @@ build_clickhouse_observation_query() {
     first=0
   done
   (( first == 0 )) || die "no SID/RID observation correlations supplied"
-  printf '%s\n' "SELECT sid,rid,toUnixTimestamp64Milli(timestamp) AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= toDateTime(intDiv(${marker_ms},1000)) AND (${conditions}) ORDER BY sid,timestamp ASC LIMIT 1 BY sid FORMAT JSONEachRow"
+  printf '%s\n' "SELECT sid,rid,toUnixTimestamp64Milli(timestamp) AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= toDateTime(intDiv(${marker_ms},1000)) AND timestamp < toDateTime(intDiv(${marker_ms},1000) + ${CLICKHOUSE_MARKER_WINDOW_SECONDS}) AND (${conditions}) ORDER BY sid,timestamp ASC FORMAT JSONEachRow"
 }
 
 assert_selected_observations() {
   local file="$1" expected="$2" pairs_csv="$3" marker_ms="$4" current_file="$5"
-  jq -s -e --slurpfile current "$current_file" --argjson expected "$expected" --arg pairs "$pairs_csv" --argjson marker_ms "$marker_ms" '
+  jq -s -e --slurpfile current "$current_file" --argjson expected "$expected" --arg pairs "$pairs_csv" \
+    --argjson marker_ms "$marker_ms" --argjson window "$CLICKHOUSE_MARKER_WINDOW_SECONDS" '
     ($pairs | split(",") | map(split(":") | {sid:(.[0]|tonumber),rid:.[1]}) | sort_by(.sid,.rid)) as $expected_pairs |
     length == $expected and
     (map(.sid)|unique|length)==$expected and
     (map([.sid,.rid])|unique|length)==$expected and
     (map({sid,rid})|sort_by(.sid,.rid)) == $expected_pairs and
-    all(.observed_epoch_ms >= (($marker_ms / 1000 | floor) * 1000)) and
+    all(.observed_epoch_ms >= (($marker_ms / 1000 | floor) * 1000) and
+        .observed_epoch_ms < ((($marker_ms / 1000 | floor) + $window) * 1000)) and
     all(. as $observation |
       ($observation.relations|fromjson) as $relations |
       ($current | map(select(.sid == $observation.sid))) as $expected_relations |
       ($relations|type)=="array" and ($relations|length)>0 and
       (($relations|map([.Type,.GroupKey])|unique|length)==($relations|length)) and
       ($expected_relations|length)>0 and
-      ($expected_relations | all(. as $relation |
-        $relations | any(
-          .Type == $relation.relation_type and
-          .GroupKey == $relation.group_key and
-          .MemberKey == $relation.member_key and
-          .ParentGroupKey == $relation.parent_group_key and
-          .Role == $relation.role and
-          .IsWriter == ($relation.is_writer == 1) and
-          .ReplicationState == $relation.replication_state
-        )
-      ))
+      (($relations | map({relation_type:.Type,group_key:.GroupKey,member_key:.MemberKey,parent_group_key:.ParentGroupKey,role:.Role,is_writer:(if .IsWriter then 1 else 0 end),replication_state:.ReplicationState}) | sort_by(.relation_type,.group_key)) ==
+       ($expected_relations | map({relation_type,group_key,member_key,parent_group_key,role,is_writer,replication_state}) | sort_by(.relation_type,.group_key)))
     )
   ' "$file" >/dev/null || die "selected observations are missing, duplicated, or relation-invalid"
+}
+
+poll_clickhouse_observations() {
+  local marker_ms="$1" pairs_csv="$2" expected="$3" current_file="$4" output_file="$5"
+  local query deadline now
+  query="$(build_clickhouse_observation_query "$marker_ms" "$pairs_csv")"
+  deadline=$(( $(date +%s) + CLICKHOUSE_PERSISTENCE_TIMEOUT_SECONDS ))
+  while :; do
+    platform_clickhouse "$query" >"$output_file"
+    if [[ -s "$output_file" ]] &&
+      (assert_selected_observations "$output_file" "$expected" "$pairs_csv" "$marker_ms" "$current_file" 2>/dev/null); then
+      return 0
+    fi
+    now="$(date +%s)"; (( now < deadline )) || die "ClickHouse persistence timeout"
+    sleep 10
+  done
 }
 
 current_sid_rid_pairs() {
@@ -913,8 +1091,8 @@ collect() {
   require_command jq
   load_state
   require_running_inventory
-  local mark="${1:-$(marker manual-collect)}" marker_ms evidence_dir mysql_deadline clickhouse_deadline now hostnames sids
-  local pairs_csv observation_query expectation
+  local mark="${1:-$(marker manual-collect)}" marker_ms evidence_dir mysql_deadline now hostnames sids
+  local pairs_csv expectation
   marker_ms="$(marker_epoch_ms "$mark")"
   hostnames="$(node_sql_list)"
   evidence_dir="$EVIDENCE_DIR/$RUN_LABEL/persistence/$mark"
@@ -943,16 +1121,8 @@ collect() {
   [[ "$sids" =~ ^[0-9]+(,[0-9]+){11}$ ]] || die "expected exactly 12 SIDs"
   pairs_csv="$(current_sid_rid_pairs "$evidence_dir/mysql-current.jsonl" "$REQUIRED_NODES")"
   [[ "$(tr ',' '\n' <<<"$pairs_csv" | wc -l)" -eq "$REQUIRED_NODES" ]] || die "expected one current RID for each SID"
-  observation_query="$(build_clickhouse_observation_query "$marker_ms" "$pairs_csv")"
-  clickhouse_deadline=$(( $(date +%s) + CLICKHOUSE_PERSISTENCE_TIMEOUT_SECONDS ))
-  while :; do
-    platform_clickhouse "$observation_query" >"$evidence_dir/clickhouse-observations.jsonl"
-    if [[ -s "$evidence_dir/clickhouse-observations.jsonl" ]] && assert_selected_observations "$evidence_dir/clickhouse-observations.jsonl" "$REQUIRED_NODES" "$pairs_csv" "$marker_ms" "$evidence_dir/mysql-current.jsonl"; then
-      break
-    fi
-    now="$(date +%s)"; (( now < clickhouse_deadline )) || die "ClickHouse persistence timeout for marker $mark"
-    sleep 10
-  done
+  poll_clickhouse_observations "$marker_ms" "$pairs_csv" "$REQUIRED_NODES" \
+    "$evidence_dir/mysql-current.jsonl" "$evidence_dir/clickhouse-observations.jsonl"
   awk -F'\t' 'NR>1 && $1<p {exit 1} {p=$1}' "$EVIDENCE_DIR/$RUN_LABEL/transitions/markers.tsv" 2>/dev/null ||
     die "transition markers are not monotonic"
   jq -n --arg marker "$mark" --argjson marker_epoch_ms "$marker_ms" --arg sids "$sids" \
@@ -1139,7 +1309,7 @@ destroy() {
   validate_run_label
   [[ "${GCP_TOPOLOGY_CONFIRM_DESTROY:-}" == "$RUN_LABEL" ]] ||
     die "GCP_TOPOLOGY_CONFIRM_DESTROY must equal the exact run label"
-  local records disks firewalls name zone status owner managed users firewall_name description
+  local records disks name zone status owner managed users stack_dir region firewall_name
   records="$(gcloud_project compute instances list \
     --filter="labels.${LABEL_KEY}=${RUN_LABEL} AND labels.releem-topology-managed=true" \
     --format="csv[no-heading,separator='|'](name,zone.basename(),labels.${LABEL_KEY},labels.releem-topology-managed)")"
@@ -1161,18 +1331,28 @@ destroy() {
     gcloud_project compute disks delete "$name" --zone="$zone" --quiet
   done <<<"$disks"
 
-  firewalls="$(gcloud_project compute firewall-rules list \
-    --filter="name~^releem-ic-(internal|iap-ssh)-${RUN_LABEL}$" \
-    --format="csv[no-heading,separator='|'](name,description)")"
-  while IFS='|' read -r firewall_name description; do
-    [[ -n "$firewall_name" ]] || continue
-    case "$firewall_name" in
-      "releem-ic-internal-${RUN_LABEL}"|"releem-ic-iap-ssh-${RUN_LABEL}") ;;
-      *) die "refusing unexpected firewall delete: $firewall_name" ;;
-    esac
-    [[ "$description" == *"owner=${LABEL_KEY}:${RUN_LABEL}"* ]] || die "refusing unowned firewall delete"
-    gcloud_project compute firewall-rules delete "$firewall_name" --quiet
-  done <<<"$firewalls"
+  stack_dir="$EVIDENCE_DIR/$RUN_LABEL/destroy-network"
+  inventory_network_stack '' "$stack_dir"
+  region="$(jq -r '[.[0].region // empty][0] // "" | split("/")[-1]' "$stack_dir/subnet.json")"
+  [[ -n "$region" ]] || region="$(jq -r '[.[0].region // empty][0] // "" | split("/")[-1]' "$stack_dir/router.json")"
+  [[ -n "$region" ]] || region=unused
+  validate_network_stack "$region" "$stack_dir/network.json" "$stack_dir/subnet.json" "$stack_dir/router.json" "$stack_dir/nat.json" "$stack_dir/firewall.json" optional
+
+  if jq -e 'length == 1' "$stack_dir/nat.json" >/dev/null; then
+    gcloud_project compute routers nats delete "$NAT_NAME" --router="$ROUTER_NAME" --region="$region" --quiet
+  fi
+  if jq -e 'length == 1' "$stack_dir/router.json" >/dev/null; then
+    gcloud_project compute routers delete "$ROUTER_NAME" --region="$region" --quiet
+  fi
+  while IFS= read -r firewall_name; do
+    [[ -n "$firewall_name" ]] && gcloud_project compute firewall-rules delete "$firewall_name" --quiet
+  done < <(jq -r '.[].name' "$stack_dir/firewall.json")
+  if jq -e 'length == 1' "$stack_dir/subnet.json" >/dev/null; then
+    gcloud_project compute networks subnets delete "$SUBNET_NAME" --region="$region" --quiet
+  fi
+  if jq -e 'length == 1' "$stack_dir/network.json" >/dev/null; then
+    gcloud_project compute networks delete "$NETWORK_NAME" --quiet
+  fi
 }
 
 main() {

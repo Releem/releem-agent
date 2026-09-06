@@ -17,13 +17,20 @@ normal unit and installation test suites.
 | `releem-ic-cs-replica-1..3` | 3 | ClusterSet replica cluster |
 
 The harness is resumable. `preflight` is always read-only and must pass before
-`create` performs a mutation. Existing matching instances, disks, or firewall
-rules are rejected unless their ownership marker matches the current run.
-Instances and disks use GCP labels. Compute firewall rules do not support GCP
-labels, so the two run-specific rules use an ownership string in `description`
-and are checked with the same fail-closed collision semantics. Instances have
-no external address. Operator SSH and scp always use IAP; the only ingress is
-IAP TCP/22 and tagged internal TCP/3306, TCP/33060, and TCP/33061.
+`create` performs a mutation. Each run owns a deterministic custom-mode VPC,
+`10.212.0.0/24` regional subnet, Cloud Router, Cloud NAT, and two firewall
+rules. Network, subnet, router, and firewall ownership uses an exact run marker
+in `description`; the NAT is accepted only as the exact child configuration of
+the owned router. Existing or partial resources fail closed unless every
+available resource has the expected ownership and semantics.
+
+Instances and disks use GCP labels. Resumed instances must all use one
+supported machine type, the selected zone, and the exact run subnet and
+network. They have no external address. Cloud NAT supplies private outbound
+access for package and installer downloads. Operator SSH and scp always use
+IAP. The only cloud ingress is IAP TCP/22 and subnet-sourced TCP/3306,
+TCP/33060, and TCP/33061 to the run tags; guest UFW restricts the database ports
+to `10.212.0.0/24` as well.
 
 ### Runtime secrets
 
@@ -100,9 +107,17 @@ twelve services must be active and have the local build checksum. The build uses
 `-buildvcs=false` because Go 1.26 can resolve linked-worktree VCS stamping to the
 non-repository parent directory; this changes build metadata only.
 
+`configure` inspects AdminAPI metadata, topology mode, member status, and
+read/write mode. It adds absent members, attempts bounded rejoin for supported
+OFFLINE/MISSING states, rejects incompatible or unsafe states, and requires the
+exact ONLINE member set and single-primary or multi-primary semantics before
+continuing.
+
 `exercise` records UTC transition markers, restarts each Agent for immediate
-collection, waits for current-state persistence, and verifies a post-marker
-ClickHouse observation for every exact tenant-scoped SID and current RID.
+collection, waits for current-state persistence, and queries every matching
+ClickHouse row for the exact tenant-scoped SID/current-RID pairs in a bounded
+post-marker window. Validation rejects missing, duplicate, extra, late, or
+relation-mismatched observations; there is no `LIMIT 1 BY sid` selection.
 Sanitized MySQL/JSON evidence is
 stored under `/tmp/releem-db-topology-evidence/gcp/` with mode `0600` defaults.
 Addresses and credentials are excluded from the evidence and inventory output.
@@ -112,7 +127,12 @@ Independent deadlines can be adjusted with
 `TOPOLOGY_BOOTSTRAP_TIMEOUT_SECONDS`, `TOPOLOGY_ADMINAPI_TIMEOUT_SECONDS`,
 `TOPOLOGY_SWITCHOVER_TIMEOUT_SECONDS`,
 `TOPOLOGY_MYSQL_PERSISTENCE_TIMEOUT_SECONDS`, and
-`TOPOLOGY_CLICKHOUSE_PERSISTENCE_TIMEOUT_SECONDS`.
+`TOPOLOGY_CLICKHOUSE_PERSISTENCE_TIMEOUT_SECONDS`. Individual Platform calls
+are also bounded by `TOPOLOGY_MYSQL_CONNECT_TIMEOUT_SECONDS`,
+`TOPOLOGY_MYSQL_QUERY_TIMEOUT_SECONDS`,
+`TOPOLOGY_CLICKHOUSE_CONNECT_TIMEOUT_SECONDS`, and
+`TOPOLOGY_CLICKHOUSE_QUERY_TIMEOUT_SECONDS`. The ClickHouse marker window is
+controlled by `TOPOLOGY_CLICKHOUSE_MARKER_WINDOW_SECONDS`.
 
 The VMs are intentionally left running after validation. Teardown is available
 for a later explicit request and is bounded by both ownership checks and a
@@ -124,3 +144,7 @@ tests/topology/gcp_innodb_cluster.sh destroy
 ```
 
 Never run `destroy` as routine test cleanup.
+
+After exact ownership and semantic validation, `destroy` removes instances,
+owned detached disks, NAT, router, firewall rules, subnet, and network in
+dependency order. It does not run quota, zone, or machine-type selection.
