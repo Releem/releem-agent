@@ -247,6 +247,19 @@ validate_network_stack() {
   ' "$nat_file" >/dev/null || die "Cloud NAT ownership or semantics mismatch"
   jq -e --arg network "$NETWORK_NAME" --arg internal "releem-ic-internal-${RUN_LABEL}" --arg iap "releem-ic-iap-ssh-${RUN_LABEL}" \
     --arg internal_tag "$INTERNAL_TAG" --arg iap_tag "$IAP_SSH_TAG" --arg cidr "$SUBNET_CIDR" --arg owner "$(ownership_description)" --argjson required "$firewall_required" '
+    def has_exact_tcp_ports($expected):
+      (.allowed | type) == "array" and
+      (.allowed | length) > 0 and
+      all(.allowed[];
+        type == "object" and
+        (keys | sort) == ["IPProtocol", "ports"] and
+        .IPProtocol == "tcp" and
+        (.ports | type) == "array" and
+        (.ports | length) > 0 and
+        all(.ports[]; type == "string" and test("^[0-9]+$"))) and
+      ([.allowed[].ports[]] as $ports |
+        ($ports | length) == ($ports | unique | length) and
+        ($ports | sort) == ($expected | sort));
     def has_no_extra_selectors:
       ((.sourceTags // []) == []) and
       ((.sourceServiceAccounts // []) == []) and
@@ -261,9 +274,9 @@ validate_network_stack() {
         (.priority // 1000) == 1000 and (.disabled // false) == false and has_no_extra_selectors) and
     (if length == 0 then true else
       (map(select(.name == $internal and .sourceRanges == [$cidr] and .targetTags == [$internal_tag] and
-        .allowed == [{"IPProtocol":"tcp","ports":["3306","33060","33061"]}]))|length) == (if $required then 1 else (map(select(.name==$internal))|length) end) and
+        has_exact_tcp_ports(["3306", "33060", "33061"])))|length) == (if $required then 1 else (map(select(.name==$internal))|length) end) and
       (map(select(.name == $iap and .sourceRanges == ["35.235.240.0/20"] and .targetTags == [$iap_tag] and
-        .allowed == [{"IPProtocol":"tcp","ports":["22"]}]))|length) == (if $required then 1 else (map(select(.name==$iap))|length) end) and
+        has_exact_tcp_ports(["22"])))|length) == (if $required then 1 else (map(select(.name==$iap))|length) end) and
       (map(.name)|unique|length) == length and all(.name == $internal or .name == $iap)
      end)
   ' "$firewall_file" >/dev/null || die "firewall ownership or semantics mismatch"

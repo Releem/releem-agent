@@ -26,7 +26,11 @@ available resource has the expected ownership and semantics. Firewall
 inventory covers every rule attached to the dedicated VPC and rejects anything
 other than the exact internal and IAP rules. Both rules must have no source
 tags, source service accounts, target service accounts, or other additive
-source/target selectors.
+source/target selectors. Firewall `allowed` objects are normalized by protocol
+and port set because GCP may split one requested port list across multiple
+objects or reorder it. Validation still requires only TCP/22 for IAP and only
+TCP/3306, TCP/33060, and TCP/33061 internally; duplicate ports, ranges,
+all-port entries, extra protocols, and malformed allowed objects fail closed.
 
 Instances and disks use GCP labels. Resumed instances must all use one
 supported machine type, the selected zone, and the exact run subnet and
