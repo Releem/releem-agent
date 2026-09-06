@@ -20,8 +20,10 @@ The harness is resumable. `preflight` is always read-only and must pass before
 `create` performs a mutation. Existing matching instances, disks, or firewall
 rules are rejected unless their ownership marker matches the current run.
 Instances and disks use GCP labels. Compute firewall rules do not support GCP
-labels, so the one run-specific rule uses an ownership string in `description`
-and is checked with the same fail-closed collision semantics.
+labels, so the two run-specific rules use an ownership string in `description`
+and are checked with the same fail-closed collision semantics. Instances have
+no external address. Operator SSH and scp always use IAP; the only ingress is
+IAP TCP/22 and tagged internal TCP/3306, TCP/33060, and TCP/33061.
 
 ### Runtime secrets
 
@@ -32,29 +34,50 @@ The harness never writes their values. `MYSQL_CLUSTER_PASSWORD` must contain
 non-interactive AdminAPI and SQL boundaries without unsafe quoting.
 
 ```bash
+export GCP_TOPOLOGY_RUN_LABEL=task12-20260906
 read -rsp 'Releem dev API key: ' RELEEM_API_KEY; echo
 export RELEEM_API_KEY
 read -rsp 'Ephemeral cluster admin password: ' MYSQL_CLUSTER_PASSWORD; echo
 export MYSQL_CLUSTER_PASSWORD
-export GCP_TOPOLOGY_RUN_LABEL="task12-$(date -u +%Y%m%d)"
 ```
 
-Persistence checks also need runtime-only dev database credentials:
+Fresh installation receives the API key only through the process environment,
+along with `RELEEM_ENV=dev`, `RELEEM_DB_MEMORY_LIMIT=0`,
+`RELEEM_CRON_ENABLE=1`, `RELEEM_QUERY_OPTIMIZATION=true`, and the required
+noninteractive local MySQL values. Harness state and evidence never contain
+secret values. The installer still creates its normal protected Agent
+configuration on each target VM.
+
+Persistence checks require one exact positive numeric tenant UID. For the dev
+Platform environment, load credentials without shell tracing and map the
+existing variables directly:
 
 ```bash
-export TOPOLOGY_MYSQL_HOST=...
-export TOPOLOGY_MYSQL_PORT=3306
-export TOPOLOGY_MYSQL_USER=...
-read -rsp 'Dev MySQL password: ' TOPOLOGY_MYSQL_PASSWORD; echo
-export TOPOLOGY_MYSQL_PASSWORD
-export TOPOLOGY_MYSQL_DATABASE=releemdb_dev
+set +x
+source /home/dkochetov/Документы/laptop/releem/Releem_Platform/.env
 
-export TOPOLOGY_CLICKHOUSE_URL='https://...:8443/'
-export TOPOLOGY_CLICKHOUSE_USER=...
-read -rsp 'Dev ClickHouse password: ' TOPOLOGY_CLICKHOUSE_PASSWORD; echo
-export TOPOLOGY_CLICKHOUSE_PASSWORD
-export TOPOLOGY_CLICKHOUSE_DATABASE=releemdb_dev
+export TOPOLOGY_MYSQL_HOST="$DB_HOST_MASTER"
+export TOPOLOGY_MYSQL_USER="$DB_USER"
+export TOPOLOGY_MYSQL_PASSWORD="$DB_PASSWORD"
+export TOPOLOGY_MYSQL_DATABASE="${DB_NAME:-releemdb}"
+export TOPOLOGY_MYSQL_PORT=3306
+
+export TOPOLOGY_CLICKHOUSE_HOST="$CH_HOST"
+export TOPOLOGY_CLICKHOUSE_USER="$CH_USER"
+export TOPOLOGY_CLICKHOUSE_PASSWORD="$CH_PASSWORD"
+export TOPOLOGY_CLICKHOUSE_DATABASE="${CH_NAME:-releemdb_dev}"
+export TOPOLOGY_CLICKHOUSE_SCHEME=http
+export TOPOLOGY_CLICKHOUSE_PORT=8123
+
+read -rp 'Exact dev tenant UID: ' TOPOLOGY_UID
+export TOPOLOGY_UID
+
+[[ "$TOPOLOGY_MYSQL_DATABASE" == releemdb ]]
+[[ "$TOPOLOGY_CLICKHOUSE_DATABASE" == releemdb_dev ]]
 ```
+
+The defaults are MySQL `releemdb` and ClickHouse `releemdb_dev`. The explicit
+checks above fail before cloud work if the loaded environment points elsewhere.
 
 ### Lifecycle
 
@@ -79,9 +102,17 @@ non-repository parent directory; this changes build metadata only.
 
 `exercise` records UTC transition markers, restarts each Agent for immediate
 collection, waits for current-state persistence, and verifies a post-marker
-ClickHouse observation for every exact SID. Sanitized MySQL/JSON evidence is
+ClickHouse observation for every exact tenant-scoped SID and current RID.
+Sanitized MySQL/JSON evidence is
 stored under `/tmp/releem-db-topology-evidence/gcp/` with mode `0600` defaults.
 Addresses and credentials are excluded from the evidence and inventory output.
+
+Independent deadlines can be adjusted with
+`TOPOLOGY_SSH_TIMEOUT_SECONDS`, `TOPOLOGY_SSH_READY_TIMEOUT_SECONDS`,
+`TOPOLOGY_BOOTSTRAP_TIMEOUT_SECONDS`, `TOPOLOGY_ADMINAPI_TIMEOUT_SECONDS`,
+`TOPOLOGY_SWITCHOVER_TIMEOUT_SECONDS`,
+`TOPOLOGY_MYSQL_PERSISTENCE_TIMEOUT_SECONDS`, and
+`TOPOLOGY_CLICKHOUSE_PERSISTENCE_TIMEOUT_SECONDS`.
 
 The VMs are intentionally left running after validation. Teardown is available
 for a later explicit request and is bounded by both ownership checks and a
