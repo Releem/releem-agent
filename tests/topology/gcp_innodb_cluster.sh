@@ -1315,7 +1315,7 @@ build_clickhouse_observation_query() {
     first=0
   done
   (( first == 0 )) || die "no SID/RID observation correlations supplied"
-  printf '%s\n' "SELECT sid,rid,toUnixTimestamp64Milli(timestamp) AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= fromUnixTimestamp64Milli(${marker_ms}) AND timestamp < fromUnixTimestamp64Milli(${marker_ms} + ${CLICKHOUSE_MARKER_WINDOW_SECONDS} * 1000) AND (${conditions}) ORDER BY sid,timestamp ASC FORMAT JSONEachRow"
+  printf '%s\n' "SELECT sid,rid,toUnixTimestamp(timestamp) * 1000 AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= toDateTime(intDiv(${marker_ms}, 1000)) AND timestamp < toDateTime(intDiv(${marker_ms}, 1000) + ${CLICKHOUSE_MARKER_WINDOW_SECONDS}) AND (${conditions}) ORDER BY sid,timestamp ASC FORMAT JSONEachRow"
 }
 
 assert_selected_observations() {
@@ -1323,12 +1323,13 @@ assert_selected_observations() {
   jq -s -e --slurpfile current "$current_file" --argjson expected "$expected" --arg pairs "$pairs_csv" \
     --argjson marker_ms "$marker_ms" --argjson window "$CLICKHOUSE_MARKER_WINDOW_SECONDS" '
     ($pairs | split(",") | map(split(":") | {sid:(.[0]|tonumber),rid:.[1]}) | sort_by(.sid,.rid)) as $expected_pairs |
+    (($marker_ms / 1000 | floor) * 1000) as $marker_floor_ms |
     length == $expected and
     (map(.sid)|unique|length)==$expected and
     (map([.sid,.rid])|unique|length)==$expected and
     (map({sid,rid})|sort_by(.sid,.rid)) == $expected_pairs and
-    all(.observed_epoch_ms >= $marker_ms and
-        .observed_epoch_ms < ($marker_ms + ($window * 1000))) and
+    all(.observed_epoch_ms >= $marker_floor_ms and
+        .observed_epoch_ms < ($marker_floor_ms + ($window * 1000))) and
     all(. as $observation |
       ($observation.relations|fromjson) as $relations |
       ($current | map(select(.sid == $observation.sid))) as $expected_relations |
