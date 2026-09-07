@@ -17,8 +17,9 @@ type MetricValue struct {
 type MetricGroupValue map[string]interface{}
 
 type ModeType struct {
-	Name string
-	Type string
+	Name      string
+	Type      string
+	ApplyMode string
 }
 type Metrics struct {
 	System struct {

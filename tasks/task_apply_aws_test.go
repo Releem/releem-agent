@@ -54,7 +54,7 @@ func (e testAWSAPIError) ErrorCode() string {
 }
 
 func (r *awsApplyRepeater) ProcessMetrics(_ models.MetricContext, _ models.Metrics, mode models.ModeType) (string, error) {
-	if mode == (models.ModeType{Name: "Configurations", Type: "GetJson"}) {
+	if mode.Name == "Configurations" && mode.Type == "GetJson" {
 		r.calls++
 		if r.panicValue != nil {
 			panic(r.panicValue)

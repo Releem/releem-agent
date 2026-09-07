@@ -1,6 +1,41 @@
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
+
+func TestParseConfigurationApplyMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		getConfig  bool
+		args       []string
+		wantMode   string
+		wantRemain []string
+		wantErr    bool
+	}{
+		{name: "legacy config download defaults to full", getConfig: true, wantMode: "full"},
+		{name: "dynamic config download", getConfig: true, args: []string{"dynamic"}, wantMode: "dynamic"},
+		{name: "full config download", getConfig: true, args: []string{"full"}, wantMode: "full"},
+		{name: "invalid config mode", getConfig: true, args: []string{"partial"}, wantErr: true},
+		{name: "service command remains untouched", args: []string{"status"}, wantRemain: []string{"status"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMode, gotRemain, err := parseConfigurationApplyMode(tt.getConfig, tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseConfigurationApplyMode(%t, %v) error = %v, wantErr %t", tt.getConfig, tt.args, err, tt.wantErr)
+			}
+			if gotMode != tt.wantMode {
+				t.Errorf("parseConfigurationApplyMode(%t, %v) mode = %q, want %q", tt.getConfig, tt.args, gotMode, tt.wantMode)
+			}
+			if !reflect.DeepEqual(gotRemain, tt.wantRemain) {
+				t.Errorf("parseConfigurationApplyMode(%t, %v) remaining = %v, want %v", tt.getConfig, tt.args, gotRemain, tt.wantRemain)
+			}
+		})
+	}
+}
 
 func TestShouldRunOneShotMode(t *testing.T) {
 	tests := []struct {

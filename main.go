@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -41,6 +42,7 @@ const (
 var logger logging.Logger
 var SetConfigRun, GetConfigRun, InitialConfigRun *bool
 var ConfigFile, AgentEvent, AgentTask *string
+var configurationApplyMode = "full"
 
 // Service has embedded daemon
 type Service struct {
@@ -95,6 +97,7 @@ func (programm *Programm) Run() {
 			Mode.Type = "GetInitial"
 		} else if *GetConfigRun {
 			Mode.Type = "Get"
+			Mode.ApplyMode = configurationApplyMode
 		} else {
 			Mode.Type = "Default"
 		}
@@ -354,6 +357,19 @@ func shouldRunOneShotMode(commandLen int, setConfig bool, getConfig bool, initia
 	return setConfig || getConfig || initialConfig || len(agentEvent) > 0 || len(agentTask) > 0
 }
 
+func parseConfigurationApplyMode(getConfig bool, args []string) (string, []string, error) {
+	if !getConfig {
+		return "", args, nil
+	}
+	if len(args) == 0 {
+		return "full", nil, nil
+	}
+	if len(args) != 1 || (args[0] != "dynamic" && args[0] != "full") {
+		return "", nil, fmt.Errorf("-c accepts only one optional mode: dynamic or full")
+	}
+	return args[0], nil, nil
+}
+
 func main() {
 	logger = *logging.Init("releem-agent", true, defaultSystemLogFlag(), io.Discard)
 	defer logger.Close()
@@ -368,6 +384,12 @@ func main() {
 	AgentTask = flag.String("task", "", "Run Releem agent to execute task")
 	flag.Parse()
 	command := flag.Args()
+	var err error
+	configurationApplyMode, command, err = parseConfigurationApplyMode(*GetConfigRun, command)
+	if err != nil {
+		logger.Error(err)
+		os.Exit(2)
+	}
 
 	if shouldRunOneShotMode(len(command), *SetConfigRun, *GetConfigRun, *InitialConfigRun, *AgentEvent, *AgentTask) {
 		(&Programm{}).Run()

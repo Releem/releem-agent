@@ -445,6 +445,27 @@ func TestBuildApplyPlanRoutesAndFiltersLiveParameters(t *testing.T) {
 			},
 		},
 		{
+			name: "dynamic-only mode skips static parameters",
+			input: func() BuildApplyPlanInput {
+				input := planInput(
+					map[string]ParameterInfo{
+						"dynamic_parameter": liveParameter("dynamic_parameter", "dynamic", true, ScopeInstance),
+						"static_parameter":  liveParameter("static_parameter", "static", true, ScopeInstance),
+					},
+					nil,
+					map[string]interface{}{"dynamic_parameter": "1", "static_parameter": "2"},
+				)
+				input.DynamicOnly = true
+				return input
+			}(),
+			wantInstance: []simpleParameter{
+				{name: "dynamic_parameter", value: "1", method: types.ApplyMethodImmediate},
+			},
+			wantInstanceSkipped: []SkippedVariable{
+				{Name: "static_parameter", Reason: SkipNotDynamic},
+			},
+		},
+		{
 			name: "pending-reboot-only mode defers dynamic and static parameters",
 			input: func() BuildApplyPlanInput {
 				input := planInput(

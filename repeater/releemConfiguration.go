@@ -22,6 +22,10 @@ type ReleemConfigurationsRepeater struct {
 	configuration *config.Config
 }
 
+var newHTTPClient = func() *http.Client {
+	return &http.Client{Timeout: 10 * time.Minute}
+}
+
 func (repeater ReleemConfigurationsRepeater) ProcessMetrics(context models.MetricContext, metrics models.Metrics, Mode models.ModeType) (string, error) {
 	defer utils.HandlePanic(repeater.configuration, repeater.logger)
 	repeater.logger.V(5).Info(Mode.Name, Mode.Type)
@@ -89,13 +93,13 @@ func (repeater ReleemConfigurationsRepeater) ProcessMetrics(context models.Metri
 		return "", errors.New("Request: could not create request: " + err.Error())
 	}
 	req.Header.Set("x-releem-api-key", context.GetApiKey())
+	if Mode.Name == "Configurations" && Mode.ApplyMode != "" {
+		req.Header.Set("X-Releem-Apply-Mode", Mode.ApplyMode)
+	}
 	if Mode.Name == "Configurations" && Mode.Type == "GetJson" {
 		req.Header.Set("Accept", "application/json")
 	}
-	client := http.Client{
-		Timeout: 10 * time.Minute,
-	}
-	res, err := client.Do(req)
+	res, err := newHTTPClient().Do(req)
 	if err != nil {
 		return "", errors.New("Request: error making http request: " + err.Error())
 	}
@@ -111,7 +115,7 @@ func (repeater ReleemConfigurationsRepeater) ProcessMetrics(context models.Metri
 	repeater.logger.V(5).Info("Response: status code: ", res.StatusCode)
 	repeater.logger.V(5).Info("Response: body:\n", string(body_res))
 
-	if Mode.Name == "Configurations" {
+	if Mode.Name == "Configurations" && Mode.Type != "GetJson" {
 		var config_filename string
 		if Mode.Type == "GetInitial" {
 			config_filename = "initial_config_mysql.cnf"
