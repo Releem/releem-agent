@@ -629,6 +629,7 @@ remote_bootstrap() {
     cat <<'REMOTE'
 umask 077
 mysql_admin_user=releem_cluster_admin
+monitoring_user=releem
 
 sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq
 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl gnupg lsb-release ufw
@@ -693,9 +694,26 @@ else
 CREATE USER IF NOT EXISTS '${mysql_admin_user}'@'%' IDENTIFIED BY '${escaped_password}';
 ALTER USER '${mysql_admin_user}'@'%' IDENTIFIED BY '${escaped_password}';
 GRANT ALL PRIVILEGES ON *.* TO '${mysql_admin_user}'@'%' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS '${monitoring_user}'@'localhost' IDENTIFIED BY '${escaped_password}';
+ALTER USER '${monitoring_user}'@'localhost' IDENTIFIED BY '${escaped_password}';
+GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW VIEW ON *.* TO '${monitoring_user}'@'localhost';
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '${monitoring_user}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 fi
+
+monitoring_login_ready=0
+for _ in $(seq 1 30); do
+  if MYSQL_PWD="$cluster_password" mysqladmin --socket=/var/run/mysqld/mysqld.sock --user="$monitoring_user" ping >/dev/null 2>&1; then
+    monitoring_login_ready=1
+    break
+  fi
+  sleep 2
+done
+[[ "$monitoring_login_ready" == 1 ]] || {
+  echo "shared monitoring account is unavailable on $node_name" >&2
+  exit 1
+}
 
 sudo ufw allow OpenSSH >/dev/null
 sudo ufw allow from 10.212.0.0/24 to any port 3306 proto tcp >/dev/null
@@ -709,11 +727,21 @@ mysqlsh --version | grep -Eq "$mysqlsh_version_pattern"
 sudo mysql -NBe "SELECT @@server_id, @@server_uuid, @@report_host, @@gtid_mode, @@log_bin" |
   awk -v id="$server_id" -v host="$node_name" '$1 == id && $2 != "" && $3 == host && $4 == "ON" && $5 == 1 {ok=1} END {exit !ok}'
 
-if [[ ! -x /opt/releem/releem-agent ]] || ! systemctl cat releem-agent.service >/dev/null 2>&1; then
+agent_config_matches=0
+if sudo test -f /opt/releem/releem.conf &&
+  sudo grep -Fqx 'mysql_user="releem"' /opt/releem/releem.conf &&
+  sudo grep -Fqx "mysql_password=\"$cluster_password\"" /opt/releem/releem.conf &&
+  sudo grep -Fqx 'mysql_host="/var/run/mysqld/mysqld.sock"' /opt/releem/releem.conf; then
+  agent_config_matches=1
+fi
+if [[ ! -x /opt/releem/releem-agent ]] ||
+  ! systemctl cat releem-agent.service >/dev/null 2>&1 ||
+  [[ "$agent_config_matches" != 1 ]]; then
   export RELEEM_API_KEY="$releem_api_key" RELEEM_ENV=dev RELEEM_DB_MEMORY_LIMIT=0 RELEEM_CRON_ENABLE=1
   export RELEEM_QUERY_OPTIMIZATION=true RELEEM_HOSTNAME="$node_name" RELEEM_INSTANCE_TYPE=local
   export RELEEM_MYSQL_HOST=/var/run/mysqld/mysqld.sock RELEEM_MYSQL_ROOT_LOGIN=root RELEEM_MYSQL_ROOT_PASSWORD=''
-  if ! install_output=$(sudo --preserve-env=RELEEM_API_KEY,RELEEM_ENV,RELEEM_DB_MEMORY_LIMIT,RELEEM_CRON_ENABLE,RELEEM_QUERY_OPTIMIZATION,RELEEM_HOSTNAME,RELEEM_INSTANCE_TYPE,RELEEM_MYSQL_HOST,RELEEM_MYSQL_ROOT_LOGIN,RELEEM_MYSQL_ROOT_PASSWORD \
+  export RELEEM_MYSQL_LOGIN="$monitoring_user" RELEEM_MYSQL_PASSWORD="$cluster_password"
+  if ! install_output=$(sudo --preserve-env=RELEEM_API_KEY,RELEEM_ENV,RELEEM_DB_MEMORY_LIMIT,RELEEM_CRON_ENABLE,RELEEM_QUERY_OPTIMIZATION,RELEEM_HOSTNAME,RELEEM_INSTANCE_TYPE,RELEEM_MYSQL_HOST,RELEEM_MYSQL_LOGIN,RELEEM_MYSQL_PASSWORD,RELEEM_MYSQL_ROOT_LOGIN,RELEEM_MYSQL_ROOT_PASSWORD \
     bash /tmp/releem-install.sh </dev/null 2>&1); then
     echo "noninteractive Releem Agent installation failed on $node_name" >&2
     exit 1
@@ -721,7 +749,8 @@ if [[ ! -x /opt/releem/releem-agent ]] || ! systemctl cat releem-agent.service >
   [[ "$install_output" != *"$releem_api_key"* ]] || { echo "installer attempted to expose API key" >&2; exit 1; }
   unset install_output
   unset RELEEM_API_KEY RELEEM_ENV RELEEM_DB_MEMORY_LIMIT RELEEM_CRON_ENABLE RELEEM_QUERY_OPTIMIZATION
-  unset RELEEM_HOSTNAME RELEEM_INSTANCE_TYPE RELEEM_MYSQL_HOST RELEEM_MYSQL_ROOT_LOGIN RELEEM_MYSQL_ROOT_PASSWORD
+  unset RELEEM_HOSTNAME RELEEM_INSTANCE_TYPE RELEEM_MYSQL_HOST RELEEM_MYSQL_LOGIN RELEEM_MYSQL_PASSWORD
+  unset RELEEM_MYSQL_ROOT_LOGIN RELEEM_MYSQL_ROOT_PASSWORD
 fi
 owner=$(stat -c %u /opt/releem/releem-agent)
 group=$(stat -c %g /opt/releem/releem-agent)
