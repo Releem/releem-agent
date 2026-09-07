@@ -618,25 +618,15 @@ mysql_password_lines() {
 remote_bootstrap() {
   local node="$1" server_id="$2" hosts_file="$3"
   {
-    printf '%s\n%s\n%s\n%s\n' "$MYSQL_CLUSTER_PASSWORD" "$RELEEM_API_KEY" "$node" "$server_id"
-    printf '%s\n' '__HOSTS__'
-    printf '%s\n' "$hosts_file"
-    printf '%s\n' '__SCRIPT__'
+    printf '%s\n' 'set -Eeuo pipefail'
+    printf 'cluster_password=%q\n' "$MYSQL_CLUSTER_PASSWORD"
+    printf 'releem_api_key=%q\n' "$RELEEM_API_KEY"
+    printf 'node_name=%q\n' "$node"
+    printf 'server_id=%q\n' "$server_id"
+    printf 'hosts=%q\n' "$hosts_file"
     cat <<'REMOTE'
-set -Eeuo pipefail
 umask 077
-IFS= read -r cluster_password
-IFS= read -r releem_api_key
-IFS= read -r node_name
-IFS= read -r server_id
-IFS= read -r marker
-[[ "$marker" == '__HOSTS__' ]]
 mysql_admin_user=releem_cluster_admin
-hosts=''
-while IFS= read -r line; do
-  [[ "$line" == '__SCRIPT__' ]] && break
-  hosts+="$line"$'\n'
-done
 
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
