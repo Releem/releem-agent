@@ -617,12 +617,14 @@ mysql_password_lines() {
 
 remote_bootstrap() {
   local node="$1" server_id="$2" hosts_file="$3"
+  local mysqlsh_version_pattern='(^|[[:space:]])(Ver[[:space:]]+)?8\.4\.'
   {
     printf '%s\n' 'set -Eeuo pipefail'
     printf 'cluster_password=%q\n' "$MYSQL_CLUSTER_PASSWORD"
     printf 'releem_api_key=%q\n' "$RELEEM_API_KEY"
     printf 'node_name=%q\n' "$node"
     printf 'server_id=%q\n' "$server_id"
+    printf 'mysqlsh_version_pattern=%q\n' "$mysqlsh_version_pattern"
     printf 'hosts=%q\n' "$hosts_file"
     cat <<'REMOTE'
 umask 077
@@ -701,7 +703,7 @@ sudo ufw --force enable >/dev/null
 
 mysql_version=$(mysql --version)
 [[ "$mysql_version" == *'Ver 8.4.'* ]]
-mysqlsh --version | grep -Eq 'MySQL Shell 8\.4\.'
+mysqlsh --version | grep -Eq "$mysqlsh_version_pattern"
 sudo mysql -NBe "SELECT @@server_id, @@server_uuid, @@report_host, @@gtid_mode, @@log_bin" |
   awk -v id="$server_id" -v host="$node_name" '$1 == id && $2 != "" && $3 == host && $4 == "ON" && $5 == 1 {ok=1} END {exit !ok}'
 
