@@ -628,16 +628,15 @@ remote_bootstrap() {
 umask 077
 mysql_admin_user=releem_cluster_admin
 
-export DEBIAN_FRONTEND=noninteractive
-sudo apt-get update -qq
-sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release ufw
+sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl gnupg lsb-release ufw
 curl -fsSL https://repo.mysql.com/RPM-GPG-KEY-mysql-2025 | gpg --dearmor | sudo tee /usr/share/keyrings/mysql.gpg >/dev/null
 printf '%s\n' \
   'deb [arch=amd64 signed-by=/usr/share/keyrings/mysql.gpg] https://repo.mysql.com/apt/ubuntu jammy mysql-8.4-lts' \
   'deb [arch=amd64 signed-by=/usr/share/keyrings/mysql.gpg] https://repo.mysql.com/apt/ubuntu jammy mysql-tools' |
   sudo tee /etc/apt/sources.list.d/mysql.list >/dev/null
-sudo apt-get update -qq
-sudo apt-get install -y -qq mysql-community-server mysql-shell
+sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mysql-community-server mysql-shell
 
 printf '%s' "$hosts" | sudo tee /etc/hosts.releem-topology >/dev/null
 sudo sed -i '/# releem-topology begin/,/# releem-topology end/d' /etc/hosts
