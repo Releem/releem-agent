@@ -683,13 +683,15 @@ escaped_password=${cluster_password//\\/\\\\}
 escaped_password=${escaped_password//\'/\'\'}
 admin_exists=$(sudo mysql --protocol=socket --batch --skip-column-names -e "SELECT COUNT(*) FROM mysql.user WHERE user='${mysql_admin_user}' AND host='%';")
 read_only=$(sudo mysql --protocol=socket --batch --skip-column-names -e "SELECT @@global.read_only;")
-if [[ "$admin_exists" == 0 && "$read_only" == 1 ]]; then
-  echo "cluster admin account is missing on read-only member $node_name" >&2
-  exit 1
-fi
-if [[ "$admin_exists" == 0 ]]; then
+if [[ "$read_only" == 1 ]]; then
+  [[ "$admin_exists" != 0 ]] || {
+    echo "cluster admin account is missing on read-only member $node_name" >&2
+    exit 1
+  }
+else
   sudo mysql --protocol=socket <<SQL
 CREATE USER IF NOT EXISTS '${mysql_admin_user}'@'%' IDENTIFIED BY '${escaped_password}';
+ALTER USER '${mysql_admin_user}'@'%' IDENTIFIED BY '${escaped_password}';
 GRANT ALL PRIVILEGES ON *.* TO '${mysql_admin_user}'@'%' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
