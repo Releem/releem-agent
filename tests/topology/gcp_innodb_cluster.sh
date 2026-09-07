@@ -712,7 +712,7 @@ if [[ ! -x /opt/releem/releem-agent ]] || ! systemctl cat releem-agent.service >
   export RELEEM_QUERY_OPTIMIZATION=true RELEEM_HOSTNAME="$node_name" RELEEM_INSTANCE_TYPE=local
   export RELEEM_MYSQL_HOST=/var/run/mysqld/mysqld.sock RELEEM_MYSQL_ROOT_LOGIN=root RELEEM_MYSQL_ROOT_PASSWORD=''
   if ! install_output=$(sudo --preserve-env=RELEEM_API_KEY,RELEEM_ENV,RELEEM_DB_MEMORY_LIMIT,RELEEM_CRON_ENABLE,RELEEM_QUERY_OPTIMIZATION,RELEEM_HOSTNAME,RELEEM_INSTANCE_TYPE,RELEEM_MYSQL_HOST,RELEEM_MYSQL_ROOT_LOGIN,RELEEM_MYSQL_ROOT_PASSWORD \
-    bash /tmp/releem-install.sh 2>&1); then
+    bash /tmp/releem-install.sh </dev/null 2>&1); then
     echo "noninteractive Releem Agent installation failed on $node_name" >&2
     exit 1
   fi
