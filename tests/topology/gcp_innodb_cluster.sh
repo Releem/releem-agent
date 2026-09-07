@@ -802,6 +802,13 @@ extract_clusterset_primary_name() {
   printf '%s\n' "$primary"
 }
 
+extract_expected_node_name() {
+  local node
+  node="$(grep -Eo 'releem-ic-(single|multi|cs-primary|cs-replica)-[0-9]+$' | tail -n1)" || return 1
+  is_expected_node "$node" || return 1
+  printf '%s\n' "$node"
+}
+
 cluster_seed() {
   case "$1" in
     releem_single) printf '%s\n' releem-ic-single-1 ;;
@@ -1431,7 +1438,8 @@ server_uuid() {
 
 cluster_primary_host() {
   local cluster="$1" seed="$2"
-  mysqlsh_on "$seed" "var r=session.runSql('SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ROLE=\\\"PRIMARY\\\" AND MEMBER_STATE=\\\"ONLINE\\\" LIMIT 1'); var x=r.fetchOne(); if (x) print(x[0]);" | tail -n1
+  mysqlsh_on "$seed" "var r=session.runSql('SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ROLE=\\\"PRIMARY\\\" AND MEMBER_STATE=\\\"ONLINE\\\" LIMIT 1'); var x=r.fetchOne(); if (x) print(x[0]);" |
+    extract_expected_node_name
 }
 
 wait_for_new_primary() {
