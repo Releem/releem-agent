@@ -707,10 +707,10 @@ mysqlsh --version | grep -Eq "$mysqlsh_version_pattern"
 sudo mysql -NBe "SELECT @@server_id, @@server_uuid, @@report_host, @@gtid_mode, @@log_bin" |
   awk -v id="$server_id" -v host="$node_name" '$1 == id && $2 != "" && $3 == host && $4 == "ON" && $5 == 1 {ok=1} END {exit !ok}'
 
-if [[ ! -x /opt/releem/releem-agent ]]; then
+if [[ ! -x /opt/releem/releem-agent ]] || ! systemctl cat releem-agent.service >/dev/null 2>&1; then
   export RELEEM_API_KEY="$releem_api_key" RELEEM_ENV=dev RELEEM_DB_MEMORY_LIMIT=0 RELEEM_CRON_ENABLE=1
   export RELEEM_QUERY_OPTIMIZATION=true RELEEM_HOSTNAME="$node_name" RELEEM_INSTANCE_TYPE=local
-  export RELEEM_MYSQL_HOST=127.0.0.1 RELEEM_MYSQL_ROOT_LOGIN=root RELEEM_MYSQL_ROOT_PASSWORD=''
+  export RELEEM_MYSQL_HOST=/var/run/mysqld/mysqld.sock RELEEM_MYSQL_ROOT_LOGIN=root RELEEM_MYSQL_ROOT_PASSWORD=''
   if ! install_output=$(sudo --preserve-env=RELEEM_API_KEY,RELEEM_ENV,RELEEM_DB_MEMORY_LIMIT,RELEEM_CRON_ENABLE,RELEEM_QUERY_OPTIMIZATION,RELEEM_HOSTNAME,RELEEM_INSTANCE_TYPE,RELEEM_MYSQL_HOST,RELEEM_MYSQL_ROOT_LOGIN,RELEEM_MYSQL_ROOT_PASSWORD \
     bash /tmp/releem-install.sh 2>&1); then
     echo "noninteractive Releem Agent installation failed on $node_name" >&2
