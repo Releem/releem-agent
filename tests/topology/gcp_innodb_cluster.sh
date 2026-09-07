@@ -789,8 +789,8 @@ adminapi_cluster_status() {
 }
 
 adminapi_create_cluster() {
-  local cluster="$1" seed="$2" mode="$3" options="{gtidSetIsComplete:true,interactive:false}"
-  [[ "$mode" == multi ]] && options="{multiPrimary:true,force:true,gtidSetIsComplete:true,interactive:false}"
+  local cluster="$1" seed="$2" mode="$3" options="{gtidSetIsComplete:true}"
+  [[ "$mode" == multi ]] && options="{multiPrimary:true,force:true,gtidSetIsComplete:true}"
   mysqlsh_on "$seed" "var c=dba.createCluster('${cluster}',${options}); print(JSON.stringify(c.status({extended:1})));" >/dev/null
 }
 
