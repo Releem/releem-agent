@@ -756,6 +756,16 @@ mysqlsh_on_first_available() {
   return 1
 }
 
+extract_mysqlsh_json_object() {
+  local parsed
+  parsed="$(jq -Rrc '
+    (try (if startswith("{") then fromjson else (sub("^[^{]*"; "") | fromjson) end) catch empty) |
+    select(type == "object")
+  ' | tail -n1)"
+  [[ -n "$parsed" ]] || return 1
+  printf '%s\n' "$parsed"
+}
+
 cluster_seed() {
   case "$1" in
     releem_single) printf '%s\n' releem-ic-single-1 ;;
@@ -775,7 +785,7 @@ adminapi_cluster_status() {
   local cluster="$1" seed
   seed="$(cluster_seed "$cluster")"
   mysqlsh_on "$seed" "print(JSON.stringify(dba.getCluster('${cluster}').status({extended:1})));" |
-    grep -E '^\{' | tail -n1
+    extract_mysqlsh_json_object
 }
 
 adminapi_create_cluster() {
@@ -1067,11 +1077,11 @@ verify_cluster_state() {
   local label="$1" expected_clusterset_primary="$2" out captured_at single multi cs_primary cs_replica clusterset
   out="$EVIDENCE_DIR/$RUN_LABEL/${label}.json"
   mkdir -p "$EVIDENCE_DIR/$RUN_LABEL"
-  single="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_single'); print(JSON.stringify(c.status({extended:1})))" releem-ic-single-1 releem-ic-single-2 releem-ic-single-3 | grep -E '^\{' | tail -n1)"
-  multi="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_multi'); print(JSON.stringify(c.status({extended:1})))" releem-ic-multi-1 releem-ic-multi-2 releem-ic-multi-3 | grep -E '^\{' | tail -n1)"
-  cs_primary="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_cs_primary'); print(JSON.stringify(c.status({extended:1})))" releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3 | grep -E '^\{' | tail -n1)"
-  cs_replica="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_cs_replica'); print(JSON.stringify(c.status({extended:1})))" releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3 | grep -E '^\{' | tail -n1)"
-  clusterset="$(mysqlsh_on_first_available "var c=dba.getCluster(); print(JSON.stringify(c.getClusterSet().status({extended:1})))" releem-ic-cs-primary-1 releem-ic-cs-replica-1 | grep -E '^\{' | tail -n1)"
+  single="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_single'); print(JSON.stringify(c.status({extended:1})))" releem-ic-single-1 releem-ic-single-2 releem-ic-single-3 | extract_mysqlsh_json_object)"
+  multi="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_multi'); print(JSON.stringify(c.status({extended:1})))" releem-ic-multi-1 releem-ic-multi-2 releem-ic-multi-3 | extract_mysqlsh_json_object)"
+  cs_primary="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_cs_primary'); print(JSON.stringify(c.status({extended:1})))" releem-ic-cs-primary-1 releem-ic-cs-primary-2 releem-ic-cs-primary-3 | extract_mysqlsh_json_object)"
+  cs_replica="$(mysqlsh_on_first_available "var c=dba.getCluster('releem_cs_replica'); print(JSON.stringify(c.status({extended:1})))" releem-ic-cs-replica-1 releem-ic-cs-replica-2 releem-ic-cs-replica-3 | extract_mysqlsh_json_object)"
+  clusterset="$(mysqlsh_on_first_available "var c=dba.getCluster(); print(JSON.stringify(c.getClusterSet().status({extended:1})))" releem-ic-cs-primary-1 releem-ic-cs-replica-1 | extract_mysqlsh_json_object)"
 
   assert_cluster_state_for_label "$single" releem_single single "$label" \
     releem-ic-single-1 releem-ic-single-2 releem-ic-single-3
