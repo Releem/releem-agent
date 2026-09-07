@@ -795,6 +795,13 @@ extract_mysqlsh_json_object() {
   printf '%s\n' "$parsed"
 }
 
+extract_clusterset_primary_name() {
+  local primary
+  primary="$(grep -Eo '(releem_cs_primary|releem_cs_replica)$' | tail -n1)" || return 1
+  [[ -n "$primary" ]] || return 1
+  printf '%s\n' "$primary"
+}
+
 cluster_seed() {
   case "$1" in
     releem_single) printf '%s\n' releem-ic-single-1 ;;
@@ -1465,7 +1472,7 @@ sid_for_hostname() {
 clusterset_primary_name() {
   mysqlsh_on_first_available \
     "var s=dba.getCluster().getClusterSet().status({extended:1}); print(s.primaryCluster);" \
-    releem-ic-cs-primary-1 releem-ic-cs-replica-1 | tail -n1
+    releem-ic-cs-primary-1 releem-ic-cs-replica-1 | extract_clusterset_primary_name
 }
 
 clusterset_switchover() {
