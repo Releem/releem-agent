@@ -811,10 +811,18 @@ adminapi_cluster_exists() {
 }
 
 adminapi_cluster_status() {
-  local cluster="$1" seed
+  local cluster="$1" seed output parsed attempt
   seed="$(cluster_seed "$cluster")"
-  mysqlsh_on "$seed" "print(JSON.stringify(dba.getCluster('${cluster}').status({extended:1})));" |
-    extract_mysqlsh_json_object
+  for attempt in $(seq 1 30); do
+    output="$(mysqlsh_on "$seed" "print(JSON.stringify(dba.getCluster('${cluster}').status({extended:1})));" 2>&1)" || true
+    if parsed="$(extract_mysqlsh_json_object <<<"$output")"; then
+      printf '%s\n' "$parsed"
+      return 0
+    fi
+    (( attempt < 30 )) && sleep 2
+  done
+  printf '%s\n' "$output" >&2
+  return 1
 }
 
 adminapi_create_cluster() {
