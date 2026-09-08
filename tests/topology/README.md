@@ -185,7 +185,11 @@ deterministic `releem-<run-id>-` name and the exact
 The read-only `preflight` command intersects both regions when selecting the
 latest available Aurora MySQL 3 version and smallest common orderable class.
 It also selects the current Serverless v2 minimum ACU, a current MySQL 8.0
-version/class, and the regional Amazon Linux 2023 runner images. Exact regional
+version/class, and the regional Amazon Linux 2023 runner images. Its summary
+records initial and transition Serverless maximum ACU, the selected ordinary
+MySQL version/class, three 20 GiB ordinary database volumes, two 8 GiB runner
+roots, the one-second monitoring interval, all resource counts, and the global
+runtime ceiling. Exact regional
 RDS instance/cluster and standard EC2 vCPU use is checked against the matrix's
 required headroom. Quotas, private subnet routes, deterministic-name collisions
 independent of tags, and the bounded hourly configuration shape are
@@ -265,13 +269,18 @@ bounded load event using before/during/after `ServerlessDatabaseCapacity` and
 and Multi-AZ failover. Persistence queries first resolve the exact test SIDs,
 then use only tenant UID, SID, current RID, and millisecond transition markers.
 Assertions map each exact SID back to AWS instance/cluster/global resource IDs,
-ARNs, endpoints, writers, and sources. Every expected AWS provider relation is
-matched exactly, every SID requires its native MySQL relation, and the native
+ARNs, endpoints, writers, and sources. Every provider row is matched exactly,
+including parent, primary, role, writer/reader flags, and replication state;
+unlisted provider or native rows are rejected. Every SID requires exactly one
+documented native MySQL relation, and the native
 read-replica upstream must equal the source's member key. ClickHouse snapshots
-retain primary/parent keys and the corresponding source-edge evidence without
-hostname inference or `LIMIT 1 BY`.
+parse primary/source edges only from the persisted ClickHouse relations JSON,
+label that evidence as ClickHouse-sourced, and compare it with current MySQL
+state without hostname inference or `LIMIT 1 BY`.
 
-Cleanup stops Agent processes, deletes DB instances and Enhanced Monitoring
+Cleanup first stops and disarms the watchdog, masks/defer signals, and disables
+errexit internally. It remains best-effort after individual failures and is
+retryable unless terminal absence succeeds. It stops Agent processes, deletes DB instances and Enhanced Monitoring
 streams, detaches Global Database members, then removes regional clusters,
 global cluster, parameter groups, runners/ENIs, S3 objects/bucket, instance
 profile, inline/managed IAM policies, IAM roles, security groups, subnet

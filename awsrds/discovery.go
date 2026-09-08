@@ -155,7 +155,7 @@ func discoverAuroraInstanceForApply(ctx context.Context, client Client, metadata
 		return Metadata{}, fmt.Errorf("Aurora DB instance %q has no DB cluster identifier", metadata.DBInstanceIdentifier)
 	}
 
-	cluster, err := describeDBCluster(ctx, client, metadata.DBClusterIdentifier)
+	cluster, err := describeDBClusterInRegion(ctx, client, metadata.DBClusterIdentifier, metadata.Region)
 	if err != nil {
 		return Metadata{}, err
 	}
@@ -186,7 +186,7 @@ func discoverAuroraInstance(ctx context.Context, client Client, target types.DBI
 		return Metadata{}, fmt.Errorf("Aurora DB instance %q has no DB cluster identifier", metadata.DBInstanceIdentifier)
 	}
 
-	cluster, err := describeDBCluster(ctx, client, metadata.DBClusterIdentifier)
+	cluster, err := describeDBClusterInRegion(ctx, client, metadata.DBClusterIdentifier, metadata.Region)
 	if err != nil {
 		return Metadata{}, err
 	}
@@ -227,7 +227,7 @@ func discoverAuroraInstance(ctx context.Context, client Client, target types.DBI
 
 		memberInstance := target
 		if !strings.EqualFold(memberID, metadata.DBInstanceIdentifier) {
-			memberInstance, err = describeDBInstance(ctx, client, memberID)
+			memberInstance, err = describeDBInstanceInRegion(ctx, client, memberID, metadata.Region)
 			if err != nil {
 				return Metadata{}, fmt.Errorf("resolve member of DB cluster %q: %w", metadata.DBClusterIdentifier, err)
 			}
@@ -250,7 +250,7 @@ func discoverAuroraInstance(ctx context.Context, client Client, target types.DBI
 	metadata.IsClusterWriter = aws.ToBool(matchingMembers[0].IsClusterWriter)
 	metadata.PromotionTier = aws.ToInt32(matchingMembers[0].PromotionTier)
 	if globalID := aws.ToString(cluster.GlobalClusterIdentifier); globalID != "" {
-		globalCluster, err := describeGlobalCluster(ctx, client, globalID)
+		globalCluster, err := describeGlobalClusterInRegion(ctx, client, globalID, metadata.Region)
 		if err != nil {
 			metadata.GlobalClusterIdentifier = globalID
 			metadata.TopologyIncomplete = true
@@ -357,7 +357,7 @@ func discoverRDSReadReplicas(ctx context.Context, client Client, target types.DB
 		if matchesDBInstanceReference(sourceID, target, target) {
 			return Metadata{}, fmt.Errorf("DB instance %q declares itself as its read-replica source", metadata.DBInstanceIdentifier)
 		}
-		source, err := describeDBInstance(ctx, client, sourceID)
+		source, err := describeDBInstanceInRegion(ctx, client, sourceID, metadata.Region)
 		if err != nil {
 			return Metadata{}, fmt.Errorf("resolve read-replica source for DB instance %q: %w", metadata.DBInstanceIdentifier, err)
 		}
@@ -390,7 +390,7 @@ func discoverRDSReadReplicas(ctx context.Context, client Client, target types.DB
 		}
 		seenReplicas[replicaKey] = struct{}{}
 
-		replica, err := describeDBInstance(ctx, client, replicaID)
+		replica, err := describeDBInstanceInRegion(ctx, client, replicaID, metadata.Region)
 		if err != nil {
 			return Metadata{}, fmt.Errorf("resolve read replica of DB instance %q: %w", metadata.DBInstanceIdentifier, err)
 		}
@@ -469,11 +469,15 @@ func (m Metadata) DatabaseType() string {
 }
 
 func describeDBInstance(ctx context.Context, client Client, identifier string) (types.DBInstance, error) {
+	return describeDBInstanceInRegion(ctx, client, identifier, "")
+}
+
+func describeDBInstanceInRegion(ctx context.Context, client Client, identifier, region string) (types.DBInstance, error) {
 	expectedID, err := identifierFromRequest(identifier, "db")
 	if err != nil {
 		return types.DBInstance{}, fmt.Errorf("describe DB instance %q: %w", identifier, err)
 	}
-	instances, err := describeDBInstancePages(ctx, client, identifier)
+	instances, err := describeDBInstancePagesInRegion(ctx, client, identifier, region)
 	if err != nil {
 		return types.DBInstance{}, fmt.Errorf("describe DB instance %q: %w", identifier, err)
 	}
@@ -496,11 +500,15 @@ func describeDBInstance(ctx context.Context, client Client, identifier string) (
 }
 
 func describeDBCluster(ctx context.Context, client Client, identifier string) (types.DBCluster, error) {
+	return describeDBClusterInRegion(ctx, client, identifier, "")
+}
+
+func describeDBClusterInRegion(ctx context.Context, client Client, identifier, region string) (types.DBCluster, error) {
 	expectedID, err := identifierFromRequest(identifier, "cluster")
 	if err != nil {
 		return types.DBCluster{}, fmt.Errorf("describe DB cluster %q: %w", identifier, err)
 	}
-	clusters, err := describeDBClusterPages(ctx, client, identifier)
+	clusters, err := describeDBClusterPagesInRegion(ctx, client, identifier, region)
 	if err != nil {
 		return types.DBCluster{}, fmt.Errorf("describe DB cluster %q: %w", identifier, err)
 	}
@@ -520,11 +528,15 @@ func describeDBCluster(ctx context.Context, client Client, identifier string) (t
 }
 
 func describeGlobalCluster(ctx context.Context, client Client, identifier string) (types.GlobalCluster, error) {
+	return describeGlobalClusterInRegion(ctx, client, identifier, "")
+}
+
+func describeGlobalClusterInRegion(ctx context.Context, client Client, identifier, region string) (types.GlobalCluster, error) {
 	expectedID, err := identifierFromRequest(identifier, "global-cluster")
 	if err != nil {
 		return types.GlobalCluster{}, fmt.Errorf("describe global cluster %q: %w", identifier, err)
 	}
-	clusters, err := describeGlobalClusterPages(ctx, client, identifier)
+	clusters, err := describeGlobalClusterPagesInRegion(ctx, client, identifier, region)
 	if err != nil {
 		return types.GlobalCluster{}, fmt.Errorf("describe global cluster %q: %w", identifier, err)
 	}
@@ -544,13 +556,20 @@ func describeGlobalCluster(ctx context.Context, client Client, identifier string
 }
 
 func describeDBInstancePages(ctx context.Context, client Client, identifier string) ([]types.DBInstance, error) {
+	return describeDBInstancePagesInRegion(ctx, client, identifier, "")
+}
+
+func describeDBInstancePagesInRegion(ctx context.Context, client Client, identifier, region string) ([]types.DBInstance, error) {
 	var options []func(*rds.Options)
 	if strings.HasPrefix(identifier, "arn:") {
 		identity, err := parseRDSARN(identifier, "db")
 		if err != nil {
 			return nil, err
 		}
-		options = append(options, func(o *rds.Options) { o.Region = identity.Region })
+		region = identity.Region
+	}
+	if region != "" {
+		options = append(options, func(o *rds.Options) { o.Region = region })
 	}
 	input := &rds.DescribeDBInstancesInput{DBInstanceIdentifier: aws.String(identifier)}
 	var instances []types.DBInstance
@@ -576,11 +595,26 @@ func describeDBInstancePages(ctx context.Context, client Client, identifier stri
 }
 
 func describeDBClusterPages(ctx context.Context, client Client, identifier string) ([]types.DBCluster, error) {
+	return describeDBClusterPagesInRegion(ctx, client, identifier, "")
+}
+
+func describeDBClusterPagesInRegion(ctx context.Context, client Client, identifier, region string) ([]types.DBCluster, error) {
+	var options []func(*rds.Options)
+	if strings.HasPrefix(identifier, "arn:") {
+		identity, err := parseRDSARN(identifier, "cluster")
+		if err != nil {
+			return nil, err
+		}
+		region = identity.Region
+	}
+	if region != "" {
+		options = append(options, func(o *rds.Options) { o.Region = region })
+	}
 	input := &rds.DescribeDBClustersInput{DBClusterIdentifier: aws.String(identifier)}
 	var clusters []types.DBCluster
 	seenMarkers := make(map[string]struct{})
 	for {
-		output, err := client.DescribeDBClusters(ctx, input)
+		output, err := client.DescribeDBClusters(ctx, input, options...)
 		if err != nil {
 			return nil, err
 		}
@@ -600,11 +634,19 @@ func describeDBClusterPages(ctx context.Context, client Client, identifier strin
 }
 
 func describeGlobalClusterPages(ctx context.Context, client Client, identifier string) ([]types.GlobalCluster, error) {
+	return describeGlobalClusterPagesInRegion(ctx, client, identifier, "")
+}
+
+func describeGlobalClusterPagesInRegion(ctx context.Context, client Client, identifier, region string) ([]types.GlobalCluster, error) {
+	var options []func(*rds.Options)
+	if region != "" {
+		options = append(options, func(o *rds.Options) { o.Region = region })
+	}
 	input := &rds.DescribeGlobalClustersInput{GlobalClusterIdentifier: aws.String(identifier)}
 	var clusters []types.GlobalCluster
 	seenMarkers := make(map[string]struct{})
 	for {
-		output, err := client.DescribeGlobalClusters(ctx, input)
+		output, err := client.DescribeGlobalClusters(ctx, input, options...)
 		if err != nil {
 			return nil, err
 		}

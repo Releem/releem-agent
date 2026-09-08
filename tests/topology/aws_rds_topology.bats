@@ -6,7 +6,207 @@ setup() {
     export AWS_TOPOLOGY_RUN_ID=task13-20260908
     export AWS_TOPOLOGY_STATE_DIR="$TEST_TMPDIR/state"
     export AWS_TOPOLOGY_EVIDENCE_DIR="$TEST_TMPDIR/evidence"
+    export AWS_TOPOLOGY_POLL_SECONDS=0
     source "$SCRIPT" help >/dev/null
+}
+
+@test "cleanup disables errexit internally and remains retryable until success" {
+    marker="$TEST_TMPDIR/cleanup-retry"
+    attempts="$TEST_TMPDIR/cleanup-attempts"
+    printf '0\n' >"$attempts"
+    cleanup_resources_impl() {
+        count="$(cat "$attempts")"
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$attempts"
+        false
+        printf 'continued-%s\n' "$count" >>"$marker"
+        [ "$count" -gt 1 ]
+    }
+    CLEANUP_ARMED=true
+    CLEANUP_DONE=false
+
+    set -e
+    cleanup_once || first_status=$?
+    set +e
+    [ "${first_status:-0}" -ne 0 ]
+    [ "$CLEANUP_DONE" = false ]
+    cleanup_once
+
+    [ "$CLEANUP_DONE" = true ]
+    [ "$(<"$marker")" = $'continued-1\ncontinued-2' ]
+}
+
+@test "successful cleanup returns zero and workflow continues under errexit" {
+    marker="$TEST_TMPDIR/cleanup-success"
+    cleanup_resources_impl() { printf 'cleaned\n' >"$marker"; }
+    CLEANUP_ARMED=true
+
+    set -e
+    cleanup_once
+    printf 'continued\n' >>"$marker"
+    set +e
+
+    [ "$(<"$marker")" = $'cleaned\ncontinued' ]
+}
+
+@test "cleanup stops watchdog and defers TERM until dependency cleanup finishes" {
+    marker="$TEST_TMPDIR/cleanup-signal"
+    sleep 60 &
+    WATCHDOG_PID=$!
+    cleanup_resources_impl() {
+        ! kill -0 "$WATCHDOG_PID" 2>/dev/null
+        kill -TERM "$BASHPID"
+        printf 'dependency-finished\n' >"$marker"
+    }
+    CLEANUP_ARMED=true
+
+    run cleanup_once
+
+    [ "$status" -eq 143 ]
+    [ "$(<"$marker")" = dependency-finished ]
+}
+
+@test "IAM ownership inventory rejects ambiguous role and dependent API failures" {
+    aws() {
+        case "$*" in
+            iam\ get-role\ *) printf '%s\n' 'AccessDenied' >&2; return 254 ;;
+            *) return 1 ;;
+        esac
+    }
+    run capture_iam_role_ownership runner-role runner "$TEST_TMPDIR/role.json"
+    [ "$status" -ne 0 ]
+
+    aws() {
+        case "$*" in
+            iam\ get-role\ *) printf '%s\n' '{"Role":{"Arn":"arn:aws:iam::111111111111:role/runner-role"}}' ;;
+            iam\ list-role-tags\ *) printf '%s\n' 'Throttling' >&2; return 254 ;;
+            *) return 1 ;;
+        esac
+    }
+    run capture_iam_role_ownership runner-role runner "$TEST_TMPDIR/role.json"
+    [ "$status" -ne 0 ]
+}
+
+@test "IAM absence accepts only NoSuchEntity and ownership rejects empty relationships" {
+    aws() { printf '%s\n' 'NoSuchEntity: role was not found' >&2; return 254; }
+    run iam_entity_presence role missing-role
+    [ "$status" -eq 0 ]
+    [ "$output" = absent ]
+
+    aws() { printf '%s\n' 'AccessDenied' >&2; return 254; }
+    run iam_entity_presence profile profile-name
+    [ "$status" -ne 0 ]
+
+    fixture="$TEST_TMPDIR/empty-relationships.json"
+    printf '%s\n' '{"bucket":{"exists":false},"runner_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"attached_policies":[],"inline_policy_names":[],"inline_policy_name":null,"inline_policy":{}},"monitoring_role":{"exists":false},"instance_profile":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"roles":[]}}' >"$fixture"
+    run assert_destroy_support_ownership "$fixture" 'arn:aws:s3:::bucket/task13-20260908/*' releem-task13-20260908-runner-role releem-task13-20260908-monitoring-role
+    [ "$status" -ne 0 ]
+}
+
+@test "S3 secret deletion retries ambiguous head-object failures until explicit absence" {
+    calls="$TEST_TMPDIR/head-object-calls"
+    printf '0\n' >"$calls"
+    aws_region() {
+        case "$*" in
+            *s3api\ delete-object*) return 0 ;;
+            *s3api\ head-object*)
+                count="$(cat "$calls")"; count=$((count + 1)); printf '%s\n' "$count" >"$calls"
+                if [ "$count" -eq 1 ]; then printf '%s\n' 'AccessDenied' >&2; return 254; fi
+                printf '%s\n' 'An error occurred (404) when calling the HeadObject operation: Not Found' >&2
+                return 254
+                ;;
+            *) return 1 ;;
+        esac
+    }
+
+    run delete_s3_object_until_absent bucket secret us-east-1
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$calls")" -eq 2 ]
+}
+
+@test "S3 secret deletion fails when head-object remains ambiguous" {
+    aws_region() {
+        case "$*" in
+            *s3api\ delete-object*) return 0 ;;
+            *s3api\ head-object*) printf '%s\n' 'RequestTimeout' >&2; return 254 ;;
+            *) return 1 ;;
+        esac
+    }
+    run delete_s3_object_until_absent bucket secret us-east-1
+    [ "$status" -ne 0 ]
+}
+
+@test "exact SID contract rejects wrong role flags state and extra provider rows" {
+    current="$TEST_TMPDIR/current-strict.jsonl"
+    upstreams="$TEST_TMPDIR/upstreams-strict.jsonl"
+    expected="$TEST_TMPDIR/expected-strict.json"
+    : >"$upstreams"
+    printf '%s\n' '{"sid":101,"relation_type":"aurora_cluster","group_key":"aurora:c1","parent_group_key":null,"member_key":"db:i1","primary_member_key":"db:i1","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}' >"$current"
+    printf '%s\n' '{"marker_epoch_ms":1710000003500,"relations":[{"sid":101,"relation_type":"aurora_cluster","group_key":"aurora:c1","parent_group_key":null,"member_key":"db:i1","primary_member_key":"db:i1","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy"}],"upstreams":[]}' >"$expected"
+
+    run assert_exact_sid_contract "$current" "$upstreams" "$expected"
+    [ "$status" -eq 0 ]
+
+    jq '.is_writer=0 | .is_reader=0 | .replication_state="degraded"' "$current" >"$current.bad"
+    run assert_exact_sid_contract "$current.bad" "$upstreams" "$expected"
+    [ "$status" -ne 0 ]
+
+    printf '%s\n' '{"sid":101,"relation_type":"aurora_global_database","group_key":"aurora-global:g1","parent_group_key":null,"member_key":"db:i1","primary_member_key":"db:i1","role":"primary_cluster_member","is_writer":1,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}' >>"$current"
+    run assert_exact_sid_contract "$current" "$upstreams" "$expected"
+    [ "$status" -ne 0 ]
+}
+
+@test "native contract rejects an unlisted extra relation for a scoped SID" {
+    current="$TEST_TMPDIR/native-current.jsonl"
+    upstreams="$TEST_TMPDIR/native-upstreams.jsonl"
+    sidmap="$TEST_TMPDIR/native-sidmap.jsonl"
+    source="releem-task13-20260908-rds-source"
+    replica="releem-task13-20260908-rds-replica"
+    printf '%s\n' "{\"sid\":101,\"provider_id\":\"$source\"}" "{\"sid\":202,\"provider_id\":\"$replica\"}" >"$sidmap"
+    printf '%s\n' \
+      '{"sid":101,"relation_type":"standalone","member_key":"mysql:source","last_seen_epoch_ms":1710000004000}' \
+      '{"sid":202,"relation_type":"async_replication","member_key":"mysql:replica","primary_member_key":"mysql:source","last_seen_epoch_ms":1710000004000}' \
+      '{"sid":202,"relation_type":"galera_cluster","member_key":"mysql:replica","last_seen_epoch_ms":1710000004000}' >"$current"
+    printf '%s\n' '{"sid":202,"upstream_member_key":"mysql:source","last_seen_epoch_ms":1710000004000}' >"$upstreams"
+
+    run assert_exact_native_contract "$current" "$upstreams" "$sidmap" 1710000003500
+
+    [ "$status" -ne 0 ]
+}
+
+@test "ClickHouse evidence derives source edges only from persisted relations JSON" {
+    observations="$TEST_TMPDIR/ch-relations.jsonl"
+    evidence="$TEST_TMPDIR/ch-evidence.jsonl"
+    printf '%s\n' '{"sid":202,"rid":"rid-b","observed_epoch_ms":1710000004000,"relations":"[{\"relation_type\":\"rds_read_replica\",\"group_key\":\"rds:g\",\"parent_group_key\":\"rds:g\",\"member_key\":\"db:replica\",\"primary_member_key\":\"db:source\",\"role\":\"replica\",\"is_writer\":0,\"is_reader\":1,\"replication_state\":\"healthy\"}]"}' >"$observations"
+
+    run retain_clickhouse_observations "$observations" "$evidence"
+    [ "$status" -eq 0 ]
+    run jq -e '.source=="clickhouse" and .source_edges==[{"relation_type":"rds_read_replica","group_key":"rds:g","member_key":"db:replica","source_member_key":"db:source","replication_state":"healthy"}]' "$evidence"
+    [ "$status" -eq 0 ]
+
+    jq -c '.relations=(.relations|fromjson|map(.primary_member_key=null)|tojson)' "$observations" >"$observations.bad"
+    run retain_clickhouse_observations "$observations.bad" "$evidence"
+    [ "$status" -ne 0 ]
+}
+
+@test "global switchover waits for one ready target writer and old primary demotion" {
+    calls="$TEST_TMPDIR/global-calls"
+    printf '0\n' >"$calls"
+    aws_region() {
+        count="$(cat "$calls")"; count=$((count + 1)); printf '%s\n' "$count" >"$calls"
+        if [ "$count" -eq 1 ]; then
+            printf '%s\n' '{"Status":"modifying","GlobalClusterMembers":[{"DBClusterArn":"arn:old","IsWriter":true,"SynchronizationStatus":"connected"},{"DBClusterArn":"arn:new","IsWriter":false,"SynchronizationStatus":"connected"}]}'
+        else
+            printf '%s\n' '{"Status":"available","GlobalClusterMembers":[{"DBClusterArn":"arn:old","IsWriter":false,"SynchronizationStatus":"connected"},{"DBClusterArn":"arn:new","IsWriter":true,"SynchronizationStatus":"connected"}]}'
+        fi
+    }
+    RUN_DEADLINE_EPOCH=$(( $(date +%s) + 30 ))
+
+    run wait_global_switchover us-east-1 global-one arn:new arn:old
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$calls")" -eq 2 ]
 }
 
 teardown() {
@@ -136,7 +336,7 @@ EOF
 @test "destroy ownership rejects foreign bucket and mismatched IAM relationships" {
     fixture="$TEST_TMPDIR/support-ownership.json"
     cat >"$fixture" <<'EOF'
-{"bucket":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"}},"runner_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"inline_policy_name":"ReleemTopologyRunnerRead","inline_policy":{"Version":"2012-10-17","Statement":[{"Sid":"ReadRunObjects","Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/task13-20260908/*"]},{"Sid":"ReadEnhancedMonitoring","Effect":"Allow","Action":["logs:GetLogEvents"],"Resource":["arn:aws:logs:*:*:log-group:RDSOSMetrics:log-stream:*"]},{"Sid":"DescribeRDS","Effect":"Allow","Action":["rds:Describe*"],"Resource":["*"]}]},"attached_policies":["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]},"monitoring_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"attached_policies":["arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"]},"instance_profile":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"roles":["releem-task13-20260908-runner-role"]}}
+{"bucket":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"}},"runner_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"path":"/releem-topology/","trust_policy":{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]},"inline_policy_names":["ReleemTopologyRunnerRead"],"inline_policy_name":"ReleemTopologyRunnerRead","inline_policy":{"Version":"2012-10-17","Statement":[{"Sid":"ReadRunObjects","Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/task13-20260908/*"]},{"Sid":"ReadEnhancedMonitoring","Effect":"Allow","Action":["logs:GetLogEvents"],"Resource":["arn:aws:logs:*:*:log-group:RDSOSMetrics:log-stream:*"]},{"Sid":"DescribeRDS","Effect":"Allow","Action":["rds:Describe*"],"Resource":["*"]}]},"attached_policies":["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]},"monitoring_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"path":"/releem-topology/","trust_policy":{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"monitoring.rds.amazonaws.com"},"Action":"sts:AssumeRole"}]},"inline_policy_names":[],"attached_policies":["arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"]},"instance_profile":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"roles":["releem-task13-20260908-runner-role"]}}
 EOF
     run assert_destroy_support_ownership "$fixture" 'arn:aws:s3:::bucket/task13-20260908/*' releem-task13-20260908-runner-role releem-task13-20260908-monitoring-role
     [ "$status" -eq 0 ]
@@ -310,13 +510,13 @@ EOF
     upstreams="$TEST_TMPDIR/upstreams-exact.jsonl"
     expected="$TEST_TMPDIR/expected-exact.json"
     cat >"$current" <<'EOF'
-{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":null,"member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary","is_writer":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
-{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica","is_writer":0,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
+{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":null,"member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
+{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
 {"sid":202,"relation_type":"async_replication","group_key":"native:replica-a","parent_group_key":null,"member_key":"mysql:replica-a","primary_member_key":null,"role":"replica","is_writer":0,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
 EOF
     printf '%s\n' '{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy","last_seen_epoch_ms":1710000004000}' >"$upstreams"
     cat >"$expected" <<'EOF'
-{"marker_epoch_ms":1710000003500,"relations":[{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary"},{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica"},{"sid":202,"relation_type":"async_replication","member_key":"mysql:replica-a","role":"replica"}],"upstreams":[{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy"}]}
+{"marker_epoch_ms":1710000003500,"relations":[{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":null,"member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy"},{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy"},{"sid":202,"relation_type":"async_replication","member_key":"mysql:replica-a","role":"replica"}],"upstreams":[{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy"}]}
 EOF
 
     run assert_exact_sid_contract "$current" "$upstreams" "$expected"
@@ -444,6 +644,21 @@ EOF
     [ "$status" -ne 0 ]
     run validate_runtime_deadline 999999
     [ "$status" -ne 0 ]
+}
+
+@test "preflight cost shape records selected compute storage monitoring and runtime ceilings" {
+    summary="$TEST_TMPDIR/summary.json"
+    write_preflight_summary "$summary" 8.0.mysql_aurora.3.10.0 db.t4g.medium 0.5 8.0.43 db.t3.micro
+
+    run jq -e '
+      .serverless_v2=={instances:3,min_acu:0.5,configured_max_acu:1.5,transition_max_acu:2.5,load_attempts_max:3} and
+      .ordinary_mysql.instances==3 and .ordinary_mysql.engine_version=="8.0.43" and
+      .ordinary_mysql.instance_class=="db.t3.micro" and .ordinary_mysql.allocated_storage_gib_each==20 and
+      .ordinary_mysql.allocated_storage_gib_total==60 and .runners.encrypted_root_gib_total==16 and
+      .enhanced_monitoring_interval_seconds==1 and .runtime_deadline_seconds==14400
+    ' "$summary"
+
+    [ "$status" -eq 0 ]
 }
 
 @test "Enhanced Monitoring readiness requires stream events for exact resource ID" {

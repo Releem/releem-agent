@@ -36,7 +36,9 @@ type fakeClient struct {
 	describeInstanceIDs     []string
 	describeInstanceRegions []string
 	describeClusterIDs      []string
+	describeClusterRegions  []string
 	describeGlobalIDs       []string
+	describeGlobalRegions   []string
 }
 
 type describePageKey struct {
@@ -120,6 +122,61 @@ func TestDiscoverCrossRegionReplicas(t *testing.T) {
 	}
 }
 
+func TestARNTargetRegionPropagatesToBareRDSRelations(t *testing.T) {
+	fixture := loadDiscoveryFixture(t, "rds_read_replica.json")
+	target := fixture.DBInstances[0]
+	targetARN := strings.Replace(aws.ToString(target.DBInstanceArn), "us-east-1", "us-west-2", 1)
+	target.DBInstanceArn = aws.String(targetARN)
+	for i := 1; i < len(fixture.DBInstances); i++ {
+		fixture.DBInstances[i].DBInstanceArn = aws.String(strings.Replace(aws.ToString(fixture.DBInstances[i].DBInstanceArn), "us-east-1", "us-west-2", 1))
+	}
+	client := fakeClientFromFixture(fixture)
+	client.instancePages[describePageKey{identifier: targetARN}] = &rds.DescribeDBInstancesOutput{DBInstances: []types.DBInstance{target}}
+
+	got, err := DiscoverInstance(context.Background(), client, targetARN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Region != "us-west-2" || !equalStrings(client.describeInstanceRegions, []string{"us-west-2", "us-west-2", "us-west-2"}) {
+		t.Fatalf("metadata region %q, request regions %v", got.Region, client.describeInstanceRegions)
+	}
+}
+
+func TestARNTargetRegionPropagatesToBareAuroraRelations(t *testing.T) {
+	fixture := loadDiscoveryFixture(t, "aurora_global_primary.json")
+	target := fixture.DBInstances[0]
+	targetARN := strings.Replace(aws.ToString(target.DBInstanceArn), "us-east-1", "us-west-2", 1)
+	target.DBInstanceArn = aws.String(targetARN)
+	for i := range fixture.DBInstances {
+		fixture.DBInstances[i].DBInstanceArn = aws.String(strings.Replace(aws.ToString(fixture.DBInstances[i].DBInstanceArn), "us-east-1", "us-west-2", 1))
+	}
+	fixture.DBInstances[0] = target
+	fixture.DBClusters[0].DBClusterArn = aws.String(strings.Replace(aws.ToString(fixture.DBClusters[0].DBClusterArn), "us-east-1", "us-west-2", 1))
+	for i := range fixture.GlobalClusters[0].GlobalClusterMembers {
+		if strings.Contains(aws.ToString(fixture.GlobalClusters[0].GlobalClusterMembers[i].DBClusterArn), "global-primary") {
+			fixture.GlobalClusters[0].GlobalClusterMembers[i].DBClusterArn = fixture.DBClusters[0].DBClusterArn
+		}
+	}
+	client := fakeClientFromFixture(fixture)
+	client.instancePages[describePageKey{identifier: targetARN}] = &rds.DescribeDBInstancesOutput{DBInstances: []types.DBInstance{target}}
+
+	got, err := DiscoverInstance(context.Background(), client, targetARN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Region != "us-west-2" {
+		t.Fatalf("metadata region = %q", got.Region)
+	}
+	for _, region := range client.describeInstanceRegions {
+		if region != "us-west-2" {
+			t.Fatalf("instance request regions = %v", client.describeInstanceRegions)
+		}
+	}
+	if !equalStrings(client.describeClusterRegions, []string{"us-west-2"}) || !equalStrings(client.describeGlobalRegions, []string{"us-west-2"}) {
+		t.Fatalf("cluster/global request regions = %v/%v", client.describeClusterRegions, client.describeGlobalRegions)
+	}
+}
+
 func TestDiscoverGlobalAPIFailurePreservesTarget(t *testing.T) {
 	fixture := loadDiscoveryFixture(t, "aurora_global_primary.json")
 	client := fakeClientFromFixture(fixture)
@@ -137,7 +194,12 @@ func TestDiscoverGlobalAPIFailurePreservesTarget(t *testing.T) {
 	}
 }
 
-func (f *fakeClient) DescribeDBClusters(_ context.Context, input *rds.DescribeDBClustersInput, _ ...func(*rds.Options)) (*rds.DescribeDBClustersOutput, error) {
+func (f *fakeClient) DescribeDBClusters(_ context.Context, input *rds.DescribeDBClustersInput, options ...func(*rds.Options)) (*rds.DescribeDBClustersOutput, error) {
+	settings := rds.Options{}
+	for _, option := range options {
+		option(&settings)
+	}
+	f.describeClusterRegions = append(f.describeClusterRegions, settings.Region)
 	identifier := aws.ToString(input.DBClusterIdentifier)
 	key := describePageKey{identifier: identifier, marker: aws.ToString(input.Marker)}
 	f.describeClusterIDs = append(f.describeClusterIDs, identifier)
@@ -147,7 +209,12 @@ func (f *fakeClient) DescribeDBClusters(_ context.Context, input *rds.DescribeDB
 	return f.clustersOutput, f.clustersErr
 }
 
-func (f *fakeClient) DescribeGlobalClusters(_ context.Context, input *rds.DescribeGlobalClustersInput, _ ...func(*rds.Options)) (*rds.DescribeGlobalClustersOutput, error) {
+func (f *fakeClient) DescribeGlobalClusters(_ context.Context, input *rds.DescribeGlobalClustersInput, options ...func(*rds.Options)) (*rds.DescribeGlobalClustersOutput, error) {
+	settings := rds.Options{}
+	for _, option := range options {
+		option(&settings)
+	}
+	f.describeGlobalRegions = append(f.describeGlobalRegions, settings.Region)
 	identifier := aws.ToString(input.GlobalClusterIdentifier)
 	key := describePageKey{identifier: identifier, marker: aws.ToString(input.Marker)}
 	f.describeGlobalIDs = append(f.describeGlobalIDs, identifier)
