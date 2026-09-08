@@ -703,7 +703,7 @@ EOF
     [ "$status" -ne 0 ]
 }
 
-@test "settled exact DB NotFound confirms attempted create absent" {
+@test "repeated DB NotFound keeps attempted create unresolved" {
     initialize_monitoring_tracking
     identifier=releem-task13-20260908-rds-source
     mark_instance_create_attempted us-east-1 "$identifier"
@@ -715,14 +715,59 @@ EOF
     }
 
     run recover_monitoring_resource_ids
+    [ "$status" -ne 0 ]
+    run awk -F '\t' -v id="$identifier" '$2==id && $3=="create_attempted" && $4==""{found=1} END{exit !found}' "$(monitoring_tracking_file)"
     [ "$status" -eq 0 ]
-    run awk -F '\t' -v id="$identifier" '$2==id && $3=="confirmed_absent" && $4==""{found=1} END{exit !found}' "$(monitoring_tracking_file)"
-    [ "$status" -eq 0 ]
-    run monitoring_tracking_complete
-    [ "$status" -eq 0 ]
+    run db_dependencies_may_be_deleted
+    [ "$status" -ne 0 ]
     run grep -c describe-db-instances "$calls"
     [ "$status" -eq 0 ]
-    [ "$output" -eq 3 ]
+    [ "$output" -eq 1 ]
+}
+
+@test "late instance after repeated NotFound is recovered on later destroy" {
+    initialize_monitoring_tracking
+    identifier=releem-task13-20260908-rds-source
+    mark_instance_create_attempted us-east-1 "$identifier"
+    response="$(state_dir)/create-us-east-1-${identifier}-response.json"
+    calls="$TEST_TMPDIR/late-create-calls"
+    aws_region() {
+        count=0; [[ -f "$calls" ]] && count="$(wc -l <"$calls")"
+        printf 'call\n' >>"$calls"
+        if ((count < 3)); then
+            printf '%s\n' "An error occurred (DBInstanceNotFound) when calling the DescribeDBInstances operation: DBInstance $identifier not found" >&2
+            return 254
+        fi
+        printf '%s\n' db-LATE1
+    }
+
+    run recover_monitoring_resource_ids
+    [ "$status" -ne 0 ]
+    run recover_monitoring_resource_ids
+    [ "$status" -ne 0 ]
+    run recover_monitoring_resource_ids
+    [ "$status" -ne 0 ]
+    run recover_monitoring_resource_ids
+    [ "$status" -eq 0 ]
+    run awk -F '\t' -v id="$identifier" '$2==id && $3=="created_with_resource_id" && $4=="db-LATE1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
+    run db_dependencies_may_be_deleted
+    [ "$status" -eq 0 ]
+}
+
+@test "attempted create recovers monitoring ID from durable response before describe" {
+    initialize_monitoring_tracking
+    identifier=releem-task13-20260908-rds-source
+    mark_instance_create_attempted us-east-1 "$identifier"
+    response="$(state_dir)/create-us-east-1-${identifier}-response.json"
+    printf '%s\n' "{\"DBInstance\":{\"DBInstanceIdentifier\":\"$identifier\",\"DbiResourceId\":\"db-DURABLE1\"}}" >"$response"
+    aws_region() { return 1; }
+
+    run recover_monitoring_resource_ids
+
+    [ "$status" -eq 0 ]
+    run awk -F '\t' -v id="$identifier" '$2==id && $3=="created_with_resource_id" && $4=="db-DURABLE1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
 }
 
 @test "one DB NotFound followed by ambiguity remains attempted" {

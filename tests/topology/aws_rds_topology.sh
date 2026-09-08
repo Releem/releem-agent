@@ -1590,7 +1590,7 @@ ensure_cluster_instance() {
     local -a monitor_args
     mapfile -t monitor_args < <(monitoring_arguments "$MONITORING_ROLE_ARN")
     if ! instance_exists "$region" "$identifier"; then
-        response="$(state_dir)/create-${region}-${identifier}-response.json"
+        response="$(create_instance_response_file "$region" "$identifier")"
         mark_instance_create_attempted "$region" "$identifier"
         aws_region "$region" rds create-db-instance --db-instance-identifier "$identifier" \
             --db-cluster-identifier "$cluster" --engine aurora-mysql --db-instance-class "$class" \
@@ -1641,7 +1641,7 @@ ensure_rds_instance() {
     local identifier="$1" subnet="$2" sg="$3" pg="$4" multi="$5" file response
     if ! instance_exists "$PRIMARY_REGION" "$identifier"; then
         file="$(rds_input_file "$identifier" "$subnet" "$sg" "$pg" "$multi")"
-        response="$(state_dir)/create-${PRIMARY_REGION}-${identifier}-response.json"
+        response="$(create_instance_response_file "$PRIMARY_REGION" "$identifier")"
         mark_instance_create_attempted "$PRIMARY_REGION" "$identifier"
         aws_region "$PRIMARY_REGION" rds create-db-instance --cli-input-json "file://${file}" --output json >"$response"
         arm_cleanup
@@ -1672,7 +1672,7 @@ ensure_read_replica() {
     local -a args
     mapfile -t args < <(read_replica_create_arguments "$identifier" "$source" "$subnet" "$sg")
     if ! instance_exists "$PRIMARY_REGION" "$identifier"; then
-        response="$(state_dir)/create-${PRIMARY_REGION}-${identifier}-response.json"
+        response="$(create_instance_response_file "$PRIMARY_REGION" "$identifier")"
         mark_instance_create_attempted "$PRIMARY_REGION" "$identifier"
         aws_region "$PRIMARY_REGION" rds create-db-instance-read-replica "${args[@]}" --output json >"$response"
         arm_cleanup
@@ -1892,7 +1892,7 @@ persist_monitoring_resource_id() {
     local region="$1" identifier="$2" resource_id="$3" lifecycle
     [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
     lifecycle="$(monitoring_lifecycle_for_instance "$region" "$identifier")" || return 1
-    [[ "$lifecycle" == create_attempted || "$lifecycle" == created_with_resource_id ]] || return 1
+    [[ "$lifecycle" == create_attempted || "$lifecycle" == created_with_resource_id || "$lifecycle" == confirmed_absent ]] || return 1
     set_monitoring_lifecycle "$region" "$identifier" created_with_resource_id "$resource_id"
 }
 
@@ -1903,6 +1903,17 @@ capture_monitoring_resource_id_from_response() {
     [[ "$response_identifier" == "$identifier" ]] || return 1
     resource_id="$(jq -er '.DBInstance.DbiResourceId' "$response")" || return 1
     persist_monitoring_resource_id "$region" "$identifier" "$resource_id"
+}
+
+create_instance_response_file() {
+    printf '%s/create-%s-%s-response.json\n' "$(state_dir)" "$1" "$2"
+}
+
+recover_monitoring_resource_id_from_response() {
+    local region="$1" identifier="$2" response
+    response="$(create_instance_response_file "$region" "$identifier")"
+    [[ -s "$response" ]] || return 1
+    capture_monitoring_resource_id_from_response "$region" "$identifier" "$response"
 }
 
 tracked_monitoring_resource_id() {
@@ -1920,20 +1931,18 @@ tracked_monitoring_resource_id() {
     printf '%s\n' "$resource_id"
 }
 
-confirm_attempted_instance_absent() {
-    local region="$1" identifier="$2" attempt result
-    for attempt in 1 2 3; do
-        result="$(probe_db_instance_resource_id "$region" "$identifier")" || return 1
-        if [[ "${result%%$'\t'*}" == present ]]; then
-            persist_monitoring_resource_id "$region" "$identifier" "${result#*$'\t'}"
-            return
-        fi
-        [[ "$result" == absent ]] || return 1
-        if ((attempt < 3 && POLL_SECONDS > 0)); then
-            cleanup_bounded_sleep "$POLL_SECONDS" || return 1
-        fi
-    done
-    set_monitoring_lifecycle "$region" "$identifier" confirmed_absent
+recover_attempted_instance() {
+    local region="$1" identifier="$2" result
+    recover_monitoring_resource_id_from_response "$region" "$identifier" && return 0
+    result="$(probe_db_instance_resource_id "$region" "$identifier")" || return 1
+    if [[ "${result%%$'\t'*}" == present ]]; then
+        persist_monitoring_resource_id "$region" "$identifier" "${result#*$'\t'}"
+        return
+    fi
+    # NotFound is only a point-in-time observation. A create request whose
+    # outcome was interrupted remains unresolved until a response or instance
+    # supplies the durable resource ID.
+    return 1
 }
 
 delete_db_instance_if_monitoring_tracked() {
@@ -1965,7 +1974,6 @@ monitoring_tracking_complete() {
     awk -F '\t' '
       NF!=4 {exit 1}
       $3=="planned" && $4=="" {next}
-      $3=="confirmed_absent" && $4=="" {next}
       $3=="created_with_resource_id" && $4~/^db-[A-Za-z0-9]+$/ {if(seen[$4]++) exit 1; next}
       {exit 1}
     ' "$file"
@@ -1977,7 +1985,7 @@ monitoring_all_instances_created() {
 }
 
 monitoring_manifest_has_unresolved_attempts() {
-    awk -F '\t' '$3=="create_attempted"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    awk -F '\t' '$3=="create_attempted" || $3=="confirmed_absent"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
 }
 
 db_dependencies_may_be_deleted() {
@@ -1989,9 +1997,9 @@ recover_monitoring_resource_ids() {
     initialize_monitoring_tracking
     while IFS=$'\t' read -r region identifier lifecycle resource_id; do
         case "$lifecycle" in
-            planned|confirmed_absent) ;;
+            planned) ;;
             created_with_resource_id) [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || failed=1 ;;
-            create_attempted) confirm_attempted_instance_absent "$region" "$identifier" || failed=1 ;;
+            create_attempted|confirmed_absent) recover_attempted_instance "$region" "$identifier" || failed=1 ;;
             *) failed=1 ;;
         esac
     done <"$(monitoring_tracking_file)"

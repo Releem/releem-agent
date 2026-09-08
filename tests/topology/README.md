@@ -256,16 +256,16 @@ an AWS create request it becomes `create_attempted`, and a successful response
 or describe stores `created_with_resource_id` plus the resource ID atomically.
 Untouched `planned` entries need no monitoring stream. Cleanup retries IDs for
 attempted entries but never deletes an instance whose ID is not durably
-recorded. Three settled, exact `DBInstanceNotFound` responses may instead mark
-an attempted entry `confirmed_absent`; ambiguous, transient, or single absence
-responses leave it unresolved. In that case cleanup removes independent
-runners and private delivery resources, returns nonzero, and preserves DB
+recorded. Recovery reads a durable create response before probing the live
+instance. `DBInstanceNotFound` is only a point-in-time observation and never
+converts an interrupted create into terminal absence. In that case cleanup
+removes independent runners and private delivery resources, returns nonzero, and preserves DB
 clusters, database network/parameter dependencies, and the monitoring role so
 an exact-confirmed later `destroy` can recover safely. IDs remain in the
 manifest after database deletion for exact log-stream deletion and absence
 proof. Terminal success requires empty AWS inventory, no unresolved attempts,
 unique IDs for every created instance with its stream absent, and only
-unattempted or confirmed-absent entries otherwise. Legacy blank manifests are
+unattempted entries otherwise. Legacy blank manifests are
 migrated fail-closed as attempted rather than assumed never created.
 
 The reviewed `/tmp/releem-agent-db-topology-x86_64` binary and mode-`0600`
