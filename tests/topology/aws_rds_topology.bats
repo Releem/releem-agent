@@ -1156,6 +1156,13 @@ EOF
                 fi
                 ;;
             *describe-security-groups*) printf '%s\n' '{"SecurityGroups":[]}' ;;
+            us-east-1\ ec2\ describe-instances*)
+                if [ "${INCLUDE_RUNNERS:-0}" -eq 1 ]; then
+                    printf '%s\n' '{"Reservations":[{"Instances":[{"InstanceId":"i-active","State":{"Name":"running"},"Tags":[{"Key":"releem-topology-run","Value":"task13-20260908"},{"Key":"releem-topology-managed","Value":"true"}]},{"InstanceId":"i-terminal","State":{"Name":"terminated"},"Tags":[{"Key":"releem-topology-run","Value":"task13-20260908"},{"Key":"releem-topology-managed","Value":"true"}]}]}]}'
+                else
+                    printf '%s\n' '{"Reservations":[]}'
+                fi
+                ;;
             *describe-instances*) printf '%s\n' '{"Reservations":[]}' ;;
             *) return 1 ;;
         esac
@@ -1179,9 +1186,10 @@ EOF
     [ "$status" -eq 0 ]
 
     INCLUDE_SECURITY_GROUPS=1
+    INCLUDE_RUNNERS=1
     run capture_deterministic_collisions "$fixture"
     [ "$status" -eq 0 ]
-    run jq -e '.existing==["sg-owned"] and .direct_owned==["sg-owned"]' "$fixture"
+    run jq -e '.existing==["sg-owned","i-active"] and .direct_owned==["sg-owned","i-active"]' "$fixture"
     [ "$status" -eq 0 ]
 }
 

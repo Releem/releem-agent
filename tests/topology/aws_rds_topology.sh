@@ -941,8 +941,8 @@ capture_deterministic_collisions() {
          $es[0].DBSubnetGroups[]?.DBSubnetGroupName,$ws[0].DBSubnetGroups[]?.DBSubnetGroupName] | map(select(startswith($prefix)))) +
         [($esg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId),
          ($wsg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId)] +
-        [$eri[0].Reservations[].Instances[]?|select(.State.Name!="terminated")|.InstanceId,
-         $wri[0].Reservations[].Instances[]?|select(.State.Name!="terminated")|.InstanceId] +
+        [($eri[0].Reservations[].Instances[]?|select(.State.Name!="terminated")|.InstanceId),
+         ($wri[0].Reservations[].Instances[]?|select(.State.Name!="terminated")|.InstanceId)] +
         (if $bucket_state=="present" then [$bucket] else [] end)),
        direct_owned:([($esg[0].SecurityGroups[]?|select((.GroupName|startswith($prefix)) and directly_owned)|.GroupId),
                       ($wsg[0].SecurityGroups[]?|select((.GroupName|startswith($prefix)) and directly_owned)|.GroupId),
