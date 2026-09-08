@@ -63,6 +63,23 @@ func TestBuildTopologyRelationsAuroraProvisioned(t *testing.T) {
 	}
 }
 
+func TestIncompleteProviderMetadataOmitsAuthoritativeRelations(t *testing.T) {
+	metadata := testAuroraTopologyMetadata()
+	metadata.TopologyIncomplete = true
+	metrics := &models.Metrics{}
+	metrics.DB.Topology = models.MetricGroupValue{"Relations": []models.MetricGroupValue{}}
+	AttachReportMetadata(metrics, metadata, true)
+	if err := (&topologyRelationsGatherer{}).GetMetrics(metrics); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := metrics.DB.Topology["Relations"]; ok {
+		t.Fatal("incomplete topology marked authoritative")
+	}
+	if len(relationSlice(topologyFacts(metrics.DB.Topology)["Relations"])) == 0 {
+		t.Fatal("local relations lost")
+	}
+}
+
 func TestBuildTopologyRelationsAuroraServerlessV2(t *testing.T) {
 	metadata := testAuroraTopologyMetadata()
 	metadata.DBInstanceClass = "db.serverless"

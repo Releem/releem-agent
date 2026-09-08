@@ -311,6 +311,7 @@ func TestMetadataLogFieldsOmitSensitiveTopologyData(t *testing.T) {
 
 	fields := metadata.LogFields()
 	assertExactKeys(t, "Metadata.LogFields", fields, []string{
+		"topology_incomplete",
 		"cluster_member_count",
 		"db_cluster_identifier",
 		"db_cluster_parameter_group",

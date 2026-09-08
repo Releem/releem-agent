@@ -50,7 +50,7 @@ func AttachReportMetadata(metrics *models.Metrics, metadata Metadata, complete b
 	}
 	metrics.Internal.AWSRDS = reportTopologyMetadata{
 		metadata: metadata.Clone(),
-		complete: complete,
+		complete: complete && !metadata.TopologyIncomplete,
 	}
 }
 

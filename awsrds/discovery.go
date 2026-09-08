@@ -64,8 +64,10 @@ type ServerlessV2ScalingConfiguration struct {
 // Metadata contains the authoritative instance, cluster, global-cluster, and
 // ordinary RDS replication topology attached to one RDS DB instance.
 type Metadata struct {
-	Partition string
-	Region    string
+	// TopologyIncomplete preserves usable target metadata when optional API discovery fails.
+	TopologyIncomplete bool
+	Partition          string
+	Region             string
 
 	DBInstanceIdentifier                  string
 	DBInstanceARN                         string
@@ -248,18 +250,20 @@ func discoverAuroraInstance(ctx context.Context, client Client, target types.DBI
 	metadata.IsClusterWriter = aws.ToBool(matchingMembers[0].IsClusterWriter)
 	metadata.PromotionTier = aws.ToInt32(matchingMembers[0].PromotionTier)
 	if globalID := aws.ToString(cluster.GlobalClusterIdentifier); globalID != "" {
-		if err := discoverGlobalCluster(ctx, client, cluster, &metadata, globalID); err != nil {
+		globalCluster, err := describeGlobalCluster(ctx, client, globalID)
+		if err != nil {
+			metadata.GlobalClusterIdentifier = globalID
+			metadata.TopologyIncomplete = true
+			return metadata, nil
+		}
+		if err := discoverGlobalCluster(cluster, globalCluster, &metadata, globalID); err != nil {
 			return Metadata{}, err
 		}
 	}
 	return metadata, nil
 }
 
-func discoverGlobalCluster(ctx context.Context, client Client, localCluster types.DBCluster, metadata *Metadata, globalID string) error {
-	globalCluster, err := describeGlobalCluster(ctx, client, globalID)
-	if err != nil {
-		return err
-	}
+func discoverGlobalCluster(localCluster types.DBCluster, globalCluster types.GlobalCluster, metadata *Metadata, globalID string) error {
 	metadata.GlobalClusterIdentifier = aws.ToString(globalCluster.GlobalClusterIdentifier)
 	metadata.GlobalClusterARN = aws.ToString(globalCluster.GlobalClusterArn)
 	metadata.GlobalClusterResourceID = aws.ToString(globalCluster.GlobalClusterResourceId)
@@ -350,19 +354,23 @@ func discoverRDSReadReplicas(ctx context.Context, client Client, target types.DB
 	metadata.ReadReplicaDBInstanceIdentifiers = append([]string(nil), target.ReadReplicaDBInstanceIdentifiers...)
 
 	if sourceID := metadata.ReadReplicaSourceDBInstanceIdentifier; sourceID != "" {
-		if strings.EqualFold(sourceID, metadata.DBInstanceIdentifier) {
+		if matchesDBInstanceReference(sourceID, target, target) {
 			return Metadata{}, fmt.Errorf("DB instance %q declares itself as its read-replica source", metadata.DBInstanceIdentifier)
 		}
 		source, err := describeDBInstance(ctx, client, sourceID)
 		if err != nil {
 			return Metadata{}, fmt.Errorf("resolve read-replica source for DB instance %q: %w", metadata.DBInstanceIdentifier, err)
 		}
-		if !containsStringFold(source.ReadReplicaDBInstanceIdentifiers, metadata.DBInstanceIdentifier) {
-			return Metadata{}, fmt.Errorf("DB instance %q declares source %q, but the source does not declare it as a read replica", metadata.DBInstanceIdentifier, sourceID)
-		}
 		related, err := relatedDBInstance(source)
 		if err != nil {
 			return Metadata{}, fmt.Errorf("resolve read-replica source for DB instance %q: %w", metadata.DBInstanceIdentifier, err)
+		}
+		declared := false
+		for _, reference := range source.ReadReplicaDBInstanceIdentifiers {
+			declared = declared || matchesDBInstanceReference(reference, target, source)
+		}
+		if !declared {
+			return Metadata{}, fmt.Errorf("DB instance %q declares source %q, but the source does not declare it as a read replica", metadata.DBInstanceIdentifier, sourceID)
 		}
 		metadata.HasReadReplicaSource = true
 		metadata.ReadReplicaSource = related
@@ -373,7 +381,7 @@ func discoverRDSReadReplicas(ctx context.Context, client Client, target types.DB
 		if replicaID == "" {
 			return Metadata{}, fmt.Errorf("DB instance %q declares a read replica without an identifier", metadata.DBInstanceIdentifier)
 		}
-		if strings.EqualFold(replicaID, metadata.DBInstanceIdentifier) {
+		if matchesDBInstanceReference(replicaID, target, target) {
 			return Metadata{}, fmt.Errorf("DB instance %q declares itself as a read replica", metadata.DBInstanceIdentifier)
 		}
 		replicaKey := strings.ToLower(replicaID)
@@ -386,7 +394,7 @@ func discoverRDSReadReplicas(ctx context.Context, client Client, target types.DB
 		if err != nil {
 			return Metadata{}, fmt.Errorf("resolve read replica of DB instance %q: %w", metadata.DBInstanceIdentifier, err)
 		}
-		if sourceID := aws.ToString(replica.ReadReplicaSourceDBInstanceIdentifier); !strings.EqualFold(sourceID, metadata.DBInstanceIdentifier) {
+		if sourceID := aws.ToString(replica.ReadReplicaSourceDBInstanceIdentifier); !matchesDBInstanceReference(sourceID, target, replica) {
 			return Metadata{}, fmt.Errorf("DB instance %q declares read replica %q, but the replica declares source %q", metadata.DBInstanceIdentifier, replicaID, sourceID)
 		}
 		related, err := relatedDBInstance(replica)
@@ -398,10 +406,22 @@ func discoverRDSReadReplicas(ctx context.Context, client Client, target types.DB
 	return metadata, nil
 }
 
+// Bare references are local to the declaring instance's region and account.
+func matchesDBInstanceReference(reference string, target, declaring types.DBInstance) bool {
+	identity, err := parseRDSARN(reference, "db")
+	if !strings.HasPrefix(reference, "arn:") {
+		identity, err = parseRDSARN(aws.ToString(declaring.DBInstanceArn), "db")
+		identity.Identifier = reference
+	}
+	want, wantErr := parseRDSARN(aws.ToString(target.DBInstanceArn), "db")
+	return err == nil && wantErr == nil && sameRDSIdentity(identity, want)
+}
+
 // LogFields returns a bounded discovery summary that omits endpoints, ARNs,
 // account IDs, resource IDs, raw API payloads, and credentials.
 func (m Metadata) LogFields() map[string]interface{} {
 	return map[string]interface{}{
+		"topology_incomplete":               m.TopologyIncomplete,
 		"partition":                         m.Partition,
 		"region":                            m.Region,
 		"db_instance_identifier":            m.DBInstanceIdentifier,
@@ -469,6 +489,9 @@ func describeDBInstance(ctx context.Context, client Client, identifier string) (
 	if !strings.EqualFold(actualID, expectedID) {
 		return types.DBInstance{}, fmt.Errorf("DB instance %q returned identity %q", identifier, actualID)
 	}
+	if strings.HasPrefix(identifier, "arn:") && !matchesDBInstanceReference(identifier, instances[0], instances[0]) {
+		return types.DBInstance{}, fmt.Errorf("DB instance %q returned a different ARN identity", identifier)
+	}
 	return instances[0], nil
 }
 
@@ -521,11 +544,19 @@ func describeGlobalCluster(ctx context.Context, client Client, identifier string
 }
 
 func describeDBInstancePages(ctx context.Context, client Client, identifier string) ([]types.DBInstance, error) {
+	var options []func(*rds.Options)
+	if strings.HasPrefix(identifier, "arn:") {
+		identity, err := parseRDSARN(identifier, "db")
+		if err != nil {
+			return nil, err
+		}
+		options = append(options, func(o *rds.Options) { o.Region = identity.Region })
+	}
 	input := &rds.DescribeDBInstancesInput{DBInstanceIdentifier: aws.String(identifier)}
 	var instances []types.DBInstance
 	seenMarkers := make(map[string]struct{})
 	for {
-		output, err := client.DescribeDBInstances(ctx, input)
+		output, err := client.DescribeDBInstances(ctx, input, options...)
 		if err != nil {
 			return nil, err
 		}

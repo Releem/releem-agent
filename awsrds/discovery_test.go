@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -31,9 +33,10 @@ type fakeClient struct {
 	globalPages   map[describePageKey]*rds.DescribeGlobalClustersOutput
 	globalErrs    map[describePageKey]error
 
-	describeInstanceIDs []string
-	describeClusterIDs  []string
-	describeGlobalIDs   []string
+	describeInstanceIDs     []string
+	describeInstanceRegions []string
+	describeClusterIDs      []string
+	describeGlobalIDs       []string
 }
 
 type describePageKey struct {
@@ -41,7 +44,39 @@ type describePageKey struct {
 	marker     string
 }
 
-func (f *fakeClient) DescribeDBInstances(_ context.Context, input *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+type discoveryHTTPClient func(*http.Request) (*http.Response, error)
+
+func (f discoveryHTTPClient) Do(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestARNLookupUsesRegionalEndpointAndSigningRegion(t *testing.T) {
+	client := rds.NewFromConfig(aws.Config{
+		Region: "us-east-1",
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		}),
+		HTTPClient: discoveryHTTPClient(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Host != "rds.eu-west-1.amazonaws.com" {
+				t.Errorf("endpoint = %s", request.URL.Host)
+			}
+			if !strings.Contains(request.Header.Get("Authorization"), "/eu-west-1/rds/aws4_request") {
+				t.Error("request signed for wrong region")
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`<DescribeDBInstancesResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/"><DescribeDBInstancesResult><DBInstances/></DescribeDBInstancesResult></DescribeDBInstancesResponse>`))}, nil
+		}),
+	})
+	if _, err := describeDBInstancePages(context.Background(), client, "arn:aws:rds:eu-west-1:123456789012:db:orders"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *fakeClient) DescribeDBInstances(_ context.Context, input *rds.DescribeDBInstancesInput, options ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+	settings := rds.Options{}
+	for _, option := range options {
+		option(&settings)
+	}
+	f.describeInstanceRegions = append(f.describeInstanceRegions, settings.Region)
 	identifier := aws.ToString(input.DBInstanceIdentifier)
 	key := describePageKey{identifier: identifier, marker: aws.ToString(input.Marker)}
 	f.describeInstanceIDs = append(f.describeInstanceIDs, identifier)
@@ -49,6 +84,57 @@ func (f *fakeClient) DescribeDBInstances(_ context.Context, input *rds.DescribeD
 		return output, f.instanceErrs[key]
 	}
 	return f.instancesOutput, f.instancesErr
+}
+
+func TestDiscoverCrossRegionReplicas(t *testing.T) {
+	fixture := loadDiscoveryFixture(t, "rds_read_replica.json")
+	target := &fixture.DBInstances[0]
+	source := &fixture.DBInstances[1]
+	replica := &fixture.DBInstances[2]
+	source.DBInstanceArn = aws.String(strings.Replace(aws.ToString(source.DBInstanceArn), "us-east-1", "eu-west-1", 1))
+	replica.DBInstanceArn = aws.String(strings.Replace(aws.ToString(replica.DBInstanceArn), "us-east-1", "us-west-2", 1))
+	target.ReadReplicaSourceDBInstanceIdentifier = source.DBInstanceArn
+	target.ReadReplicaDBInstanceIdentifiers = []string{aws.ToString(replica.DBInstanceArn)}
+	source.ReadReplicaDBInstanceIdentifiers = []string{aws.ToString(target.DBInstanceArn)}
+	replica.ReadReplicaSourceDBInstanceIdentifier = target.DBInstanceArn
+	client := fakeClientFromFixture(fixture)
+	for _, instance := range fixture.DBInstances {
+		client.instancePages[describePageKey{identifier: aws.ToString(instance.DBInstanceArn)}] = &rds.DescribeDBInstancesOutput{DBInstances: []types.DBInstance{instance}}
+	}
+	got, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReadReplicaSource.Region != "eu-west-1" || len(got.ReadReplicas) != 1 || got.ReadReplicas[0].Region != "us-west-2" {
+		t.Fatalf("wrong related instances: %+v", got)
+	}
+	if !equalStrings(client.describeInstanceRegions, []string{"", "eu-west-1", "us-west-2"}) {
+		t.Fatalf("request regions: %v", client.describeInstanceRegions)
+	}
+	// An identically named instance in another account must never be accepted.
+	wrong := *source
+	wrong.DBInstanceArn = aws.String(strings.Replace(aws.ToString(source.DBInstanceArn), "123456789012", "999999999999", 1))
+	client.instancePages[describePageKey{identifier: aws.ToString(source.DBInstanceArn)}] = &rds.DescribeDBInstancesOutput{DBInstances: []types.DBInstance{wrong}}
+	if _, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier); err == nil {
+		t.Fatal("accepted wrong account")
+	}
+}
+
+func TestDiscoverGlobalAPIFailurePreservesTarget(t *testing.T) {
+	fixture := loadDiscoveryFixture(t, "aurora_global_primary.json")
+	client := fakeClientFromFixture(fixture)
+	client.globalPages = nil
+	client.globalErr = errors.New("AccessDenied: rds:DescribeGlobalClusters")
+	got, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Endpoint == "" || got.DBInstanceIdentifier != fixture.TargetIdentifier || len(got.ClusterMembers) != 2 || !got.TopologyIncomplete || got.GlobalClusterIdentifier != "orders-global" {
+		t.Fatalf("lost local metadata: %+v", got)
+	}
+	if len(got.GlobalClusterMembers) != 0 || got.GlobalClusterARN != "" {
+		t.Fatal("published unverified global topology")
+	}
 }
 
 func (f *fakeClient) DescribeDBClusters(_ context.Context, input *rds.DescribeDBClustersInput, _ ...func(*rds.Options)) (*rds.DescribeDBClustersOutput, error) {
