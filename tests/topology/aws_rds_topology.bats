@@ -53,6 +53,20 @@ setup() {
     [ "$(<"$marker")" = $'cleaned\ncontinued' ]
 }
 
+@test "stop agents skips terminated runners during retry cleanup" {
+    mkdir -p "$(state_dir)"
+    printf '%s\n' 'S3_BUCKET=test-bucket' 'MONITORING_ROLE_ARN=arn:aws:iam::111111111111:role/test' \
+        'EAST_RUNNER_ID=i-east' 'WEST_RUNNER_ID=i-west' >"$(support_state_file)"
+    chmod 600 "$(support_state_file)"
+    cleanup_aws_region() { printf '%s\n' terminated; }
+    send_ssm_commands() { return 99; }
+    CLEANUP_DEADLINE_EPOCH=$(( $(date +%s) + 60 ))
+
+    run stop_agents
+
+    [ "$status" -eq 0 ]
+}
+
 @test "cleanup stops watchdog and defers TERM until dependency cleanup finishes" {
     marker="$TEST_TMPDIR/cleanup-signal"
     sleep 60 &
@@ -1134,6 +1148,13 @@ EOF
             *describe-db-parameter-groups*) printf '%s\n' '{"DBParameterGroups":[]}' ;;
             *describe-db-cluster-parameter-groups*) printf '%s\n' '{"DBClusterParameterGroups":[]}' ;;
             *describe-db-subnet-groups*) printf '%s\n' '{"DBSubnetGroups":[]}' ;;
+            us-east-1\ ec2\ describe-security-groups*)
+                if [ "${INCLUDE_SECURITY_GROUPS:-0}" -eq 1 ]; then
+                    printf '%s\n' '{"SecurityGroups":[{"GroupName":"releem-task13-20260908-runner","GroupId":"sg-owned","Tags":[{"Key":"releem-topology-run","Value":"task13-20260908"},{"Key":"releem-topology-managed","Value":"true"}]},{"GroupName":"unrelated","GroupId":"sg-foreign","Tags":[]}]}'
+                else
+                    printf '%s\n' '{"SecurityGroups":[]}'
+                fi
+                ;;
             *describe-security-groups*) printf '%s\n' '{"SecurityGroups":[]}' ;;
             *describe-instances*) printf '%s\n' '{"Reservations":[]}' ;;
             *) return 1 ;;
@@ -1155,6 +1176,31 @@ EOF
 
     [ "$status" -eq 0 ]
     run jq -e '.expected==[] and .existing==[]' "$fixture"
+    [ "$status" -eq 0 ]
+
+    INCLUDE_SECURITY_GROUPS=1
+    run capture_deterministic_collisions "$fixture"
+    [ "$status" -eq 0 ]
+    run jq -e '.existing==["sg-owned"] and .direct_owned==["sg-owned"]' "$fixture"
+    [ "$status" -eq 0 ]
+}
+
+@test "regional inventory discovers directly tagged security groups during tagging API lag" {
+    aws_region() {
+        case "$*" in
+            *resourcegroupstaggingapi\ get-resources*) printf '%s\n' '{"ResourceTagMappingList":[]}' ;;
+            *ec2\ describe-security-groups*)
+                printf '%s\n' '{"SecurityGroups":[{"OwnerId":"111111111111","GroupName":"releem-task13-20260908-runner","GroupId":"sg-owned","Tags":[{"Key":"releem-topology-run","Value":"task13-20260908"},{"Key":"releem-topology-managed","Value":"true"}]}]}'
+                ;;
+            *) return 1 ;;
+        esac
+    }
+    fixture="$TEST_TMPDIR/regional-inventory.json"
+
+    run inventory_region us-east-1 "$fixture"
+
+    [ "$status" -eq 0 ]
+    run jq -e '.security_groups==["arn:aws:ec2:us-east-1:111111111111:security-group/sg-owned"] and (.ownership|length)==1' "$fixture"
     [ "$status" -eq 0 ]
 }
 

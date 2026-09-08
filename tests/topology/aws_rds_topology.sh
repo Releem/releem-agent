@@ -317,7 +317,8 @@ assert_deterministic_resources_owned() {
     local collisions="$1" owned="$2"
     jq -e -n --slurpfile collisions "$collisions" --slurpfile owned "$owned" '
       def basename: split(":")[-1] | split("/")[-1];
-      ($owned[0] | [.[]?[]? | select(type=="string") | basename] | unique) as $owned_names |
+      (($owned[0] | [.[]?[]? | select(type=="string") | basename]) +
+        ($collisions[0].direct_owned // []) | unique) as $owned_names |
       all($collisions[0].existing[]; . as $name | ($owned_names|index($name)) != null)
     ' >/dev/null || die "deterministic resource exists without exact run ownership"
 }
@@ -916,7 +917,8 @@ capture_deterministic_collisions() {
     account="$(aws_global sts get-caller-identity --query Account --output text)"
     bucket="releem-topology-$(printf '%s' "$account" | sha256sum | cut -c1-12)-$(run_id)"
     bucket_state="$(s3_bucket_presence "$bucket")" || return 1
-    jq -n --arg prefix "$prefix" --arg bucket "$bucket" \
+    jq -n --arg prefix "$prefix" --arg bucket "$bucket" --arg run "$(run_id)" \
+        --arg run_key "$TAG_RUN_KEY" --arg managed_key "$TAG_MANAGED_KEY" \
         --slurpfile ed "$dir/east-db.json" --slurpfile wd "$dir/west-db.json" \
         --slurpfile ec "$dir/east-clusters.json" --slurpfile wc "$dir/west-clusters.json" \
         --slurpfile globals "$dir/globals.json" --slurpfile roles "$dir/roles.json" \
@@ -926,6 +928,9 @@ capture_deterministic_collisions() {
         --slurpfile es "$dir/east-subnets.json" --slurpfile ws "$dir/west-subnets.json" \
         --slurpfile esg "$dir/east-sgs.json" --slurpfile wsg "$dir/west-sgs.json" \
         --slurpfile eri "$dir/east-runners.json" --slurpfile wri "$dir/west-runners.json" --arg bucket_state "$bucket_state" '
+      def directly_owned:
+        ((.Tags // []) | map({key:.Key,value:.Value}) | from_entries) as $tags |
+        $tags[$run_key]==$run and $tags[$managed_key]=="true";
       {expected:[],existing:((
         [$ed[0].DBInstances[]?.DBInstanceIdentifier,$wd[0].DBInstances[]?.DBInstanceIdentifier,
          $ec[0].DBClusters[]?.DBClusterIdentifier,$wc[0].DBClusters[]?.DBClusterIdentifier,
@@ -934,25 +939,37 @@ capture_deterministic_collisions() {
          $ep[0].DBParameterGroups[]?.DBParameterGroupName,$wp[0].DBParameterGroups[]?.DBParameterGroupName,
          $ecp[0].DBClusterParameterGroups[]?.DBClusterParameterGroupName,$wcp[0].DBClusterParameterGroups[]?.DBClusterParameterGroupName,
          $es[0].DBSubnetGroups[]?.DBSubnetGroupName,$ws[0].DBSubnetGroups[]?.DBSubnetGroupName] | map(select(startswith($prefix)))) +
-        [$esg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId,
-         $wsg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId] +
-        [$eri[0].Reservations[].Instances[]?.InstanceId,$wri[0].Reservations[].Instances[]?.InstanceId] +
-        (if $bucket_state=="present" then [$bucket] else [] end))}' >"$out"
+        [($esg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId),
+         ($wsg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId)] +
+        [$eri[0].Reservations[].Instances[]?|select(.State.Name!="terminated")|.InstanceId,
+         $wri[0].Reservations[].Instances[]?|select(.State.Name!="terminated")|.InstanceId] +
+        (if $bucket_state=="present" then [$bucket] else [] end)),
+       direct_owned:([($esg[0].SecurityGroups[]?|select((.GroupName|startswith($prefix)) and directly_owned)|.GroupId),
+                      ($wsg[0].SecurityGroups[]?|select((.GroupName|startswith($prefix)) and directly_owned)|.GroupId),
+                      ($eri[0].Reservations[].Instances[]?|select(.State.Name!="terminated" and directly_owned)|.InstanceId),
+                      ($wri[0].Reservations[].Instances[]?|select(.State.Name!="terminated" and directly_owned)|.InstanceId)])}' >"$out"
     chmod 600 "$out"
 }
 
 inventory_region() {
-    local region="$1" output="$2" prefix
+    local region="$1" output="$2" prefix direct_security_groups
     prefix="releem-$(run_id)-"
+    direct_security_groups="${output}.security-groups"
     mkdir -p "$(dirname "$output")"
     aws_region "$region" resourcegroupstaggingapi get-resources \
         --tag-filters "Key=${TAG_RUN_KEY},Values=$(run_id)" "Key=${TAG_MANAGED_KEY},Values=true" \
         --resource-type-filters rds:db rds:cluster rds:cluster-pg rds:pg rds:subgrp rds:snapshot ec2:security-group \
         --output json >"$output.raw"
-    jq --arg prefix "$prefix" '
-      [.ResourceTagMappingList[]? | .ResourceARN as $arn |
-       {arn:$arn,tags:(.Tags|map({key:.Key,value:.Value})|from_entries)} |
-       select(.arn|contains($prefix))] |
+    aws_region "$region" ec2 describe-security-groups \
+        --filters "Name=group-name,Values=${prefix}*" --output json >"$direct_security_groups"
+    jq --arg prefix "$prefix" --arg region "$region" --slurpfile direct "$direct_security_groups" '
+      ([.ResourceTagMappingList[]? | .ResourceARN as $arn |
+        {arn:$arn,tags:(.Tags|map({key:.Key,value:.Value})|from_entries)} |
+        select(.arn|contains($prefix))] +
+       [$direct[0].SecurityGroups[]? | select(.GroupName|startswith($prefix)) |
+        {arn:("arn:aws:ec2:"+$region+":"+.OwnerId+":security-group/"+.GroupId),
+         tags:((.Tags // [])|map({key:.Key,value:.Value})|from_entries)}]) |
+      unique_by(.arn) |
       {instances:[.[]|select(.arn|contains(":db:"))|.arn],
        clusters:[.[]|select(.arn|contains(":cluster:"))|.arn],
        global_clusters:[],
@@ -962,7 +979,7 @@ inventory_region() {
        snapshots:[.[]|select(.arn|contains(":snapshot:"))|.arn],
        ownership:[.[]]}
     ' "$output.raw" >"$output"
-    rm -f "$output.raw"
+    rm -f "$output.raw" "$direct_security_groups"
     assert_inventory_owned <(jq '.ownership' "$output")
 }
 
@@ -2124,8 +2141,20 @@ EOF
     done
 }
 
+runner_accepts_ssm_for_cleanup() {
+    local region="$1" runner="$2" state
+    state="$(cleanup_aws_region "$region" ec2 describe-instances \
+        --filters "Name=instance-id,Values=${runner}" \
+        --query 'Reservations[].Instances[].State.Name' --output text 2>/dev/null)" || return 2
+    case "$state" in
+        running) return 0 ;;
+        ''|None|pending|stopping|stopped|shutting-down|terminated) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
 stop_agents() {
-    local commands region runner label failed=0
+    local commands region runner label state_status failed=0
     [[ -f "$(support_state_file)" ]] || return 0
     load_support_state_nonfatal || return 1
     commands="$(state_dir)/ssm-stop.sh"
@@ -2134,8 +2163,13 @@ stop_agents() {
     chmod 600 "$commands"
     for label in east west; do
         if [[ "$label" == east ]]; then region="$PRIMARY_REGION"; runner="${EAST_RUNNER_ID:-}"; else region="$SECONDARY_REGION"; runner="${WEST_RUNNER_ID:-}"; fi
-        if [[ -n "$runner" ]] && ! send_ssm_commands "$region" "$runner" "$commands" "stop-${label}" cleanup; then
-            failed=1
+        if [[ -n "$runner" ]]; then
+            if runner_accepts_ssm_for_cleanup "$region" "$runner"; then
+                send_ssm_commands "$region" "$runner" "$commands" "stop-${label}" cleanup || failed=1
+            else
+                state_status=$?
+                [[ "$state_status" -eq 1 ]] || failed=1
+            fi
         fi
     done
     return "$failed"
