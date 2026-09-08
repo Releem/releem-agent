@@ -173,3 +173,104 @@ Never run `destroy` as routine test cleanup.
 After exact ownership and semantic validation, `destroy` removes instances,
 owned detached disks, NAT, router, firewall rules, subnet, and network in
 dependency order. It does not run quota, zone, or machine-type selection.
+
+## AWS Aurora and RDS matrix
+
+`aws_rds_topology.sh` is a single-run, destructive acceptance harness. It uses
+`us-east-1` for the primary region and `us-west-2` for the secondary region. A
+mandatory lowercase run ID owns every temporary resource through both a
+deterministic `releem-<run-id>-` name and the exact
+`releem-topology-run`/`releem-topology-managed` tags.
+
+The read-only `preflight` command intersects both regions when selecting the
+latest available Aurora MySQL 3 version and smallest common orderable class.
+It also selects the current Serverless v2 minimum ACU, a current MySQL 8.0
+version/class, and the regional Amazon Linux 2023 runner images. Quotas,
+private subnet properties, collisions, and the hourly configuration shape are
+written under `/tmp/releem-db-topology-evidence/aws/<run-id>/preflight/`.
+Review `summary.json`, both quota files, and `inventory-before.json` before
+authorizing a live run. The cost shape is 7 provisioned Aurora instances, 3
+Serverless v2 instances, 3 ordinary RDS instances, and 2 `t3.micro` runners,
+plus storage, I/O, Enhanced Monitoring logs, S3, and network egress. AWS prices
+are not stable, so preflight records selected billable units instead of a
+hard-coded currency estimate.
+
+The operator supplies two existing VPCs and at least two private subnets in
+different availability zones per region. Subnets must not auto-assign public
+addresses and must have outbound access to SSM, S3, Releem, and AWS APIs via
+NAT or VPC endpoints. The harness creates one no-ingress SSM runner security
+group and one runner-only MySQL security group in each VPC. Both EC2 runners
+have no public address, encrypted `gp3` root volumes, IMDSv2 enforcement, and
+no inbound rules.
+
+```bash
+export AWS_TOPOLOGY_RUN_ID=task13-20260908
+export AWS_TOPOLOGY_EAST_VPC_ID=vpc-...
+export AWS_TOPOLOGY_EAST_SUBNET_IDS=subnet-...,subnet-...
+export AWS_TOPOLOGY_WEST_VPC_ID=vpc-...
+export AWS_TOPOLOGY_WEST_SUBNET_IDS=subnet-...,subnet-...
+
+tests/topology/aws_rds_topology.sh preflight
+```
+
+Load the Releem and Platform credentials into the invoking shell with tracing
+disabled, using the same `TOPOLOGY_MYSQL_*`, `TOPOLOGY_CLICKHOUSE_*`, and exact
+positive `TOPOLOGY_UID` contract documented above. Do not put credentials in
+arguments, checked-in files, retained logs, or shell history. The harness
+generates the database password in a mode-`0600` file under `/tmp`.
+
+`run` creates this exact matrix and always invokes dependency-ordered cleanup
+on success, assertion failure, `EXIT`, `INT`, `TERM`, or `HUP` after mutation
+begins:
+
+| Topology | Region and members |
+| --- | --- |
+| Aurora provisioned | `us-east-1`, one writer and two readers |
+| Aurora Serverless v2 | `us-east-1`, one writer and two readers |
+| Aurora Global Database | two members in each region |
+| RDS MySQL replication | `us-east-1`, one source and one read replica |
+| RDS MySQL Multi-AZ | `us-east-1`, one addressable instance and managed standby |
+
+Every database is storage-encrypted and has `PubliclyAccessible=false`.
+Every addressable DB instance uses a temporary RDS Enhanced Monitoring role at
+a one-second interval. Before Agent startup, the harness requires at least one
+event in the exact `RDSOSMetrics/<DBInstanceResourceID>` stream. The runner
+role permits only SSM management, reads of its exact private S3 run prefix,
+`logs:GetLogEvents` for `RDSOSMetrics`, and `rds:Describe*`.
+
+The reviewed `/tmp/releem-agent-db-topology-x86_64` binary and mode-`0600`
+Agent/MySQL configuration files are uploaded as server-side-encrypted private
+S3 objects. SSM commands contain only fixed object paths and resource names;
+API keys and database passwords are never command parameters or command
+output. SSM CloudWatch and S3 command output are disabled. Agent processes run
+inside their regional VPC while remaining external to the database hosts.
+
+```bash
+tests/topology/aws_rds_topology.sh run
+```
+
+The harness verifies provisioned failover, a Serverless v2 capacity change and
+load event, a managed Global Database switchover, read-replica SQL stop/start,
+and Multi-AZ failover. Persistence queries first resolve the exact test SIDs,
+then use only tenant UID, SID, current RID, and millisecond transition markers.
+Assertions cover canonical provider keys, roles, writer changes, parent/source
+edges, native MySQL replication state, Serverless facts, monotonic timestamps,
+and ClickHouse relation snapshots without hostname inference or `LIMIT 1 BY`.
+
+Cleanup stops Agent processes, deletes DB instances and Enhanced Monitoring
+streams, detaches Global Database members, then removes regional clusters,
+global cluster, parameter groups, runners/ENIs, S3 objects/bucket, instance
+profile, inline/managed IAM policies, IAM roles, security groups, subnet
+groups, snapshots, SSM local artifacts, and secret files. It polls both regions
+until the combined run inventory is empty. AWS retains completed SSM command
+history as an account audit record; the API has no delete operation for that
+record, but no command output or credentials are stored in it.
+
+Only an untrappable termination such as `SIGKILL` can bypass the EXIT trap.
+Recover by confirming the exact run ID; `destroy` does not use preflight
+selection and deletes only exactly tagged/named resources:
+
+```bash
+export AWS_TOPOLOGY_CONFIRM_DESTROY="$AWS_TOPOLOGY_RUN_ID"
+tests/topology/aws_rds_topology.sh destroy
+```
