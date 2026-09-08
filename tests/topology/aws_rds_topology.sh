@@ -1591,6 +1591,7 @@ ensure_cluster_instance() {
     mapfile -t monitor_args < <(monitoring_arguments "$MONITORING_ROLE_ARN")
     if ! instance_exists "$region" "$identifier"; then
         response="$(state_dir)/create-${region}-${identifier}-response.json"
+        mark_instance_create_attempted "$region" "$identifier"
         aws_region "$region" rds create-db-instance --db-instance-identifier "$identifier" \
             --db-cluster-identifier "$cluster" --engine aurora-mysql --db-instance-class "$class" \
             --db-parameter-group-name "$instance_pg" --no-publicly-accessible --auto-minor-version-upgrade \
@@ -1600,6 +1601,7 @@ ensure_cluster_instance() {
         capture_monitoring_resource_id_from_response "$region" "$identifier" "$response" ||
             record_monitoring_resource_id "$region" "$identifier"
     else
+        mark_instance_create_attempted "$region" "$identifier"
         record_monitoring_resource_id "$region" "$identifier"
     fi
     wait_instance_available "$region" "$identifier"
@@ -1640,11 +1642,13 @@ ensure_rds_instance() {
     if ! instance_exists "$PRIMARY_REGION" "$identifier"; then
         file="$(rds_input_file "$identifier" "$subnet" "$sg" "$pg" "$multi")"
         response="$(state_dir)/create-${PRIMARY_REGION}-${identifier}-response.json"
+        mark_instance_create_attempted "$PRIMARY_REGION" "$identifier"
         aws_region "$PRIMARY_REGION" rds create-db-instance --cli-input-json "file://${file}" --output json >"$response"
         arm_cleanup
         capture_monitoring_resource_id_from_response "$PRIMARY_REGION" "$identifier" "$response" ||
             record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     else
+        mark_instance_create_attempted "$PRIMARY_REGION" "$identifier"
         record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     fi
     wait_instance_available "$PRIMARY_REGION" "$identifier"
@@ -1669,11 +1673,13 @@ ensure_read_replica() {
     mapfile -t args < <(read_replica_create_arguments "$identifier" "$source" "$subnet" "$sg")
     if ! instance_exists "$PRIMARY_REGION" "$identifier"; then
         response="$(state_dir)/create-${PRIMARY_REGION}-${identifier}-response.json"
+        mark_instance_create_attempted "$PRIMARY_REGION" "$identifier"
         aws_region "$PRIMARY_REGION" rds create-db-instance-read-replica "${args[@]}" --output json >"$response"
         arm_cleanup
         capture_monitoring_resource_id_from_response "$PRIMARY_REGION" "$identifier" "$response" ||
             record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     else
+        mark_instance_create_attempted "$PRIMARY_REGION" "$identifier"
         record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     fi
     wait_instance_available "$PRIMARY_REGION" "$identifier"
@@ -1796,35 +1802,98 @@ addressable_instances() {
 monitoring_tracking_file() { printf '%s/monitoring-streams.tsv\n' "$(state_dir)"; }
 
 initialize_monitoring_tracking() {
-    local file
+    local file temp
     file="$(monitoring_tracking_file)"
     mkdir -p "$(state_dir)"
     if [[ ! -f "$file" ]]; then
-        while IFS='|' read -r region identifier; do printf '%s\t%s\t\n' "$region" "$identifier"; done < <(addressable_instances) >"$file"
+        while IFS='|' read -r region identifier; do
+            printf '%s\t%s\tplanned\t\n' "$region" "$identifier"
+        done < <(addressable_instances) >"$file"
+    elif ! awk -F '\t' 'NF!=4{exit 1}' "$file"; then
+        temp="${file}.migrated"
+        awk -F '\t' -v OFS='\t' '
+          NF==3 && $3~/^db-[A-Za-z0-9]+$/ {print $1,$2,"created_with_resource_id",$3; next}
+          NF==3 && $3=="" {print $1,$2,"create_attempted",""; next}
+          NF==4 {print $1,$2,$3,$4; next}
+          {exit 1}
+        ' "$file" >"$temp" || { rm -f "$temp"; return 1; }
+        mv "$temp" "$file"
     fi
     chmod 600 "$file"
 }
 
-capture_monitoring_resource_id() {
-    local region="$1" identifier="$2" resource_id
+set_monitoring_lifecycle() {
+    local region="$1" identifier="$2" lifecycle="$3" resource_id="${4:-}" file temp
+    case "$lifecycle" in
+        planned|create_attempted|confirmed_absent) [[ -z "$resource_id" ]] || return 1 ;;
+        created_with_resource_id) [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    initialize_monitoring_tracking || return 1
+    file="$(monitoring_tracking_file)"
+    temp="${file}.new"
+    awk -F '\t' -v OFS='\t' -v region="$region" -v identifier="$identifier" \
+      -v lifecycle="$lifecycle" -v resource_id="$resource_id" '
+      $4==resource_id && resource_id!="" && !($1==region && $2==identifier) {duplicate=1}
+      $1==region && $2==identifier {$3=lifecycle; $4=resource_id; found++}
+      {print $1,$2,$3,$4}
+      END{if(found!=1 || duplicate) exit 1}
+    ' "$file" >"$temp" || { rm -f "$temp"; return 1; }
+    mv "$temp" "$file"
+    chmod 600 "$file"
+}
+
+monitoring_lifecycle_for_instance() {
+    local region="$1" identifier="$2"
+    initialize_monitoring_tracking || return 1
+    awk -F '\t' -v region="$region" -v identifier="$identifier" '
+      $1==region && $2==identifier {if(found) exit 2; value=$3; found=1}
+      END{if(!found) exit 1; print value}
+    ' "$(monitoring_tracking_file)"
+}
+
+mark_instance_create_attempted() {
+    local region="$1" identifier="$2" lifecycle
+    lifecycle="$(monitoring_lifecycle_for_instance "$region" "$identifier")" || return 1
+    case "$lifecycle" in
+        planned|confirmed_absent) set_monitoring_lifecycle "$region" "$identifier" create_attempted ;;
+        create_attempted|created_with_resource_id) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+probe_db_instance_resource_id() {
+    local region="$1" identifier="$2" error_file status=0 resource_id
+    error_file="$(state_dir)/describe-db-instance-${region}-${identifier}.error"
     resource_id="$(aws_region "$region" rds describe-db-instances --db-instance-identifier "$identifier" \
-        --query 'DBInstances[0].DbiResourceId' --output text)" || return 1
+        --query 'DBInstances[0].DbiResourceId' --output text 2>"$error_file")" || status=$?
+    chmod 600 "$error_file"
+    if ((status == 0)); then
+        [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
+        printf 'present\t%s\n' "$resource_id"
+        return 0
+    fi
+    if ((status == 254)) && grep -Eq '^An error occurred \(DBInstanceNotFound(Fault)?\) when calling the DescribeDBInstances operation: [^[:space:]].*$' "$error_file"; then
+        printf 'absent\n'
+        return 0
+    fi
+    return 1
+}
+
+capture_monitoring_resource_id() {
+    local region="$1" identifier="$2" result resource_id
+    result="$(probe_db_instance_resource_id "$region" "$identifier")" || return 1
+    [[ "${result%%$'\t'*}" == present ]] || return 1
+    resource_id="${result#*$'\t'}"
     persist_monitoring_resource_id "$region" "$identifier" "$resource_id"
 }
 
 persist_monitoring_resource_id() {
-    local region="$1" identifier="$2" resource_id="$3" file temp
+    local region="$1" identifier="$2" resource_id="$3" lifecycle
     [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
-    initialize_monitoring_tracking
-    file="$(monitoring_tracking_file)"
-    temp="${file}.new"
-    awk -F '\t' -v OFS='\t' -v region="$region" -v identifier="$identifier" -v resource_id="$resource_id" '
-      $3==resource_id && !($1==region && $2==identifier) {duplicate=1}
-      $1==region && $2==identifier {$3=resource_id; found=1} {print $1,$2,$3}
-      END{if(!found || duplicate) exit 1}
-    ' "$file" >"$temp" || { rm -f "$temp"; return 1; }
-    mv "$temp" "$file"
-    chmod 600 "$file"
+    lifecycle="$(monitoring_lifecycle_for_instance "$region" "$identifier")" || return 1
+    [[ "$lifecycle" == create_attempted || "$lifecycle" == created_with_resource_id ]] || return 1
+    set_monitoring_lifecycle "$region" "$identifier" created_with_resource_id "$resource_id"
 }
 
 capture_monitoring_resource_id_from_response() {
@@ -1837,14 +1906,34 @@ capture_monitoring_resource_id_from_response() {
 }
 
 tracked_monitoring_resource_id() {
-    local region="$1" identifier="$2" file resource_id
+    local region="$1" identifier="$2" file record lifecycle resource_id
     file="$(monitoring_tracking_file)"
     [[ -f "$file" ]] || return 1
-    resource_id="$(awk -F '\t' -v region="$region" -v identifier="$identifier" '
-      $1==region && $2==identifier {if(found) exit 2; value=$3; found=1} END{if(!found) exit 1; print value}
+    record="$(awk -F '\t' -v region="$region" -v identifier="$identifier" '
+      $1==region && $2==identifier {if(found) exit 2; value=$3 "\t" $4; found=1}
+      END{if(!found) exit 1; print value}
     ' "$file")" || return 1
+    lifecycle="${record%%$'\t'*}"
+    resource_id="${record#*$'\t'}"
+    [[ "$lifecycle" == created_with_resource_id ]] || return 1
     [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
     printf '%s\n' "$resource_id"
+}
+
+confirm_attempted_instance_absent() {
+    local region="$1" identifier="$2" attempt result
+    for attempt in 1 2 3; do
+        result="$(probe_db_instance_resource_id "$region" "$identifier")" || return 1
+        if [[ "${result%%$'\t'*}" == present ]]; then
+            persist_monitoring_resource_id "$region" "$identifier" "${result#*$'\t'}"
+            return
+        fi
+        [[ "$result" == absent ]] || return 1
+        if ((attempt < 3 && POLL_SECONDS > 0)); then
+            cleanup_bounded_sleep "$POLL_SECONDS" || return 1
+        fi
+    done
+    set_monitoring_lifecycle "$region" "$identifier" confirmed_absent
 }
 
 delete_db_instance_if_monitoring_tracked() {
@@ -1871,25 +1960,47 @@ monitoring_tracking_complete() {
     file="$(monitoring_tracking_file)"
     [[ -f "$file" ]] || return 1
     expected="$(addressable_instances | tr '|' '\t' | sort)"
-    actual="$(awk -F '\t' 'NF==3 && $3~/^db-[A-Za-z0-9]+$/{print $1 "\t" $2}' "$file" | sort)"
-    [[ "$(awk -F '\t' 'NF==3 && $3~/^db-[A-Za-z0-9]+$/{count++} END{print count+0}' "$file")" -eq 13 ]] || return 1
-    [[ "$(awk -F '\t' 'NF==3 && $3~/^db-[A-Za-z0-9]+$/{seen[$3]=1} END{for(id in seen) count++; print count+0}' "$file")" -eq 13 ]] || return 1
-    [[ "$actual" == "$expected" ]]
+    actual="$(awk -F '\t' 'NF==4{print $1 "\t" $2}' "$file" | sort)"
+    [[ "$actual" == "$expected" ]] || return 1
+    awk -F '\t' '
+      NF!=4 {exit 1}
+      $3=="planned" && $4=="" {next}
+      $3=="confirmed_absent" && $4=="" {next}
+      $3=="created_with_resource_id" && $4~/^db-[A-Za-z0-9]+$/ {if(seen[$4]++) exit 1; next}
+      {exit 1}
+    ' "$file"
+}
+
+monitoring_all_instances_created() {
+    monitoring_tracking_complete || return 1
+    [[ "$(awk -F '\t' '$3=="created_with_resource_id"{count++} END{print count+0}' "$(monitoring_tracking_file)")" -eq 13 ]]
+}
+
+monitoring_manifest_has_unresolved_attempts() {
+    awk -F '\t' '$3=="create_attempted"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+}
+
+db_dependencies_may_be_deleted() {
+    ! monitoring_manifest_has_unresolved_attempts
 }
 
 recover_monitoring_resource_ids() {
-    local region identifier resource_id failed=0
+    local region identifier lifecycle resource_id failed=0
     initialize_monitoring_tracking
-    while IFS=$'\t' read -r region identifier resource_id; do
-        [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] && continue
-        capture_monitoring_resource_id "$region" "$identifier" || failed=1
+    while IFS=$'\t' read -r region identifier lifecycle resource_id; do
+        case "$lifecycle" in
+            planned|confirmed_absent) ;;
+            created_with_resource_id) [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || failed=1 ;;
+            create_attempted) confirm_attempted_instance_absent "$region" "$identifier" || failed=1 ;;
+            *) failed=1 ;;
+        esac
     done <"$(monitoring_tracking_file)"
     ((failed == 0)) && monitoring_tracking_complete
 }
 
 wait_monitoring_events() {
     local region="$1" identifier="$2" resource_id file deadline
-    resource_id="$(awk -F '\t' -v region="$region" -v identifier="$identifier" '$1==region && $2==identifier{print $3}' "$(monitoring_tracking_file)")"
+    resource_id="$(tracked_monitoring_resource_id "$region" "$identifier")"
     [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || die "missing resource ID for Enhanced Monitoring"
     file="$(state_dir)/monitoring-${region}-${identifier}.json"
     deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
@@ -1907,7 +2018,7 @@ wait_monitoring_events() {
 
 wait_all_monitoring_events() {
     local region identifier
-    monitoring_tracking_complete || die "Enhanced Monitoring resource ID tracking is incomplete"
+    monitoring_all_instances_created || die "Enhanced Monitoring resource ID tracking is incomplete"
     while IFS='|' read -r region identifier; do
         wait_monitoring_events "$region" "$identifier"
     done < <(addressable_instances)
@@ -2333,10 +2444,28 @@ exercise_matrix() {
 
 identifier_from_arn() { printf '%s\n' "${1##*:}"; }
 
+cleanup_verified_support_iam() {
+    local ownership_file="$1" runner_role="$2" runner_profile="$3" monitor_role="$4" preserve_db_dependencies="$5" failed=0
+    if jq -e '.instance_profile.exists==true' "$ownership_file" >/dev/null; then
+        cleanup_aws iam remove-role-from-instance-profile --instance-profile-name "$runner_profile" --role-name "$runner_role" >/dev/null 2>&1 || failed=1
+        cleanup_aws iam delete-instance-profile --instance-profile-name "$runner_profile" >/dev/null 2>&1 || failed=1
+    fi
+    if jq -e '.runner_role.exists==true' "$ownership_file" >/dev/null; then
+        cleanup_aws iam delete-role-policy --role-name "$runner_role" --policy-name ReleemTopologyRunnerRead >/dev/null 2>&1 || failed=1
+        cleanup_aws iam detach-role-policy --role-name "$runner_role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null 2>&1 || failed=1
+        cleanup_aws iam delete-role --role-name "$runner_role" >/dev/null 2>&1 || failed=1
+    fi
+    if ! "$preserve_db_dependencies" && jq -e '.monitoring_role.exists==true' "$ownership_file" >/dev/null; then
+        cleanup_aws iam detach-role-policy --role-name "$monitor_role" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole >/dev/null 2>&1 || failed=1
+        cleanup_aws iam delete-role --role-name "$monitor_role" >/dev/null 2>&1 || failed=1
+    fi
+    return "$failed"
+}
+
 cleanup_resources_impl() {
     local cleanup_failed=0
     run_cleanup_steps stop_agents || cleanup_failed=1
-    local dir region arn id sg global_id cluster_arn cluster_region runner account bucket runner_role runner_profile monitor_role post ownership_file deleted_instances
+    local dir region arn id sg global_id cluster_arn cluster_region runner account bucket runner_role runner_profile monitor_role post ownership_file deleted_instances preserve_db_dependencies=false
     dir="$(state_dir)/cleanup"
     mkdir -p "$dir"
     deleted_instances="$dir/deleted-instances.tsv"
@@ -2369,12 +2498,20 @@ cleanup_resources_impl() {
         done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source))' "$dir/${region}.json")
     done
     if [[ -f "$(monitoring_tracking_file)" ]]; then
-        while IFS=$'\t' read -r region identifier id; do
-            [[ -n "$id" ]] && delete_monitoring_stream_until_absent "$region" "$id" || cleanup_failed=1
+        while IFS=$'\t' read -r region identifier lifecycle id; do
+            [[ "$lifecycle" != created_with_resource_id ]] && continue
+            delete_monitoring_stream_until_absent "$region" "$id" || cleanup_failed=1
         done <"$(monitoring_tracking_file)"
     fi
 
+    if ! db_dependencies_may_be_deleted; then
+        preserve_db_dependencies=true
+        cleanup_failed=1
+        log "database dependencies preserved because create attempts remain unresolved"
+    fi
+
     # Aurora Global members must be detached before regional clusters can be removed.
+    if ! "$preserve_db_dependencies"; then
     inventory_global_clusters "$dir/globals.json" || { cleanup_failed=1; printf '[]\n' >"$dir/globals.json"; }
     while IFS= read -r arn; do
         global_id="$(identifier_from_arn "$arn")"
@@ -2387,7 +2524,9 @@ cleanup_resources_impl() {
         done < <(cleanup_aws_region "$PRIMARY_REGION" rds describe-global-clusters --global-cluster-identifier "$global_id" \
             --output json 2>/dev/null | jq -r '.GlobalClusters[0].GlobalClusterMembers|sort_by(.IsWriter)|.[].DBClusterArn')
     done < <(jq -r '.[].arn' "$dir/globals.json")
+    fi
 
+    if ! "$preserve_db_dependencies"; then
     for region in "$PRIMARY_REGION" "$SECONDARY_REGION"; do
         [[ -f "$dir/${region}.json" ]] || continue
         while IFS= read -r arn; do
@@ -2407,6 +2546,7 @@ cleanup_resources_impl() {
         id="$(identifier_from_arn "$arn")"
         cleanup_aws_region "$PRIMARY_REGION" rds delete-global-cluster --global-cluster-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1
     done < <(jq -r '.[].arn' "$dir/globals.json")
+    fi
 
     # Stop SSM work first, then terminate runners and wait for their tagged ENIs.
     for region in "$PRIMARY_REGION" "$SECONDARY_REGION"; do
@@ -2421,6 +2561,7 @@ cleanup_resources_impl() {
         cleanup_wait_until "runner ENI deletion in $region" runner_enis_absent "$region" || cleanup_failed=1
     done
 
+    if ! "$preserve_db_dependencies"; then
     for region in "$PRIMARY_REGION" "$SECONDARY_REGION"; do
         inventory_region "$region" "$dir/${region}-late.json" || { cleanup_failed=1; continue; }
         while IFS= read -r arn; do
@@ -2444,6 +2585,7 @@ cleanup_resources_impl() {
             cleanup_aws_region "$region" rds delete-db-subnet-group --db-subnet-group-name "$id" >/dev/null 2>&1 || cleanup_failed=1
         done < <(jq -r '.subnet_groups[]' "$dir/${region}-late.json")
     done
+    fi
 
     # Private delivery objects precede the bucket; instance profile precedes roles.
     account="$(aws_global sts get-caller-identity --query Account --output text 2>/dev/null || true)"
@@ -2469,13 +2611,7 @@ cleanup_resources_impl() {
             fi
             aws_region "$PRIMARY_REGION" s3api delete-bucket --bucket "$bucket" >/dev/null 2>&1 || cleanup_failed=1
         fi
-        cleanup_aws iam remove-role-from-instance-profile --instance-profile-name "$runner_profile" --role-name "$runner_role" >/dev/null 2>&1 || cleanup_failed=1
-        cleanup_aws iam delete-instance-profile --instance-profile-name "$runner_profile" >/dev/null 2>&1 || cleanup_failed=1
-        cleanup_aws iam delete-role-policy --role-name "$runner_role" --policy-name ReleemTopologyRunnerRead >/dev/null 2>&1 || cleanup_failed=1
-        cleanup_aws iam detach-role-policy --role-name "$runner_role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null 2>&1 || cleanup_failed=1
-        cleanup_aws iam detach-role-policy --role-name "$monitor_role" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole >/dev/null 2>&1 || cleanup_failed=1
-        cleanup_aws iam delete-role --role-name "$runner_role" >/dev/null 2>&1 || cleanup_failed=1
-        cleanup_aws iam delete-role --role-name "$monitor_role" >/dev/null 2>&1 || cleanup_failed=1
+        cleanup_verified_support_iam "$ownership_file" "$runner_role" "$runner_profile" "$monitor_role" "$preserve_db_dependencies" || cleanup_failed=1
     else
         log "support cleanup skipped because exact ownership could not be proven"
         cleanup_failed=1
@@ -2489,7 +2625,7 @@ cleanup_resources_impl() {
     while remaining="$(cleanup_remaining_seconds)"; do
         rm -f "$post"
         if (set -e; capture_inventory "$post") && [[ -s "$post" ]] &&
-            assert_inventory_empty "$post" 2>/dev/null && monitoring_streams_absent; then break; fi
+            assert_terminal_cleanup_state "$post" 2>/dev/null; then break; fi
         sleep_seconds="$(cleanup_poll_seconds "$POLL_SECONDS" "$remaining")"
         ((sleep_seconds > 0)) && sleep "$sleep_seconds"
     done
@@ -2580,12 +2716,18 @@ delete_monitoring_stream_until_absent() {
 }
 
 monitoring_streams_absent() {
-    local region identifier id count
+    local region identifier lifecycle id count
     monitoring_tracking_complete || return 1
-    while IFS=$'\t' read -r region identifier id; do
+    while IFS=$'\t' read -r region identifier lifecycle id; do
+        [[ "$lifecycle" != created_with_resource_id ]] && continue
         count="$(monitoring_stream_count "$region" "$id")" || return 1
         [[ "$count" == 0 ]] || return 1
     done <"$(monitoring_tracking_file)"
+}
+
+assert_terminal_cleanup_state() {
+    local inventory="$1"
+    assert_inventory_empty "$inventory" && monitoring_streams_absent
 }
 
 cleanup_once() {

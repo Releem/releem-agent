@@ -531,13 +531,15 @@ EOF
     [ "$status" -ne 0 ]
 }
 
-@test "instance tracking precedes readiness failure and incomplete tracking blocks terminal success" {
+@test "instance tracking precedes readiness failure without requiring unattempted IDs" {
     initialize_monitoring_tracking
     MONITORING_ROLE_ARN=arn:aws:iam::111111111111:role/releem-monitoring
     instance_exists() { return 1; }
     aws_region() {
         case "$*" in
-            *create-db-instance*) return 0 ;;
+            *create-db-instance*)
+                awk -F '\t' '$2=="releem-task13-20260908-aurora-provisioned-1" && $3=="create_attempted"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+                ;;
             *describe-db-instances*) printf '%s\n' db-TRACKED1 ;;
             *) return 1 ;;
         esac
@@ -546,18 +548,19 @@ EOF
 
     run ensure_cluster_instance us-east-1 releem-task13-20260908-aurora-provisioned-1 cluster db.t3.small pg
     [ "$status" -ne 0 ]
-    run awk -F '\t' '$2=="releem-task13-20260908-aurora-provisioned-1" && $3=="db-TRACKED1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    run awk -F '\t' '$2=="releem-task13-20260908-aurora-provisioned-1" && $3=="created_with_resource_id" && $4=="db-TRACKED1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
     [ "$status" -eq 0 ]
 
     aws_region() { return 1; }
     run recover_monitoring_resource_ids
-    [ "$status" -ne 0 ]
+    [ "$status" -eq 0 ]
     run monitoring_streams_absent
     [ "$status" -ne 0 ]
 }
 
 @test "cleanup preserves an untracked DB until a later destroy can recover its monitoring ID" {
     initialize_monitoring_tracking
+    mark_instance_create_attempted us-east-1 releem-task13-20260908-aurora-provisioned-1
     calls="$TEST_TMPDIR/monitoring-recovery-calls"
     describe_ok=false
     aws_region() {
@@ -584,15 +587,12 @@ EOF
     describe_ok=true
     run delete_db_instance_if_monitoring_tracked us-east-1 releem-task13-20260908-aurora-provisioned-1
     [ "$status" -eq 0 ]
-    run awk -F '\t' '$2=="releem-task13-20260908-aurora-provisioned-1" && $3=="db-RECOVERED1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    run awk -F '\t' '$2=="releem-task13-20260908-aurora-provisioned-1" && $3=="created_with_resource_id" && $4=="db-RECOVERED1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
     [ "$status" -eq 0 ]
     run grep -c '^delete:' "$calls"
     [ "$status" -eq 0 ]
     [ "$output" -eq 1 ]
 
-    awk -F '\t' -v OFS='\t' '{$3=($3=="" ? "db-FINAL" NR : $3); print}' \
-        "$(monitoring_tracking_file)" >"$(monitoring_tracking_file).new"
-    mv "$(monitoring_tracking_file).new" "$(monitoring_tracking_file)"
     run delete_monitoring_stream_until_absent us-east-1 db-RECOVERED1
     [ "$status" -eq 0 ]
     run monitoring_streams_absent
@@ -601,24 +601,150 @@ EOF
 
 @test "create response records monitoring resource ID atomically" {
     initialize_monitoring_tracking
+    mark_instance_create_attempted us-east-1 releem-task13-20260908-rds-source
     response="$TEST_TMPDIR/create-instance.json"
     printf '%s\n' '{"DBInstance":{"DBInstanceIdentifier":"releem-task13-20260908-rds-source","DbiResourceId":"db-CREATE1"}}' >"$response"
 
     run capture_monitoring_resource_id_from_response us-east-1 releem-task13-20260908-rds-source "$response"
 
     [ "$status" -eq 0 ]
-    run awk -F '\t' '$2=="releem-task13-20260908-rds-source" && $3=="db-CREATE1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    run awk -F '\t' '$2=="releem-task13-20260908-rds-source" && $3=="created_with_resource_id" && $4=="db-CREATE1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
     [ "$status" -eq 0 ]
 }
 
 @test "terminal monitoring tracking rejects duplicate resource IDs" {
     initialize_monitoring_tracking
-    awk -F '\t' -v OFS='\t' '{$3="db-DUPLICATE"; print}' "$(monitoring_tracking_file)" >"$(monitoring_tracking_file).new"
+    awk -F '\t' -v OFS='\t' '{$3="created_with_resource_id"; $4="db-DUPLICATE"; print}' "$(monitoring_tracking_file)" >"$(monitoring_tracking_file).new"
     mv "$(monitoring_tracking_file).new" "$(monitoring_tracking_file)"
 
     run monitoring_tracking_complete
 
     [ "$status" -ne 0 ]
+}
+
+@test "partial provisioning terminal state excludes twelve never-attempted streams" {
+    initialize_monitoring_tracking
+    first=releem-task13-20260908-aurora-provisioned-1
+    mark_instance_create_attempted us-east-1 "$first"
+    persist_monitoring_resource_id us-east-1 "$first" db-PARTIAL1
+    calls="$TEST_TMPDIR/partial-stream-calls"
+    inventory="$TEST_TMPDIR/partial-empty-inventory.json"
+    printf '%s\n' '{"instances":[],"clusters":[],"global_clusters":[],"parameter_groups":[],"runners":[],"enis":[],"security_groups":[],"subnet_groups":[],"ssm_artifacts":[],"monitoring_streams":[],"s3_objects":[],"s3_buckets":[],"instance_profiles":[],"iam_policies":[],"iam_roles":[],"snapshots":[]}' >"$inventory"
+    aws_region() {
+        printf '%s\n' "$*" >>"$calls"
+        case "$*" in *describe-log-streams*) printf '0\n' ;; *) return 1 ;; esac
+    }
+
+    run monitoring_tracking_complete
+    [ "$status" -eq 0 ]
+    run assert_terminal_cleanup_state "$inventory"
+    [ "$status" -eq 0 ]
+    run grep -c describe-log-streams "$calls"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ]
+}
+
+@test "legacy blank manifest entries migrate fail-closed as attempted" {
+    initialize_monitoring_tracking
+    awk -F '\t' -v OFS='\t' '{print $1,$2,(NR==2 ? "db-LEGACY2" : "")}' \
+        "$(monitoring_tracking_file)" >"$(monitoring_tracking_file).legacy"
+    mv "$(monitoring_tracking_file).legacy" "$(monitoring_tracking_file)"
+
+    run initialize_monitoring_tracking
+    [ "$status" -eq 0 ]
+    run awk -F '\t' '
+      NR==1 && $3=="create_attempted" && $4=="" {attempted=1}
+      NR==2 && $3=="created_with_resource_id" && $4=="db-LEGACY2" {created=1}
+      END{exit !(attempted && created)}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
+}
+
+@test "retry cleanup skips already absent runner IAM and preserves monitoring role" {
+    ownership="$TEST_TMPDIR/retry-support-ownership.json"
+    printf '%s\n' '{"instance_profile":{"exists":false},"runner_role":{"exists":false},"monitoring_role":{"exists":true}}' >"$ownership"
+    calls="$TEST_TMPDIR/retry-support-iam-calls"
+    cleanup_aws() { printf '%s\n' "$*" >>"$calls"; }
+
+    run cleanup_verified_support_iam "$ownership" runner-role runner-profile monitoring-role true
+
+    [ "$status" -eq 0 ]
+    [ ! -e "$calls" ]
+
+    run cleanup_verified_support_iam "$ownership" runner-role runner-profile monitoring-role false
+    [ "$status" -eq 0 ]
+    run grep -c monitoring-role "$calls"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 2 ]
+}
+
+@test "ambiguous attempted create remains unresolved and cannot delete dependencies" {
+    initialize_monitoring_tracking
+    identifier=releem-task13-20260908-aurora-provisioned-1
+    mark_instance_create_attempted us-east-1 "$identifier"
+    calls="$TEST_TMPDIR/ambiguous-create-calls"
+    aws_region() {
+        printf '%s\n' "$*" >>"$calls"
+        printf '%s\n' 'An error occurred (ThrottlingException) when calling the DescribeDBInstances operation: retry' >&2
+        return 254
+    }
+    cleanup_aws_region() { printf 'delete:%s\n' "$*" >>"$calls"; }
+
+    run recover_monitoring_resource_ids
+    [ "$status" -ne 0 ]
+    run delete_db_instance_if_monitoring_tracked us-east-1 "$identifier"
+    [ "$status" -ne 0 ]
+    run monitoring_tracking_complete
+    [ "$status" -ne 0 ]
+    run grep -c '^delete:' "$calls"
+    [ "$status" -ne 0 ]
+    run monitoring_manifest_has_unresolved_attempts
+    [ "$status" -eq 0 ]
+    run db_dependencies_may_be_deleted
+    [ "$status" -ne 0 ]
+}
+
+@test "settled exact DB NotFound confirms attempted create absent" {
+    initialize_monitoring_tracking
+    identifier=releem-task13-20260908-rds-source
+    mark_instance_create_attempted us-east-1 "$identifier"
+    calls="$TEST_TMPDIR/notfound-calls"
+    aws_region() {
+        printf '%s\n' "$*" >>"$calls"
+        printf '%s\n' "An error occurred (DBInstanceNotFound) when calling the DescribeDBInstances operation: DBInstance $identifier not found" >&2
+        return 254
+    }
+
+    run recover_monitoring_resource_ids
+    [ "$status" -eq 0 ]
+    run awk -F '\t' -v id="$identifier" '$2==id && $3=="confirmed_absent" && $4==""{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
+    run monitoring_tracking_complete
+    [ "$status" -eq 0 ]
+    run grep -c describe-db-instances "$calls"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 3 ]
+}
+
+@test "one DB NotFound followed by ambiguity remains attempted" {
+    initialize_monitoring_tracking
+    identifier=releem-task13-20260908-rds-source
+    mark_instance_create_attempted us-east-1 "$identifier"
+    calls="$TEST_TMPDIR/notfound-then-ambiguous-calls"
+    aws_region() {
+        count=0; [[ -f "$calls" ]] && count="$(wc -l <"$calls")"
+        printf 'call\n' >>"$calls"
+        if ((count == 0)); then
+            printf '%s\n' "An error occurred (DBInstanceNotFound) when calling the DescribeDBInstances operation: DBInstance $identifier not found" >&2
+        else
+            printf '%s\n' 'An error occurred (RequestTimeout) when calling the DescribeDBInstances operation: retry' >&2
+        fi
+        return 254
+    }
+
+    run recover_monitoring_resource_ids
+    [ "$status" -ne 0 ]
+    run awk -F '\t' -v id="$identifier" '$2==id && $3=="create_attempted" && $4==""{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
 }
 
 @test "monitoring stream cleanup is idempotent and fails closed on ambiguous reads" {

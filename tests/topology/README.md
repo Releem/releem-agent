@@ -251,13 +251,22 @@ event in the exact `RDSOSMetrics/<DBInstanceResourceID>` stream. The runner
 role permits only SSM management, reads of its exact private S3 run prefix,
 `logs:GetLogEvents` for `RDSOSMetrics`, and `rds:Describe*`.
 The harness initializes an exact 13-instance monitoring manifest before cloud
-mutation and records each resource ID atomically from the create response,
-falling back to a bounded describe retry before the availability wait. Cleanup
-retries missing IDs but never deletes an instance whose ID is not durably
-recorded. It continues with other resources, returns nonzero, and preserves the
-instance so an exact-confirmed later `destroy` can recover the ID before
-deleting its monitoring stream and database. An incomplete or duplicate
-manifest makes terminal cleanup fail closed.
+mutation. Every deterministic instance starts as `planned`; immediately before
+an AWS create request it becomes `create_attempted`, and a successful response
+or describe stores `created_with_resource_id` plus the resource ID atomically.
+Untouched `planned` entries need no monitoring stream. Cleanup retries IDs for
+attempted entries but never deletes an instance whose ID is not durably
+recorded. Three settled, exact `DBInstanceNotFound` responses may instead mark
+an attempted entry `confirmed_absent`; ambiguous, transient, or single absence
+responses leave it unresolved. In that case cleanup removes independent
+runners and private delivery resources, returns nonzero, and preserves DB
+clusters, database network/parameter dependencies, and the monitoring role so
+an exact-confirmed later `destroy` can recover safely. IDs remain in the
+manifest after database deletion for exact log-stream deletion and absence
+proof. Terminal success requires empty AWS inventory, no unresolved attempts,
+unique IDs for every created instance with its stream absent, and only
+unattempted or confirmed-absent entries otherwise. Legacy blank manifests are
+migrated fail-closed as attempted rather than assumed never created.
 
 The reviewed `/tmp/releem-agent-db-topology-x86_64` binary and mode-`0600`
 Agent/MySQL configuration archives are transported as server-side-encrypted
