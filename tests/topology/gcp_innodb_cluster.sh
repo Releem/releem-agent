@@ -929,7 +929,10 @@ assert_cluster_state_for_label() {
          .defaultReplicaSet.topology[$p].mode == "R/W" and
          .defaultReplicaSet.topology[$p].memberRole == "PRIMARY" and
          ([.defaultReplicaSet.topology|to_entries[]|select(.key != $p)|.value.memberRole]|all(. == "SECONDARY")))
-     else ([.defaultReplicaSet.topology[].memberRole]|all(. == "PRIMARY")) end)
+     else
+       ([.defaultReplicaSet.topology[]|select(.status == "ONLINE")|.memberRole]|all(. == "PRIMARY")) and
+       ([.defaultReplicaSet.topology[]|select(.status != "ONLINE")]|all(.memberRole == "SECONDARY" and .mode != "R/W"))
+     end)
   ' <<<"$status" >/dev/null || die "cluster $cluster has invalid expected transition state for $label"
 }
 
@@ -1264,21 +1267,28 @@ assert_transition_state() {
     (group_by([.relation_type,.group_key]) | all((map(.member_key)|unique|length) == length)) and
     if $x.transition == "single-primary-stopped" then
       (map(select(.hostname|startswith("releem-ic-single-")) | select(.relation_type=="innodb_cluster")) as $r |
-       ($r|map(select(.hostname==$x.target_hostname and .member_key==$x.old_primary_member_key and .is_writer==0))|length)==1 and
-       ($r|map(.primary_member_key)|unique)==[$x.new_primary_member_key] and
+       ($r|map(select(.hostname==$x.target_hostname and .member_key==$x.old_primary_member_key and .is_writer==0 and
+                      (.replication_state=="error" or .replication_state=="stopped") and
+                      (.primary_member_key==null or .primary_member_key==$x.new_primary_member_key)))|length)==1 and
+       ($r|map(select(.hostname!=$x.target_hostname))|all(.primary_member_key==$x.new_primary_member_key)) and
        ($r|map(select(.member_key==$x.new_primary_member_key and .is_writer==1))|length)==1)
     elif $x.transition == "single-secondary-promoted" then
       (map(select(.hostname|startswith("releem-ic-single-")) | select(.relation_type=="innodb_cluster")) as $r |
        ($r|map(select(.hostname==$x.target_hostname and .member_key==$x.new_primary_member_key and .is_writer==1))|length)==1 and
-       ($r|map(.primary_member_key)|unique)==[$x.new_primary_member_key] and
-       ($r|map(select(.member_key==$x.old_primary_member_key and .is_writer==0))|length)==1)
+       ($r|map(select(.member_key!=$x.old_primary_member_key))|all(.primary_member_key==$x.new_primary_member_key)) and
+       ($r|map(select(.member_key==$x.old_primary_member_key and .is_writer==0 and
+                      (.replication_state=="error" or .replication_state=="stopped") and
+                      (.primary_member_key==null or .primary_member_key==$x.new_primary_member_key)))|length)==1)
     elif $x.transition == "single-old-primary-rejoined" then
-      (map(select(.hostname==$x.target_hostname and .member_key==$x.target_member_key and .replication_state=="healthy" and .is_writer==0))|length)==1 and
-      (map(select(.hostname|startswith("releem-ic-single-")) | select(.relation_type=="innodb_cluster") | .primary_member_key)|unique)==[$x.new_primary_member_key]
+      (map(select(.hostname|startswith("releem-ic-single-")) | select(.relation_type=="innodb_cluster")) as $r |
+       ($r|map(select(.hostname==$x.target_hostname and .member_key==$x.target_member_key and .replication_state=="healthy" and .is_writer==0))|length)==1 and
+       ($r|map(.primary_member_key)|unique)==[$x.new_primary_member_key])
     elif $x.transition == "multi-writer-offline" then
-      (map(select(.hostname==$x.target_hostname and .member_key==$x.target_member_key and .is_writer==0 and (.replication_state=="error" or .replication_state=="stopped")))|length)==1
+      (map(select(.relation_type=="innodb_cluster" and .hostname==$x.target_hostname and .member_key==$x.target_member_key and
+                  .is_writer==0 and (.replication_state=="error" or .replication_state=="stopped")))|length)==1
     elif $x.transition == "multi-writer-rejoined" then
-      (map(select(.hostname==$x.target_hostname and .member_key==$x.target_member_key and .is_writer==1 and .replication_state=="healthy"))|length)==1
+      (map(select(.relation_type=="innodb_cluster" and .hostname==$x.target_hostname and .member_key==$x.target_member_key and
+                  .is_writer==1 and .replication_state=="healthy"))|length)==1
     elif $x.transition == "clusterset-primary-switchover" then
       (map(select((.hostname|startswith($x.old_primary_cluster)) and .relation_type=="innodb_clusterset"))|length)==3 and
       (map(select((.hostname|startswith($x.old_primary_cluster)) and .relation_type=="innodb_clusterset"))|all(.role=="replica_cluster" and .is_writer==0 and .parent_group_key != null)) and
@@ -1334,9 +1344,9 @@ assert_selected_observations() {
       ($observation.relations|fromjson) as $relations |
       ($current | map(select(.sid == $observation.sid))) as $expected_relations |
       ($relations|type)=="array" and ($relations|length)>0 and
-      (($relations|map([.Type,.GroupKey])|unique|length)==($relations|length)) and
+      (($relations|map([.relation_type,.group_key])|unique|length)==($relations|length)) and
       ($expected_relations|length)>0 and
-      (($relations | map({relation_type:.Type,group_key:.GroupKey,member_key:.MemberKey,parent_group_key:.ParentGroupKey,role:.Role,is_writer:(if .IsWriter then 1 else 0 end),replication_state:.ReplicationState}) | sort_by(.relation_type,.group_key)) ==
+      (($relations | map({relation_type,group_key,member_key,parent_group_key,role,is_writer,replication_state}) | sort_by(.relation_type,.group_key)) ==
        ($expected_relations | map({relation_type,group_key,member_key,parent_group_key,role,is_writer,replication_state}) | sort_by(.relation_type,.group_key)))
     )
   ' "$file" >/dev/null || die "selected observations are missing, duplicated, or relation-invalid"
