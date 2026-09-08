@@ -398,6 +398,11 @@ EOF
     [ "$status" -eq 0 ]
     [ "$output" = absent ]
 
+    printf '%s\n' 'aws: [ERROR]: An error occurred (NoSuchEntity) when calling the GetRole operation: Role not found' >"$error_file"
+    run classify_iam_get_result 254 "$error_file" GetRole
+    [ "$status" -eq 0 ]
+    [ "$output" = absent ]
+
     printf '%s\n' 'proxy wrapper: cached NoSuchEntity from GetRole' >"$error_file"
     run classify_iam_get_result 254 "$error_file" GetRole
     [ "$status" -ne 0 ]
@@ -405,6 +410,11 @@ EOF
     printf '%s\n' 'An error occurred (404) when calling the HeadObject operation: Not Found' >"$error_file"
     run classify_s3_head_result 254 "$error_file" HeadObject
     [ "$status" -eq 0 ]
+
+    printf '%s\n' 'aws: [ERROR]: An error occurred (404) when calling the HeadBucket operation: Not Found' >"$error_file"
+    run classify_s3_head_result 254 "$error_file" HeadBucket
+    [ "$status" -eq 0 ]
+    [ "$output" = absent ]
 
     printf '%s\n' 'wrapper saw 404 Not Found while proxying HeadObject' >"$error_file"
     run classify_s3_head_result 254 "$error_file" HeadObject

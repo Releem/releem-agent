@@ -106,7 +106,7 @@ classify_s3_head_result() {
     [[ "$status" -eq 254 && "$operation" =~ ^Head(Bucket|Object)$ ]] || return 1
     local errors='(404|NotFound)'
     [[ "$operation" == HeadObject ]] && errors='(404|NotFound|NoSuchKey)'
-    if grep -Eq "^An error occurred \\(${errors}\\) when calling the ${operation} operation: (Not Found|[^[:space:]].*)$" "$error_file"; then
+    if grep -Eq "^(aws: \\[ERROR\\]: )?An error occurred \\(${errors}\\) when calling the ${operation} operation: (Not Found|[^[:space:]].*)$" "$error_file"; then
         printf 'absent\n'; return 0
     fi
     return 1
@@ -125,7 +125,7 @@ classify_iam_get_result() {
     local status="$1" error_file="$2" operation="${3:-GetRole}"
     if ((status == 0)); then printf 'present\n'; return 0; fi
     [[ "$status" -eq 254 && "$operation" =~ ^Get(Role|InstanceProfile)$ ]] || return 1
-    if grep -Eq "^An error occurred \\(NoSuchEntity\\) when calling the ${operation} operation: [^[:space:]].*$" "$error_file"; then
+    if grep -Eq "^(aws: \\[ERROR\\]: )?An error occurred \\(NoSuchEntity\\) when calling the ${operation} operation: [^[:space:]].*$" "$error_file"; then
         printf 'absent\n'; return 0
     fi
     return 1
@@ -1873,7 +1873,7 @@ probe_db_instance_resource_id() {
         printf 'present\t%s\n' "$resource_id"
         return 0
     fi
-    if ((status == 254)) && grep -Eq '^An error occurred \(DBInstanceNotFound(Fault)?\) when calling the DescribeDBInstances operation: [^[:space:]].*$' "$error_file"; then
+    if ((status == 254)) && grep -Eq '^(aws: \[ERROR\]: )?An error occurred \(DBInstanceNotFound(Fault)?\) when calling the DescribeDBInstances operation: [^[:space:]].*$' "$error_file"; then
         printf 'absent\n'
         return 0
     fi
