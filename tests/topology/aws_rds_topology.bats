@@ -1125,6 +1125,39 @@ EOF
     [ "$status" -ne 0 ]
 }
 
+@test "deterministic collision capture emits valid empty inventory" {
+    aws_region() {
+        case "$*" in
+            *describe-db-instances*) printf '%s\n' '{"DBInstances":[]}' ;;
+            *describe-db-clusters*) printf '%s\n' '{"DBClusters":[]}' ;;
+            *describe-global-clusters*) printf '%s\n' '{"GlobalClusters":[]}' ;;
+            *describe-db-parameter-groups*) printf '%s\n' '{"DBParameterGroups":[]}' ;;
+            *describe-db-cluster-parameter-groups*) printf '%s\n' '{"DBClusterParameterGroups":[]}' ;;
+            *describe-db-subnet-groups*) printf '%s\n' '{"DBSubnetGroups":[]}' ;;
+            *describe-security-groups*) printf '%s\n' '{"SecurityGroups":[]}' ;;
+            *describe-instances*) printf '%s\n' '{"Reservations":[]}' ;;
+            *) return 1 ;;
+        esac
+    }
+    aws_global() {
+        case "$*" in
+            *list-roles*) printf '%s\n' '{"Roles":[]}' ;;
+            *list-instance-profiles*) printf '%s\n' '{"InstanceProfiles":[]}' ;;
+            *list-buckets*) printf '%s\n' '{"Buckets":[]}' ;;
+            *get-caller-identity*) printf '%s\n' '111111111111' ;;
+            *) return 1 ;;
+        esac
+    }
+    s3_bucket_presence() { printf '%s\n' absent; }
+    fixture="$TEST_TMPDIR/captured-collisions.json"
+
+    run capture_deterministic_collisions "$fixture"
+
+    [ "$status" -eq 0 ]
+    run jq -e '.expected==[] and .existing==[]' "$fixture"
+    [ "$status" -eq 0 ]
+}
+
 @test "preflight requires private subnet NAT egress" {
     good="$TEST_TMPDIR/egress-good.json"
     bad="$TEST_TMPDIR/egress-bad.json"

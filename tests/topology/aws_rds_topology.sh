@@ -926,7 +926,7 @@ capture_deterministic_collisions() {
         --slurpfile es "$dir/east-subnets.json" --slurpfile ws "$dir/west-subnets.json" \
         --slurpfile esg "$dir/east-sgs.json" --slurpfile wsg "$dir/west-sgs.json" \
         --slurpfile eri "$dir/east-runners.json" --slurpfile wri "$dir/west-runners.json" --arg bucket_state "$bucket_state" '
-      {expected:[],existing:(
+      {expected:[],existing:((
         [$ed[0].DBInstances[]?.DBInstanceIdentifier,$wd[0].DBInstances[]?.DBInstanceIdentifier,
          $ec[0].DBClusters[]?.DBClusterIdentifier,$wc[0].DBClusters[]?.DBClusterIdentifier,
          $globals[0].GlobalClusters[]?.GlobalClusterIdentifier,$roles[0].Roles[]?.RoleName,
@@ -937,7 +937,7 @@ capture_deterministic_collisions() {
         [$esg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId,
          $wsg[0].SecurityGroups[]?|select(.GroupName|startswith($prefix))|.GroupId] +
         [$eri[0].Reservations[].Instances[]?.InstanceId,$wri[0].Reservations[].Instances[]?.InstanceId] +
-        (if $bucket_state=="present" then [$bucket] else [] end)}' >"$out"
+        (if $bucket_state=="present" then [$bucket] else [] end))}' >"$out"
     chmod 600 "$out"
 }
 
