@@ -250,6 +250,18 @@ cleanup_poll_seconds() {
     printf '%s\n' "$poll"
 }
 
+cleanup_bounded_sleep() {
+    local requested="$1" remaining sleep_seconds
+    if ((CLEANUP_DEADLINE_EPOCH <= 0)); then
+        sleep "$requested"
+        return 0
+    fi
+    remaining="$(cleanup_remaining_seconds)" || return 1
+    sleep_seconds="$(cleanup_poll_seconds "$requested" "$remaining")"
+    ((sleep_seconds > 0)) || return 1
+    sleep "$sleep_seconds"
+}
+
 cleanup_wait_until() {
     local description="$1" status remaining sleep_seconds
     shift
@@ -661,6 +673,13 @@ assert_exact_sid_contract() {
     ' "$current" >/dev/null || die "exact per-SID provider/native/source contract mismatch"
 }
 
+topology_relation_edge_key() {
+    local relation_type="$1" group_key="$2" digest
+    digest="$(printf '%s\0%s' "$relation_type" "$group_key" | sha256sum | awk '{print $1}')"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '__releem_relation_edge__:%s\n' "$digest"
+}
+
 capture_native_identity_map() {
     local current="$1" sid_map="$2" out="$3"
     jq -s -e --slurpfile sidmap "$sid_map" '
@@ -696,8 +715,24 @@ capture_native_identity_map() {
 }
 
 add_exact_native_expectations() {
-    local expectation="$1" sid_map="$2" identities="$3" label="$4"
-    jq -s --slurpfile sidmap "$sid_map" --slurpfile identities "$identities" --arg label "$label" '
+    local expectation="$1" sid_map="$2" identities="$3" label="$4" global_rows global_upstreams channel_key
+    mkdir -p "$(state_dir)"
+    global_rows="$(state_dir)/global-upstream-rows.tsv"
+    global_upstreams="$(state_dir)/global-upstreams.json"
+    jq -r '.relations[]|select(.relation_type=="aurora_global_database" and .role=="replica_cluster_member")|
+      [.sid,.group_key,.parent_group_key,.replication_state]|@tsv' "$expectation" >"$global_rows" || return 1
+    : >"${global_upstreams}.jsonl"
+    while IFS=$'\t' read -r sid group_key upstream_member_key replication_state; do
+        [[ -n "$sid" ]] || continue
+        channel_key="$(topology_relation_edge_key aurora_global_database "$group_key")" || return 1
+        jq -cn --argjson sid "$sid" --arg channel_key "$channel_key" --arg upstream "$upstream_member_key" \
+          --arg state "$replication_state" \
+          '{sid:$sid,channel_key:$channel_key,upstream_member_key:$upstream,replication_state:$state}' \
+          >>"${global_upstreams}.jsonl" || return 1
+    done <"$global_rows"
+    jq -s '.' "${global_upstreams}.jsonl" >"$global_upstreams" || return 1
+    jq -s --slurpfile sidmap "$sid_map" --slurpfile identities "$identities" \
+      --slurpfile global_upstreams "$global_upstreams" --arg label "$label" '
       .[0] as $expected | $identities[0] as $ids |
       ($ids|map(select(.provider_id|endswith("-rds-source")))|if length==1 then .[0] else error("source identity") end) as $source |
       ($ids|map(select(.provider_id|endswith("-rds-replica")))|if length==1 then .[0] else error("replica identity") end) as $replica |
@@ -715,8 +750,9 @@ add_exact_native_expectations() {
              is_reader:1,replication_state:"healthy"}
           end
         end] as $native |
-      $expected + {relations:($expected.relations+$native),upstreams:[{sid:$replica.sid,channel_key:"default",
-        upstream_member_key:$source.member_key,replication_state:$replica_state}]}
+      $expected + {relations:($expected.relations+$native),upstreams:([{
+        sid:$replica.sid,channel_key:"default",upstream_member_key:$source.member_key,
+        replication_state:$replica_state}]+$global_upstreams[0])}
     ' "$expectation" >"${expectation}.new" || return 1
     mv "${expectation}.new" "$expectation"
     chmod 600 "$expectation"
@@ -766,7 +802,9 @@ assert_transition_state() {
         (map(select(.relation_type=="aurora_global_database")) as $global |
           ($global|length)==4 and ($global|map(.group_key)|unique|length)==1 and
           ($global|map(select(.role=="primary_cluster_member"))|length)==2 and
-          ($global|map(select(.role=="replica_cluster_member" and .parent_group_key!=null))|length)==2) and
+          ($global|map(select(.role=="replica_cluster_member" and .parent_group_key!=null))|length)==2 and
+          ($global|map(select(.is_writer==1 and .is_reader==1 and .replication_state=="healthy"))|length)==1 and
+          ($global|all(.is_reader==1 and .replication_state=="healthy"))) and
         (map(select(.relation_type=="rds_read_replica")) as $replica |
           ($replica|length)==2 and ($replica|map(.group_key)|unique|length)==1 and
           ($replica|map(.role)|sort)==["primary","replica"]) and
@@ -782,6 +820,8 @@ assert_transition_state() {
         (map(select(.relation_type=="aurora_global_database" and .group_key==$e.group_key)) as $r |
           ($r|length)==4 and ($r|map(select(.role=="primary_cluster_member"))|length)==2 and
           ($r|map(select(.role=="replica_cluster_member" and .parent_group_key != null))|length)==2 and
+          ($r|map(select(.is_writer==1 and .is_reader==1 and .replication_state=="healthy"))|length)==1 and
+          ($r|all(.is_reader==1 and .replication_state=="healthy")) and
           ($r|map(select(.role=="primary_cluster_member"))|map(.member_key)|
             all(. as $member|($e.old_primary_member_keys|index($member))==null)))
       elif $label == "rds-replica-stopped" then
@@ -1310,14 +1350,15 @@ delete_s3_object_until_absent() {
     error_file="$(state_dir)/head-object-error"
     mkdir -p "$(state_dir)"
     for attempt in 1 2 3 4 5; do
-        aws_region "$region" s3api delete-object --bucket "$bucket" --key "$key" >/dev/null 2>&1 || { sleep "$POLL_SECONDS"; continue; }
+        ((CLEANUP_DEADLINE_EPOCH <= 0)) || cleanup_remaining_seconds >/dev/null || return 1
+        aws_region "$region" s3api delete-object --bucket "$bucket" --key "$key" >/dev/null 2>&1 || { cleanup_bounded_sleep "$POLL_SECONDS" || return 1; continue; }
         status=0
         aws_region "$region" s3api head-object --bucket "$bucket" --key "$key" >/dev/null 2>"$error_file" || status=$?
         if ((status == 0)); then state=present
-        else state="$(classify_s3_head_result "$status" "$error_file" HeadObject)" || { sleep "$POLL_SECONDS"; continue; }
+        else state="$(classify_s3_head_result "$status" "$error_file" HeadObject)" || { cleanup_bounded_sleep "$POLL_SECONDS" || return 1; continue; }
         fi
         [[ "$state" == absent ]] && return 0
-        sleep "$POLL_SECONDS"
+        cleanup_bounded_sleep "$POLL_SECONDS" || return 1
     done
     return 1
 }
@@ -1545,17 +1586,22 @@ ensure_cluster() {
 
 ensure_cluster_instance() {
     local region="$1" identifier="$2" cluster="$3" class="$4" instance_pg="$5"
+    local response
     local -a monitor_args
     mapfile -t monitor_args < <(monitoring_arguments "$MONITORING_ROLE_ARN")
     if ! instance_exists "$region" "$identifier"; then
+        response="$(state_dir)/create-${region}-${identifier}-response.json"
         aws_region "$region" rds create-db-instance --db-instance-identifier "$identifier" \
             --db-cluster-identifier "$cluster" --engine aurora-mysql --db-instance-class "$class" \
             --db-parameter-group-name "$instance_pg" --no-publicly-accessible --auto-minor-version-upgrade \
             "${monitor_args[@]}" \
-            --tags "$(tags_args | head -n1)" "$(tags_args | tail -n1)" >/dev/null
+            --tags "$(tags_args | head -n1)" "$(tags_args | tail -n1)" --output json >"$response"
         arm_cleanup
+        capture_monitoring_resource_id_from_response "$region" "$identifier" "$response" ||
+            record_monitoring_resource_id "$region" "$identifier"
+    else
+        record_monitoring_resource_id "$region" "$identifier"
     fi
-    record_monitoring_resource_id "$region" "$identifier"
     wait_instance_available "$region" "$identifier"
 }
 
@@ -1590,13 +1636,17 @@ rds_input_file() {
 }
 
 ensure_rds_instance() {
-    local identifier="$1" subnet="$2" sg="$3" pg="$4" multi="$5" file
+    local identifier="$1" subnet="$2" sg="$3" pg="$4" multi="$5" file response
     if ! instance_exists "$PRIMARY_REGION" "$identifier"; then
         file="$(rds_input_file "$identifier" "$subnet" "$sg" "$pg" "$multi")"
-        aws_region "$PRIMARY_REGION" rds create-db-instance --cli-input-json "file://${file}" >/dev/null
+        response="$(state_dir)/create-${PRIMARY_REGION}-${identifier}-response.json"
+        aws_region "$PRIMARY_REGION" rds create-db-instance --cli-input-json "file://${file}" --output json >"$response"
         arm_cleanup
+        capture_monitoring_resource_id_from_response "$PRIMARY_REGION" "$identifier" "$response" ||
+            record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
+    else
+        record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     fi
-    record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     wait_instance_available "$PRIMARY_REGION" "$identifier"
 }
 
@@ -1614,14 +1664,18 @@ read_replica_create_arguments() {
 
 ensure_read_replica() {
     local identifier="$1" source="$2" subnet="$3" sg="$4" pg="$5"
-    local file
+    local file response
     local -a args
     mapfile -t args < <(read_replica_create_arguments "$identifier" "$source" "$subnet" "$sg")
     if ! instance_exists "$PRIMARY_REGION" "$identifier"; then
-        aws_region "$PRIMARY_REGION" rds create-db-instance-read-replica "${args[@]}" >/dev/null
+        response="$(state_dir)/create-${PRIMARY_REGION}-${identifier}-response.json"
+        aws_region "$PRIMARY_REGION" rds create-db-instance-read-replica "${args[@]}" --output json >"$response"
         arm_cleanup
+        capture_monitoring_resource_id_from_response "$PRIMARY_REGION" "$identifier" "$response" ||
+            record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
+    else
+        record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     fi
-    record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     wait_instance_available "$PRIMARY_REGION" "$identifier"
     file="$(state_dir)/read-replica-parameter-group.json"
     aws_region "$PRIMARY_REGION" rds describe-db-instances --db-instance-identifier "$identifier" --output json >"$file"
@@ -1752,17 +1806,59 @@ initialize_monitoring_tracking() {
 }
 
 capture_monitoring_resource_id() {
-    local region="$1" identifier="$2" file resource_id temp
-    file="$(monitoring_tracking_file)"
+    local region="$1" identifier="$2" resource_id
     resource_id="$(aws_region "$region" rds describe-db-instances --db-instance-identifier "$identifier" \
         --query 'DBInstances[0].DbiResourceId' --output text)" || return 1
+    persist_monitoring_resource_id "$region" "$identifier" "$resource_id"
+}
+
+persist_monitoring_resource_id() {
+    local region="$1" identifier="$2" resource_id="$3" file temp
     [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
+    initialize_monitoring_tracking
+    file="$(monitoring_tracking_file)"
     temp="${file}.new"
     awk -F '\t' -v OFS='\t' -v region="$region" -v identifier="$identifier" -v resource_id="$resource_id" '
-      $1==region && $2==identifier {$3=resource_id; found=1} {print $1,$2,$3} END{if(!found) exit 1}
+      $3==resource_id && !($1==region && $2==identifier) {duplicate=1}
+      $1==region && $2==identifier {$3=resource_id; found=1} {print $1,$2,$3}
+      END{if(!found || duplicate) exit 1}
     ' "$file" >"$temp" || { rm -f "$temp"; return 1; }
     mv "$temp" "$file"
     chmod 600 "$file"
+}
+
+capture_monitoring_resource_id_from_response() {
+    local region="$1" identifier="$2" response="$3" response_identifier resource_id
+    [[ -s "$response" ]] || return 1
+    response_identifier="$(jq -er '.DBInstance.DBInstanceIdentifier' "$response")" || return 1
+    [[ "$response_identifier" == "$identifier" ]] || return 1
+    resource_id="$(jq -er '.DBInstance.DbiResourceId' "$response")" || return 1
+    persist_monitoring_resource_id "$region" "$identifier" "$resource_id"
+}
+
+tracked_monitoring_resource_id() {
+    local region="$1" identifier="$2" file resource_id
+    file="$(monitoring_tracking_file)"
+    [[ -f "$file" ]] || return 1
+    resource_id="$(awk -F '\t' -v region="$region" -v identifier="$identifier" '
+      $1==region && $2==identifier {if(found) exit 2; value=$3; found=1} END{if(!found) exit 1; print value}
+    ' "$file")" || return 1
+    [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
+    printf '%s\n' "$resource_id"
+}
+
+delete_db_instance_if_monitoring_tracked() {
+    local region="$1" identifier="$2" deleted_file="${3:-}" resource_id
+    resource_id="$(tracked_monitoring_resource_id "$region" "$identifier")" || {
+        capture_monitoring_resource_id "$region" "$identifier" || return 1
+        resource_id="$(tracked_monitoring_resource_id "$region" "$identifier")" || return 1
+    }
+    [[ -n "$resource_id" ]] || return 1
+    cleanup_aws_region "$region" rds delete-db-instance --db-instance-identifier "$identifier" \
+        --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || return 1
+    if [[ -n "$deleted_file" ]]; then
+        printf '%s\t%s\n' "$region" "$identifier" >>"$deleted_file"
+    fi
 }
 
 record_monitoring_resource_id() {
@@ -1972,7 +2068,11 @@ capture_aws_identity_map() {
           --argjson global "$global" --argjson source "$source" --argjson writer "$writer" '
           def member($x): $x.DBInstanceArn;
           def available($x): $x.DBInstanceStatus=="available";
-          def global_state($x): if $x=="connected" then "healthy" elif $x=="pending-resync" then "lagging" else "unknown" end;
+          def global_state($member):
+            if $member.SynchronizationStatus=="connected" then "healthy"
+            elif $member.SynchronizationStatus=="pending-resync" then "lagging"
+            elif $member.IsWriter==true and (($member.SynchronizationStatus//"")=="") then "healthy"
+            else "unknown" end;
           def provider_relations:
             (if $cluster != null then
               (any($cluster.DBClusterMembers[];.DBInstanceIdentifier==$identifier and .IsClusterWriter)) as $local_writer |
@@ -1984,13 +2084,13 @@ capture_aws_identity_map() {
               (if $global != null then
                 ($global.GlobalClusterMembers|map(select(.IsWriter==true))[0].DBClusterArn) as $primary_cluster |
                 ($global.GlobalClusterMembers|map(select(.DBClusterArn==$cluster.DBClusterArn))[0]) as $global_member |
-                (global_state($global_member.SynchronizationStatus)) as $state |
+                (global_state($global_member)) as $state |
                 [{relation_type:"aurora_global_database",group_key:("aurora-global:"+$global.GlobalClusterResourceId),
                   parent_group_key:(if $cluster.DBClusterArn==$primary_cluster then null else $primary_cluster end),
                   member_key:member($db),primary_member_key:null,
                   role:(if $cluster.DBClusterArn==$primary_cluster then "primary_cluster_member" else "replica_cluster_member" end),
-                  is_writer:(available($db) and $state!="unknown" and $cluster.DBClusterArn==$primary_cluster and $local_writer),
-                  is_reader:(available($db) and $state!="unknown"),replication_state:$state}]
+                  is_writer:(available($db) and $state=="healthy" and $cluster.DBClusterArn==$primary_cluster and $local_writer),
+                  is_reader:(available($db) and ($state=="healthy" or $state=="lagging")),replication_state:$state}]
                else [] end)
              else [] end) +
             (if $source != null then
@@ -2236,9 +2336,11 @@ identifier_from_arn() { printf '%s\n' "${1##*:}"; }
 cleanup_resources_impl() {
     local cleanup_failed=0
     run_cleanup_steps stop_agents || cleanup_failed=1
-    local dir region arn id sg global_id cluster_arn cluster_region runner account bucket runner_role runner_profile monitor_role post ownership_file
+    local dir region arn id sg global_id cluster_arn cluster_region runner account bucket runner_role runner_profile monitor_role post ownership_file deleted_instances
     dir="$(state_dir)/cleanup"
     mkdir -p "$dir"
+    deleted_instances="$dir/deleted-instances.tsv"
+    : >"$deleted_instances"
     capture_inventory "$dir/before.json" || cleanup_failed=1
     recover_monitoring_resource_ids || { log "Enhanced Monitoring resource ID recovery incomplete"; cleanup_failed=1; }
 
@@ -2247,16 +2349,23 @@ cleanup_resources_impl() {
         inventory_region "$region" "$dir/${region}.json" || { cleanup_failed=1; continue; }
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            cleanup_aws_region "$region" rds delete-db-instance --db-instance-identifier "$id" --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || cleanup_failed=1
+            delete_db_instance_if_monitoring_tracked "$region" "$id" "$deleted_instances" || {
+                log "database deletion skipped until Enhanced Monitoring resource ID is recorded: $region/$id"
+                cleanup_failed=1
+            }
         done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source)|not)' "$dir/${region}.json")
+        while IFS=$'\t' read -r deleted_region id; do
+            [[ "$deleted_region" == "$region" ]] || continue
+            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
+        done <"$deleted_instances"
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
-        done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source)|not)' "$dir/${region}.json")
-        while IFS= read -r arn; do
-            id="$(identifier_from_arn "$arn")"
-            cleanup_aws_region "$region" rds delete-db-instance --db-instance-identifier "$id" --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || cleanup_failed=1
-            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
+            if delete_db_instance_if_monitoring_tracked "$region" "$id" "$deleted_instances"; then
+                if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
+            else
+                log "source database deletion skipped until Enhanced Monitoring resource ID is recorded: $region/$id"
+                cleanup_failed=1
+            fi
         done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source))' "$dir/${region}.json")
     done
     if [[ -f "$(monitoring_tracking_file)" ]]; then

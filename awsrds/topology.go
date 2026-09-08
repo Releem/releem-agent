@@ -166,9 +166,10 @@ func buildAuroraGlobalRelation(metadata Metadata) (models.MetricGroupValue, bool
 		return nil, false
 	}
 
-	state := globalReplicationState(local.SynchronizationStatus)
+	state := globalMemberReplicationState(local)
 	available := instanceAvailable(metadata.InstanceStatus) && readableReplicationState(state)
 	isPrimaryCluster := local.IsWriter
+	isWriter := available && state == "healthy" && isPrimaryCluster && metadata.IsClusterWriter
 	relation := baseProviderRelation(
 		"aurora_global_database",
 		groupKey,
@@ -185,9 +186,9 @@ func buildAuroraGlobalRelation(metadata Metadata) (models.MetricGroupValue, bool
 	} else {
 		relation["ParentGroupKey"] = nullableString(primary.DBClusterARN)
 	}
-	relation["IsWriter"] = available && isPrimaryCluster && metadata.IsClusterWriter
+	relation["IsWriter"] = isWriter
 	relation["IsReader"] = available
-	relation["ReadOnly"] = !(isPrimaryCluster && metadata.IsClusterWriter)
+	relation["ReadOnly"] = !isWriter
 	relation["ReplicationState"] = state
 	relation["Facts"] = models.MetricGroupValue{
 		"GlobalClusterIdentifier":     metadata.GlobalClusterIdentifier,
@@ -451,6 +452,13 @@ func globalReplicationState(status string) string {
 	default:
 		return "unknown"
 	}
+}
+
+func globalMemberReplicationState(member GlobalClusterMember) string {
+	if member.IsWriter && strings.TrimSpace(member.SynchronizationStatus) == "" {
+		return "healthy"
+	}
+	return globalReplicationState(member.SynchronizationStatus)
 }
 
 func readableReplicationState(state string) bool {

@@ -250,10 +250,14 @@ a one-second interval. Before Agent startup, the harness requires at least one
 event in the exact `RDSOSMetrics/<DBInstanceResourceID>` stream. The runner
 role permits only SSM management, reads of its exact private S3 run prefix,
 `logs:GetLogEvents` for `RDSOSMetrics`, and `rds:Describe*`.
-The harness initializes an exact 13-instance monitoring manifest and records
-each resource ID immediately after that instance becomes describable, before
-its availability wait. Cleanup retries missing IDs before deleting databases;
-an incomplete or duplicate manifest makes terminal cleanup fail closed.
+The harness initializes an exact 13-instance monitoring manifest before cloud
+mutation and records each resource ID atomically from the create response,
+falling back to a bounded describe retry before the availability wait. Cleanup
+retries missing IDs but never deletes an instance whose ID is not durably
+recorded. It continues with other resources, returns nonzero, and preserves the
+instance so an exact-confirmed later `destroy` can recover the ID before
+deleting its monitoring stream and database. An incomplete or duplicate
+manifest makes terminal cleanup fail closed.
 
 The reviewed `/tmp/releem-agent-db-topology-x86_64` binary and mode-`0600`
 Agent/MySQL configuration archives are transported as server-side-encrypted
@@ -282,8 +286,11 @@ including parent, primary, role, writer/reader flags, and replication state;
 unlisted provider or native rows are rejected. A validated baseline identity
 map generates one exact native relation for every one of the 13 SIDs and
 transition-specific writer/reader/state expectations. The complete upstream
-set contains only the expected ordinary replica channel/source/state; extra
-channels, including spurious Global Database upstreams, fail. ClickHouse snapshots
+set contains the ordinary replica channel/source/state plus one deterministic
+Platform-synthesized relation channel for every Aurora Global Database instance
+in the secondary regional cluster. Those channels use the exact relation/group
+digest and primary regional cluster ARN; their direction reverses after the
+managed switchover. Missing or extra channels fail. ClickHouse snapshots
 parse primary/source edges only from the persisted ClickHouse relations JSON,
 label that evidence as ClickHouse-sourced, and compare it with current MySQL
 state without hostname inference or `LIMIT 1 BY`.
@@ -301,7 +308,8 @@ record, but no command output or credentials are stored in it.
 AWS API calls during cleanup have short per-call timeouts and waiters consume
 only the remaining shared wait budget. Explicit absence classification accepts
 only standard operation-specific AWS CLI service-error envelopes and rejects
-ambiguous wrapper, proxy, timeout, or authorization text.
+ambiguous wrapper, proxy, timeout, or authorization text. S3 object deletion
+retries and their sleeps also stop at the shared cleanup deadline.
 
 Only an untrappable termination such as `SIGKILL` can bypass the EXIT trap.
 Recover by confirming the exact run ID. `destroy` is only for the same single

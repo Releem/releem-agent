@@ -6,7 +6,11 @@ setup() {
     export AWS_TOPOLOGY_RUN_ID=task13-20260908
     export AWS_TOPOLOGY_STATE_DIR="$TEST_TMPDIR/state"
     export AWS_TOPOLOGY_EVIDENCE_DIR="$TEST_TMPDIR/evidence"
-    export AWS_TOPOLOGY_POLL_SECONDS=0
+    if [[ "$BATS_TEST_DESCRIPTION" == "S3 secret deletion stops retries and sleeps at the shared cleanup deadline" ]]; then
+        export AWS_TOPOLOGY_POLL_SECONDS=20
+    else
+        export AWS_TOPOLOGY_POLL_SECONDS=0
+    fi
     source "$SCRIPT" help >/dev/null
 }
 
@@ -135,6 +139,31 @@ setup() {
     }
     run delete_s3_object_until_absent bucket secret us-east-1
     [ "$status" -ne 0 ]
+}
+
+@test "S3 secret deletion stops retries and sleeps at the shared cleanup deadline" {
+    calls="$TEST_TMPDIR/s3-deadline-calls"
+    expired="$TEST_TMPDIR/s3-deadline-expired"
+    CLEANUP_DEADLINE_EPOCH=103
+    cleanup_remaining_seconds() {
+        [[ ! -e "$expired" ]] || return 1
+        printf '3\n'
+    }
+    sleep() {
+        printf 'sleep:%s\n' "$1" >>"$calls"
+        : >"$expired"
+    }
+    aws_region() {
+        printf 'aws:%s\n' "$*" >>"$calls"
+        return 1
+    }
+
+    run delete_s3_object_until_absent bucket secret us-east-1
+
+    [ "$status" -ne 0 ]
+    [ "$(grep -c '^sleep:' "$calls")" -eq 1 ]
+    [ "$(grep '^sleep:' "$calls")" = 'sleep:3' ]
+    [ "$(grep -c '^aws:' "$calls")" -eq 1 ]
 }
 
 @test "exact SID contract rejects wrong role flags state and extra provider rows" {
@@ -390,7 +419,7 @@ EOF
     [ "$status" -ne 0 ]
 }
 
-@test "native expectation builds exact closed rows and one upstream for all 13 SIDs" {
+@test "native expectation builds exact closed rows and synthesized Global upstreams for all 13 SIDs" {
     sidmap="$TEST_TMPDIR/native-13-sids.jsonl"
     current="$TEST_TMPDIR/native-13-current.jsonl"
     providers="$TEST_TMPDIR/native-13-provider.json"
@@ -408,14 +437,63 @@ EOF
             printf '{"sid":%d,"relation_type":"standalone","group_key":"%s","parent_group_key":null,"member_key":"%s","primary_member_key":null,"role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}\n' "$sid" "$member" "$member" >>"$current"
         fi
     done < <(addressable_instances)
-    jq -s '{marker_epoch_ms:1710000003500,relations:map({sid,relation_type:"rds_multi_az",group_key:("provider:"+(.sid|tostring)),parent_group_key:null,member_key:("db:"+(.sid|tostring)),primary_member_key:("db:"+(.sid|tostring)),role:"primary",is_writer:1,is_reader:1,replication_state:"unknown"}),upstreams:[]}' "$sidmap" >"$providers"
+    jq -s '
+      {marker_epoch_ms:1710000003500,relations:(map(
+        if (.provider_id|contains("-global-west-")) then
+          [{sid,relation_type:"aurora_cluster",group_key:"aurora:global-west",parent_group_key:"aurora-global:global-resource",
+            member_key:("db:"+(.sid|tostring)),primary_member_key:"db:global-west-writer",
+            role:(if (.provider_id|endswith("-1")) then "primary" else "replica" end),
+            is_writer:(if (.provider_id|endswith("-1")) then 1 else 0 end),is_reader:1,replication_state:"healthy"},
+           {sid,relation_type:"aurora_global_database",group_key:"aurora-global:global-resource",
+           parent_group_key:"arn:aws:rds:us-east-1:111111111111:cluster:global-east",
+           member_key:("db:"+(.sid|tostring)),primary_member_key:null,role:"replica_cluster_member",
+           is_writer:0,is_reader:1,replication_state:"healthy"}]
+        elif (.provider_id|contains("-global-east-")) then
+          [{sid,relation_type:"aurora_cluster",group_key:"aurora:global-east",parent_group_key:"aurora-global:global-resource",
+            member_key:("db:"+(.sid|tostring)),primary_member_key:"db:global-east-writer",
+            role:(if (.provider_id|endswith("-1")) then "primary" else "replica" end),
+            is_writer:(if (.provider_id|endswith("-1")) then 1 else 0 end),is_reader:1,replication_state:"healthy"},
+           {sid,relation_type:"aurora_global_database",group_key:"aurora-global:global-resource",
+           parent_group_key:null,member_key:("db:"+(.sid|tostring)),primary_member_key:null,
+           role:"primary_cluster_member",is_writer:(if (.provider_id|endswith("-1")) then 1 else 0 end),
+           is_reader:1,replication_state:"healthy"}]
+        else
+          [{sid,relation_type:"rds_multi_az",group_key:("provider:"+(.sid|tostring)),parent_group_key:null,
+           member_key:("db:"+(.sid|tostring)),primary_member_key:("db:"+(.sid|tostring)),role:"primary",
+           is_writer:1,is_reader:1,replication_state:"unknown"}]
+        end)|flatten),upstreams:[]}' "$sidmap" >"$providers"
 
     run capture_native_identity_map "$current" "$sidmap" "$identities"
     [ "$status" -eq 0 ]
     cp "$providers" "$expected"
     run add_exact_native_expectations "$expected" "$sidmap" "$identities" aws-baseline
     [ "$status" -eq 0 ]
-    run jq -e '([.relations[]|select(.relation_type=="standalone" or .relation_type=="async_replication")]|length)==13 and (.upstreams|length)==1 and .upstreams[0].channel_key=="default" and .upstreams[0].upstream_member_key=="uuid-source"' "$expected"
+    global_channel="__releem_relation_edge__:$(printf 'aurora_global_database\0aurora-global:global-resource' | sha256sum | awk '{print $1}')"
+    run jq -e --arg channel "$global_channel" '
+      ([.relations[]|select(.relation_type=="standalone" or .relation_type=="async_replication")]|length)==13 and
+      (.upstreams|length)==3 and
+      ([.upstreams[]|select(.channel_key=="default" and .upstream_member_key=="uuid-source")]|length)==1 and
+      ([.upstreams[]|select(.channel_key==$channel and
+        .upstream_member_key=="arn:aws:rds:us-east-1:111111111111:cluster:global-east" and
+        .replication_state=="healthy")]|map(.sid)|unique|length)==2' "$expected"
+    [ "$status" -eq 0 ]
+
+    jq '
+      .relations |= map(
+        if .relation_type!="aurora_global_database" then .
+        elif (.member_key|startswith("db:107") or startswith("db:108")) then
+          .role="replica_cluster_member" |
+          .parent_group_key="arn:aws:rds:us-west-2:111111111111:cluster:global-west" |
+          .is_writer=0
+        else
+          .role="primary_cluster_member" | .parent_group_key=null |
+          .is_writer=(if (.member_key|endswith("109")) then 1 else 0 end)
+        end)' "$providers" >"$expected"
+    run add_exact_native_expectations "$expected" "$sidmap" "$identities" aurora-global-transition
+    [ "$status" -eq 0 ]
+    run jq -e --arg channel "$global_channel" '
+      ([.upstreams[]|select(.channel_key==$channel and
+        .upstream_member_key=="arn:aws:rds:us-west-2:111111111111:cluster:global-west")]|map(.sid)|sort)==[107,108]' "$expected"
     [ "$status" -eq 0 ]
 }
 
@@ -476,6 +554,61 @@ EOF
     [ "$status" -ne 0 ]
     run monitoring_streams_absent
     [ "$status" -ne 0 ]
+}
+
+@test "cleanup preserves an untracked DB until a later destroy can recover its monitoring ID" {
+    initialize_monitoring_tracking
+    calls="$TEST_TMPDIR/monitoring-recovery-calls"
+    describe_ok=false
+    aws_region() {
+        case "$*" in
+            *describe-db-instances*)
+                "$describe_ok" || return 1
+                printf '%s\n' db-RECOVERED1
+                ;;
+            *describe-log-streams*) printf '0\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    cleanup_aws_region() {
+        case "$*" in
+            *delete-db-instance*) printf 'delete:%s\n' "$*" >>"$calls" ;;
+            *) return 1 ;;
+        esac
+    }
+
+    run delete_db_instance_if_monitoring_tracked us-east-1 releem-task13-20260908-aurora-provisioned-1
+    [ "$status" -ne 0 ]
+    [ ! -e "$calls" ]
+
+    describe_ok=true
+    run delete_db_instance_if_monitoring_tracked us-east-1 releem-task13-20260908-aurora-provisioned-1
+    [ "$status" -eq 0 ]
+    run awk -F '\t' '$2=="releem-task13-20260908-aurora-provisioned-1" && $3=="db-RECOVERED1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
+    run grep -c '^delete:' "$calls"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ]
+
+    awk -F '\t' -v OFS='\t' '{$3=($3=="" ? "db-FINAL" NR : $3); print}' \
+        "$(monitoring_tracking_file)" >"$(monitoring_tracking_file).new"
+    mv "$(monitoring_tracking_file).new" "$(monitoring_tracking_file)"
+    run delete_monitoring_stream_until_absent us-east-1 db-RECOVERED1
+    [ "$status" -eq 0 ]
+    run monitoring_streams_absent
+    [ "$status" -eq 0 ]
+}
+
+@test "create response records monitoring resource ID atomically" {
+    initialize_monitoring_tracking
+    response="$TEST_TMPDIR/create-instance.json"
+    printf '%s\n' '{"DBInstance":{"DBInstanceIdentifier":"releem-task13-20260908-rds-source","DbiResourceId":"db-CREATE1"}}' >"$response"
+
+    run capture_monitoring_resource_id_from_response us-east-1 releem-task13-20260908-rds-source "$response"
+
+    [ "$status" -eq 0 ]
+    run awk -F '\t' '$2=="releem-task13-20260908-rds-source" && $3=="db-CREATE1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
 }
 
 @test "terminal monitoring tracking rejects duplicate resource IDs" {

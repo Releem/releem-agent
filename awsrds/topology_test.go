@@ -197,6 +197,60 @@ func TestBuildTopologyRelationsAuroraGlobalDatabase(t *testing.T) {
 	})
 }
 
+func TestBuildTopologyRelationsAuroraGlobalWriterOptionalSynchronization(t *testing.T) {
+	metadata := testAuroraTopologyMetadata()
+	metadata.IsClusterWriter = true
+	metadata.DBInstanceIdentifier = "orders-writer"
+	metadata.DBInstanceARN = "arn:aws:rds:us-east-1:123456789012:db:orders-writer"
+	metadata.DBInstanceResourceID = "db-orders-writer"
+	metadata.Endpoint = "orders-writer.internal"
+	metadata.ClusterMembers = metadata.ClusterMembers[:1]
+	metadata.GlobalClusterIdentifier = "orders-global"
+	metadata.GlobalClusterARN = "arn:aws:rds::123456789012:global-cluster:orders-global"
+	metadata.GlobalClusterResourceID = "cluster-orders-global-resource"
+	metadata.GlobalClusterMembers = []GlobalClusterMember{
+		{
+			DBClusterIdentifier: metadata.DBClusterIdentifier,
+			DBClusterARN:        metadata.DBClusterARN,
+			Region:              metadata.Region,
+			IsWriter:            true,
+		},
+		{
+			DBClusterIdentifier:   "orders-secondary",
+			DBClusterARN:          "arn:aws:rds:us-west-2:123456789012:cluster:orders-secondary",
+			Region:                "us-west-2",
+			SynchronizationStatus: "connected",
+		},
+	}
+
+	relation := relationByType(t, BuildTopologyRelations(metadata), "aurora_global_database")
+	assertRelationFields(t, relation, models.MetricGroupValue{
+		"Role":             "primary_cluster_member",
+		"IsWriter":         true,
+		"IsReader":         true,
+		"ReadOnly":         false,
+		"ReplicationState": "healthy",
+	})
+
+	metadata.GlobalClusterMembers[0].SynchronizationStatus = "pending-resync"
+	relation = relationByType(t, BuildTopologyRelations(metadata), "aurora_global_database")
+	assertRelationFields(t, relation, models.MetricGroupValue{
+		"IsWriter":         false,
+		"IsReader":         true,
+		"ReadOnly":         true,
+		"ReplicationState": "lagging",
+	})
+
+	metadata.GlobalClusterMembers[0].SynchronizationStatus = "disconnected"
+	relation = relationByType(t, BuildTopologyRelations(metadata), "aurora_global_database")
+	assertRelationFields(t, relation, models.MetricGroupValue{
+		"IsWriter":         false,
+		"IsReader":         false,
+		"ReadOnly":         true,
+		"ReplicationState": "unknown",
+	})
+}
+
 func TestBuildTopologyRelationsRDSReadReplica(t *testing.T) {
 	metadata := Metadata{
 		Partition:            "aws",
