@@ -13,6 +13,9 @@ readonly WAIT_TIMEOUT_SECONDS="${AWS_TOPOLOGY_WAIT_TIMEOUT_SECONDS:-3600}"
 readonly PERSISTENCE_TIMEOUT_SECONDS="${TOPOLOGY_PERSISTENCE_TIMEOUT_SECONDS:-600}"
 readonly CLICKHOUSE_MARKER_WINDOW_SECONDS="${TOPOLOGY_CLICKHOUSE_MARKER_WINDOW_SECONDS:-900}"
 readonly RUNTIME_DEADLINE_SECONDS="${AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS:-14400}"
+readonly CLEANUP_DEADLINE_SECONDS="${AWS_TOPOLOGY_CLEANUP_DEADLINE_SECONDS:-3600}"
+readonly CLEANUP_API_TIMEOUT_SECONDS="${AWS_TOPOLOGY_CLEANUP_API_TIMEOUT_SECONDS:-5}"
+readonly CLEANUP_DELETE_RESERVE_SECONDS="${AWS_TOPOLOGY_CLEANUP_DELETE_RESERVE_SECONDS:-600}"
 
 CLEANUP_ARMED=false
 CLEANUP_RUNNING=false
@@ -22,6 +25,8 @@ AWS_IDENTITY_MAP=''
 WATCHDOG_PID=''
 PENDING_SIGNAL_STATUS=0
 RUN_DEADLINE_EPOCH=0
+CLEANUP_DEADLINE_EPOCH=0
+CLEANUP_BUDGET_EXHAUSTED=false
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
@@ -80,13 +85,30 @@ secret_file() { printf '%s/runtime-secret.env\n' "$(state_dir)"; }
 aws_region() {
     local region="$1"
     shift
+    if "$CLEANUP_RUNNING"; then
+        cleanup_aws_region "$region" "$@"
+        return
+    fi
     aws --no-cli-pager --region "$region" "$@"
 }
 
+aws_global() {
+    if "$CLEANUP_RUNNING"; then
+        cleanup_aws "$@"
+        return
+    fi
+    aws "$@"
+}
+
 classify_s3_head_result() {
-    local status="$1" error_file="$2"
+    local status="$1" error_file="$2" operation="${3:-HeadBucket}"
     if [[ "$status" -eq 0 ]]; then printf 'present\n'; return 0; fi
-    if grep -Eq '\(404\)|Not Found' "$error_file"; then printf 'absent\n'; return 0; fi
+    [[ "$status" -eq 254 && "$operation" =~ ^Head(Bucket|Object)$ ]] || return 1
+    local errors='(404|NotFound)'
+    [[ "$operation" == HeadObject ]] && errors='(404|NotFound|NoSuchKey)'
+    if grep -Eq "^An error occurred \\(${errors}\\) when calling the ${operation} operation: (Not Found|[^[:space:]].*)$" "$error_file"; then
+        printf 'absent\n'; return 0
+    fi
     return 1
 }
 
@@ -94,28 +116,31 @@ s3_bucket_presence() {
     local bucket="$1" error_file status
     error_file="$(state_dir)/s3-head-error.txt"
     mkdir -p "$(state_dir)"; chmod 700 "$(state_dir)"
-    if aws s3api head-bucket --bucket "$bucket" >/dev/null 2>"$error_file"; then status=0; else status=$?; fi
+    if aws_global s3api head-bucket --bucket "$bucket" >/dev/null 2>"$error_file"; then status=0; else status=$?; fi
     chmod 600 "$error_file"
-    classify_s3_head_result "$status" "$error_file" || die "S3 bucket presence is ambiguous; refusing to continue"
+    classify_s3_head_result "$status" "$error_file" HeadBucket || die "S3 bucket presence is ambiguous; refusing to continue"
 }
 
 classify_iam_get_result() {
-    local status="$1" error_file="$2"
+    local status="$1" error_file="$2" operation="${3:-GetRole}"
     if ((status == 0)); then printf 'present\n'; return 0; fi
-    if grep -Eq 'NoSuchEntity' "$error_file"; then printf 'absent\n'; return 0; fi
+    [[ "$status" -eq 254 && "$operation" =~ ^Get(Role|InstanceProfile)$ ]] || return 1
+    if grep -Eq "^An error occurred \\(NoSuchEntity\\) when calling the ${operation} operation: [^[:space:]].*$" "$error_file"; then
+        printf 'absent\n'; return 0
+    fi
     return 1
 }
 
 iam_entity_presence() {
-    local kind="$1" name="$2" error_file status=0
+    local kind="$1" name="$2" error_file operation status=0
     error_file="$(state_dir)/iam-${kind}-error"
     mkdir -p "$(state_dir)"
     case "$kind" in
-        role) aws iam get-role --role-name "$name" >/dev/null 2>"$error_file" || status=$? ;;
-        profile) aws iam get-instance-profile --instance-profile-name "$name" >/dev/null 2>"$error_file" || status=$? ;;
+        role) aws_global iam get-role --role-name "$name" >/dev/null 2>"$error_file" || status=$?; operation=GetRole ;;
+        profile) aws_global iam get-instance-profile --instance-profile-name "$name" >/dev/null 2>"$error_file" || status=$?; operation=GetInstanceProfile ;;
         *) return 1 ;;
     esac
-    classify_iam_get_result "$status" "$error_file"
+    classify_iam_get_result "$status" "$error_file" "$operation"
 }
 
 tags_args() {
@@ -194,6 +219,73 @@ assert_inventory_owned() {
 validate_runtime_deadline() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 600 && $1 <= 21600 )) ||
         die "AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS must be between 600 and 21600"
+}
+
+validate_cleanup_deadline() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((CLEANUP_DELETE_RESERVE_SECONDS + 10 <= $1 && $1 <= 10800)) ||
+        die "cleanup deadline must exceed the deletion reserve and be at most 3 hours"
+}
+
+initialize_cleanup_deadline() {
+    ((CLEANUP_DEADLINE_EPOCH > 0)) || CLEANUP_DEADLINE_EPOCH=$(( $(date +%s) + CLEANUP_DEADLINE_SECONDS ))
+}
+
+cleanup_remaining_seconds() {
+    local remaining=$((CLEANUP_DEADLINE_EPOCH - $(date +%s)))
+    ((remaining > 0)) || { printf '0\n'; return 1; }
+    printf '%s\n' "$remaining"
+}
+
+cleanup_wait_remaining_seconds() {
+    local remaining
+    remaining="$(cleanup_remaining_seconds)" || return 1
+    remaining=$((remaining - CLEANUP_DELETE_RESERVE_SECONDS))
+    ((remaining > 0)) || { printf '0\n'; return 1; }
+    printf '%s\n' "$remaining"
+}
+
+cleanup_poll_seconds() {
+    local poll="$1" remaining="$2"
+    ((poll <= remaining)) || poll="$remaining"
+    printf '%s\n' "$poll"
+}
+
+cleanup_wait_until() {
+    local description="$1" status remaining sleep_seconds
+    shift
+    while remaining="$(cleanup_wait_remaining_seconds)"; do
+        "$@" && return 0
+        status=$?
+        [[ "$status" -ne 2 ]] || { log "$description failed"; return 1; }
+        sleep_seconds="$POLL_SECONDS"
+        ((sleep_seconds <= remaining)) || sleep_seconds="$remaining"
+        ((sleep_seconds > 0)) && sleep "$sleep_seconds"
+    done
+    CLEANUP_BUDGET_EXHAUSTED=true
+    log "cleanup budget exhausted while waiting for $description; run exact-confirmed destroy"
+    return 1
+}
+
+cleanup_aws_region() {
+    local region="$1" remaining timeout_seconds
+    shift
+    remaining="$(cleanup_remaining_seconds)" || return 124
+    timeout_seconds="$CLEANUP_API_TIMEOUT_SECONDS"; ((timeout_seconds <= remaining)) || timeout_seconds="$remaining"
+    timeout --foreground --kill-after=5s "${timeout_seconds}s" aws --no-cli-pager --region "$region" "$@"
+}
+
+cleanup_aws_wait_region() {
+    local region="$1" remaining
+    shift
+    remaining="$(cleanup_wait_remaining_seconds)" || return 1
+    timeout --foreground --kill-after=5s "${remaining}s" aws --no-cli-pager --region "$region" "$@"
+}
+
+cleanup_aws() {
+    local remaining timeout_seconds
+    remaining="$(cleanup_remaining_seconds)" || return 124
+    timeout_seconds="$CLEANUP_API_TIMEOUT_SECONDS"; ((timeout_seconds <= remaining)) || timeout_seconds="$remaining"
+    timeout --foreground --kill-after=5s "${timeout_seconds}s" aws --no-cli-pager "$@"
 }
 
 run_cleanup_steps() {
@@ -464,7 +556,9 @@ assert_global_switchover_converged() {
       ([$g.GlobalClusterMembers[]|select(.IsWriter==true)]|length)==1 and
       any($g.GlobalClusterMembers[];.DBClusterArn==$target and .IsWriter==true) and
       any($g.GlobalClusterMembers[];.DBClusterArn==$old and .IsWriter==false) and
-      all($g.GlobalClusterMembers[]; .SynchronizationStatus=="connected")
+      all($g.GlobalClusterMembers[]|select(.IsWriter==false); .SynchronizationStatus=="connected") and
+      all($g.GlobalClusterMembers[]|select(.IsWriter==true);
+        (.SynchronizationStatus==null or .SynchronizationStatus=="connected"))
     ' "$file" >/dev/null
 }
 
@@ -558,19 +652,74 @@ assert_exact_sid_contract() {
       . as $current | ($expected[0]) as $e |
       all($current[]; .last_seen_epoch_ms >= $e.marker_epoch_ms) and
       all($upstreams[]; .last_seen_epoch_ms >= $e.marker_epoch_ms) and
-      ($e.relations|map(select(.relation_type|IN("aurora_cluster","aurora_global_database","rds_read_replica","rds_multi_az")))|
-        map({sid,relation_type,group_key,parent_group_key,member_key,primary_member_key,role,is_writer,is_reader,replication_state})|sort_by(.sid,.relation_type,.group_key,.member_key)) as $wanted_relations |
-      ($current|map(select(.relation_type|IN("aurora_cluster","aurora_global_database","rds_read_replica","rds_multi_az")))|
-        map({sid,relation_type,group_key,parent_group_key,member_key,primary_member_key,role,is_writer,is_reader,replication_state})|sort_by(.sid,.relation_type,.group_key,.member_key))==$wanted_relations and
-      all($e.relations[]; . as $wanted |
-        ($wanted|keys) as $keys |
-        [$current[]|select(.sid==$wanted.sid and .relation_type==$wanted.relation_type)] as $matches |
-        ($matches|length)==1 and ($matches[0] as $actual | all($keys[]; . as $key | $actual[$key]==$wanted[$key]))) and
-      all($e.upstreams[]; . as $wanted |
-        ($wanted|keys) as $keys |
-        [$upstreams[]|select(.sid==$wanted.sid and .channel_key==$wanted.channel_key)] as $matches |
-        ($matches|length)==1 and ($matches[0] as $actual | all($keys[]; . as $key | $actual[$key]==$wanted[$key])))
+      def relation: {sid,relation_type,group_key,parent_group_key,member_key,primary_member_key,role,is_writer,is_reader,replication_state};
+      def upstream: {sid,channel_key,upstream_member_key,replication_state};
+      ($e.relations|map(relation)|sort_by(.sid,.relation_type,.group_key,.member_key)) ==
+        ($current|map(relation)|sort_by(.sid,.relation_type,.group_key,.member_key)) and
+      ($e.upstreams|map(upstream)|sort_by(.sid,.channel_key,.upstream_member_key)) ==
+        ($upstreams|map(upstream)|sort_by(.sid,.channel_key,.upstream_member_key))
     ' "$current" >/dev/null || die "exact per-SID provider/native/source contract mismatch"
+}
+
+capture_native_identity_map() {
+    local current="$1" sid_map="$2" out="$3"
+    jq -s -e --slurpfile sidmap "$sid_map" '
+      def provider: .relation_type|IN("aurora_cluster","aurora_global_database","rds_read_replica","rds_multi_az");
+      [.[]|select(provider|not)] as $native |
+      ($sidmap|map(select(.provider_id|endswith("-rds-source")))|if length==1 then .[0].sid else error("source SID") end) as $source_sid |
+      ($sidmap|map(select(.provider_id|endswith("-rds-replica")))|if length==1 then .[0].sid else error("replica SID") end) as $replica_sid |
+      ($native|map(select(.sid==$source_sid))[0].member_key) as $source_member |
+      if (($sidmap|length)>0 and ($native|length)==($sidmap|length) and
+        all($sidmap[]; . as $mapping |
+        [$native[]|select(.sid==$mapping.sid)] as $rows |
+        ($rows|length)==1 and
+        ($rows[0] as $row |
+          if ($mapping.provider_id|endswith("-rds-replica")) then
+            $row.relation_type=="async_replication" and $row.parent_group_key==null and
+            $row.role=="replica" and $row.is_writer==0 and $row.is_reader==1 and
+            $row.replication_state=="healthy" and ($row.member_key|type)=="string" and
+            ($row.member_key|length)>0 and ($row.primary_member_key|type)=="string" and
+            $row.group_key==$row.primary_member_key
+          else
+            $row.relation_type=="standalone" and $row.group_key==$row.member_key and
+            $row.parent_group_key==null and $row.primary_member_key==null and
+            $row.role=="primary" and ($row.is_writer==0 or $row.is_writer==1) and
+            $row.is_reader==1 and $row.replication_state=="healthy" and
+            ($row.member_key|type)=="string" and ($row.member_key|length)>0
+          end)) and
+        ($native|map(select(.sid==$replica_sid))[0].primary_member_key)==$source_member)
+      then [$sidmap[] as $mapping | ($native|map(select(.sid==$mapping.sid))[0]) as $row |
+        {sid:$mapping.sid,provider_id:$mapping.provider_id,member_key:$row.member_key}]
+      else error("native identity contract mismatch") end
+    ' "$current" >"$out" || return 1
+    chmod 600 "$out"
+}
+
+add_exact_native_expectations() {
+    local expectation="$1" sid_map="$2" identities="$3" label="$4"
+    jq -s --slurpfile sidmap "$sid_map" --slurpfile identities "$identities" --arg label "$label" '
+      .[0] as $expected | $identities[0] as $ids |
+      ($ids|map(select(.provider_id|endswith("-rds-source")))|if length==1 then .[0] else error("source identity") end) as $source |
+      ($ids|map(select(.provider_id|endswith("-rds-replica")))|if length==1 then .[0] else error("replica identity") end) as $replica |
+      (if $label=="rds-replica-stopped" then "stopped" else "healthy" end) as $replica_state |
+      [$ids[] as $identity |
+        if $identity.sid==$replica.sid then
+          {sid:$identity.sid,relation_type:"async_replication",group_key:$source.member_key,parent_group_key:null,
+           member_key:$identity.member_key,primary_member_key:$source.member_key,role:"replica",is_writer:0,
+           is_reader:(if $replica_state=="stopped" then 0 else 1 end),replication_state:$replica_state}
+        else
+          ([$expected.relations[]|select(.sid==$identity.sid and (.relation_type|IN("aurora_cluster","rds_read_replica","rds_multi_az")))]|first) as $provider |
+          if $provider==null then error("provider expectation missing") else
+            {sid:$identity.sid,relation_type:"standalone",group_key:$identity.member_key,parent_group_key:null,
+             member_key:$identity.member_key,primary_member_key:null,role:"primary",is_writer:$provider.is_writer,
+             is_reader:1,replication_state:"healthy"}
+          end
+        end] as $native |
+      $expected + {relations:($expected.relations+$native),upstreams:[{sid:$replica.sid,channel_key:"default",
+        upstream_member_key:$source.member_key,replication_state:$replica_state}]}
+    ' "$expectation" >"${expectation}.new" || return 1
+    mv "${expectation}.new" "$expectation"
+    chmod 600 "$expectation"
 }
 
 retain_clickhouse_observations() {
@@ -608,8 +757,7 @@ assert_transition_state() {
       if $label == "aurora-provisioned-failover" then
         (map(select(.relation_type=="aurora_cluster" and .group_key==$e.group_key)) as $r |
           ($r|length)==3 and ($r|map(select(.is_writer==1 and .role=="primary"))|length)==1 and
-          ($r|map(select(.is_writer==1))[0].member_key != $e.old_writer_member_key) and
-          (map(select(.relation_type=="async_replication" or .relation_type=="group_replication"))|length)>0)
+          ($r|map(select(.is_writer==1))[0].member_key != $e.old_writer_member_key))
       elif $label == "aws-baseline" then
         (map(select(.relation_type=="aurora_cluster")) as $aurora |
           ($aurora|length)==10 and ($aurora|map(.group_key)|unique|length)==4 and
@@ -722,10 +870,10 @@ capture_deterministic_collisions() {
     aws_region "$SECONDARY_REGION" ec2 describe-security-groups --output json >"$dir/west-sgs.json"
     aws_region "$PRIMARY_REGION" ec2 describe-instances --filters "Name=tag:Name,Values=${prefix}runner" --output json >"$dir/east-runners.json"
     aws_region "$SECONDARY_REGION" ec2 describe-instances --filters "Name=tag:Name,Values=${prefix}runner" --output json >"$dir/west-runners.json"
-    aws iam list-roles --path-prefix /releem-topology/ --output json >"$dir/roles.json"
-    aws iam list-instance-profiles --path-prefix / --output json >"$dir/profiles.json"
-    aws s3api list-buckets --output json >"$dir/buckets.json"
-    account="$(aws sts get-caller-identity --query Account --output text)"
+    aws_global iam list-roles --path-prefix /releem-topology/ --output json >"$dir/roles.json"
+    aws_global iam list-instance-profiles --path-prefix / --output json >"$dir/profiles.json"
+    aws_global s3api list-buckets --output json >"$dir/buckets.json"
+    account="$(aws_global sts get-caller-identity --query Account --output text)"
     bucket="releem-topology-$(printf '%s' "$account" | sha256sum | cut -c1-12)-$(run_id)"
     bucket_state="$(s3_bucket_presence "$bucket")" || return 1
     jq -n --arg prefix "$prefix" --arg bucket "$bucket" \
@@ -808,7 +956,7 @@ combine_inventory() {
 
 inventory_support_resources() {
     local out="$1" account bucket bucket_state runner_role monitor_role profile east_instances west_instances east_enis west_enis
-    account="$(aws sts get-caller-identity --query Account --output text)"
+    account="$(aws_global sts get-caller-identity --query Account --output text)"
     bucket="releem-topology-$(printf '%s' "$account" | sha256sum | cut -c1-12)-$(run_id)"
     bucket_state="$(s3_bucket_presence "$bucket")" || return 1
     runner_role="$(resource_name runner-role)"; monitor_role="$(resource_name monitoring-role)"; profile="$(resource_name runner-profile)"
@@ -851,12 +999,12 @@ capture_iam_role_ownership() {
     dir="$(dirname "$out")"; mkdir -p "$dir"
     state="$(iam_entity_presence role "$role")" || return 1
     if [[ "$state" == absent ]]; then jq -n '{exists:false}' >"$out"; return 0; fi
-    aws iam get-role --role-name "$role" --output json >"${out}.get" || return 1
-    aws iam list-role-tags --role-name "$role" --output json >"${out}.tags" || return 1
-    aws iam list-attached-role-policies --role-name "$role" --output json >"${out}.attached" || return 1
-    aws iam list-role-policies --role-name "$role" --output json >"${out}.names" || return 1
+    aws_global iam get-role --role-name "$role" --output json >"${out}.get" || return 1
+    aws_global iam list-role-tags --role-name "$role" --output json >"${out}.tags" || return 1
+    aws_global iam list-attached-role-policies --role-name "$role" --output json >"${out}.attached" || return 1
+    aws_global iam list-role-policies --role-name "$role" --output json >"${out}.names" || return 1
     if [[ "$kind" == runner ]]; then
-        aws iam get-role-policy --role-name "$role" --policy-name ReleemTopologyRunnerRead --output json >"${out}.inline" || return 1
+        aws_global iam get-role-policy --role-name "$role" --policy-name ReleemTopologyRunnerRead --output json >"${out}.inline" || return 1
     else
         printf '{}\n' >"${out}.inline"
     fi
@@ -868,7 +1016,7 @@ capture_iam_role_ownership() {
 
 capture_destroy_support_ownership() {
     local out="$1" account bucket bucket_state runner_role monitor_role profile dir
-    account="$(aws sts get-caller-identity --query Account --output text)"
+    account="$(aws_global sts get-caller-identity --query Account --output text)"
     bucket="releem-topology-$(printf '%s' "$account" | sha256sum | cut -c1-12)-$(run_id)"
     runner_role="$(resource_name runner-role)"; monitor_role="$(resource_name monitoring-role)"; profile="$(resource_name runner-profile)"
     dir="$(dirname "$out")/ownership-work"; mkdir -p "$dir"
@@ -882,8 +1030,8 @@ capture_destroy_support_ownership() {
     local profile_state
     profile_state="$(iam_entity_presence profile "$profile")" || return 1
     if [[ "$profile_state" == present ]]; then
-        aws iam get-instance-profile --instance-profile-name "$profile" --output json >"$dir/profile-get.json" || return 1
-        aws iam list-instance-profile-tags --instance-profile-name "$profile" --output json >"$dir/profile-tags.json" || return 1
+        aws_global iam get-instance-profile --instance-profile-name "$profile" --output json >"$dir/profile-get.json" || return 1
+        aws_global iam list-instance-profile-tags --instance-profile-name "$profile" --output json >"$dir/profile-tags.json" || return 1
         jq -n --slurpfile profile "$dir/profile-get.json" --slurpfile tags "$dir/profile-tags.json" \
           '{exists:true,tags:($tags[0].Tags|map({key:.Key,value:.Value})|from_entries),roles:[$profile[0].InstanceProfile.Roles[].RoleName]}' >"$dir/profile.json" || return 1
     else jq -n '{exists:false}' >"$dir/profile.json"; fi
@@ -898,7 +1046,7 @@ verify_destroy_ownership() {
     file="$(state_dir)/destroy-support-ownership.json"
     mkdir -p "$(state_dir)"; chmod 700 "$(state_dir)"
     capture_destroy_support_ownership "$file"
-    account="$(aws sts get-caller-identity --query Account --output text)"
+    account="$(aws_global sts get-caller-identity --query Account --output text)"
     bucket="releem-topology-$(printf '%s' "$account" | sha256sum | cut -c1-12)-$(run_id)"
     assert_destroy_support_ownership "$file" "arn:aws:s3:::${bucket}/$(run_id)/*" \
         "$(resource_name runner-role)" "$(resource_name monitoring-role)"
@@ -940,7 +1088,8 @@ write_preflight_summary() {
     jq -n --arg captured_at "$(date -u +%FT%TZ)" --arg engine "$engine" --arg class "$class" \
         --arg mysql_version "$mysql_version" --arg mysql_class "$mysql_class" --argjson min_acu "$acu" \
         --argjson initial_max "$initial_max" --argjson transition_max "$transition_max" \
-        --argjson runtime_deadline_seconds "$RUNTIME_DEADLINE_SECONDS" '
+        --argjson runtime_deadline_seconds "$RUNTIME_DEADLINE_SECONDS" --argjson cleanup_deadline_seconds "$CLEANUP_DEADLINE_SECONDS" \
+        --argjson cleanup_delete_reserve_seconds "$CLEANUP_DELETE_RESERVE_SECONDS" '
       {captured_at:$captured_at,regions:["us-east-1","us-west-2"],aurora_engine_version:$engine,
        provisioned_instance_class:$class,serverless_v2:{instances:3,min_acu:$min_acu,
          configured_max_acu:$initial_max,transition_max_acu:$transition_max,load_attempts_max:3},
@@ -948,6 +1097,10 @@ write_preflight_summary() {
          allocated_storage_gib_each:20,allocated_storage_gib_total:60,storage_type:"gp3"},
        runners:{instances:2,instance_class:"t3.micro",encrypted_root_gib_each:8,encrypted_root_gib_total:16},
        enhanced_monitoring_interval_seconds:1,runtime_deadline_seconds:$runtime_deadline_seconds,
+       cleanup_deadline_seconds:$cleanup_deadline_seconds,
+       cleanup_delete_reserve_seconds:$cleanup_delete_reserve_seconds,
+       total_advertised_max_seconds:($runtime_deadline_seconds+$cleanup_deadline_seconds),
+       cleanup_retry_contract:"all automatic attempts share one cleanup deadline; after exhaustion use exact-confirmed destroy",
        hourly_configuration:{provisioned_aurora_instances:7,serverless_v2_instances:3,
          ordinary_rds_instances:3,runner_instances:2,
          note:"configuration units only; consult current AWS pricing before approval"}}' >"$out"
@@ -973,6 +1126,7 @@ load_selection_state() {
 preflight() {
     validate_run_id
     validate_runtime_deadline "$RUNTIME_DEADLINE_SECONDS"
+    validate_cleanup_deadline "$CLEANUP_DEADLINE_SECONDS"
     require_command aws
     require_command jq
     require_command sha256sum
@@ -1160,7 +1314,7 @@ delete_s3_object_until_absent() {
         status=0
         aws_region "$region" s3api head-object --bucket "$bucket" --key "$key" >/dev/null 2>"$error_file" || status=$?
         if ((status == 0)); then state=present
-        else state="$(classify_s3_head_result "$status" "$error_file")" || { sleep "$POLL_SECONDS"; continue; }
+        else state="$(classify_s3_head_result "$status" "$error_file" HeadObject)" || { sleep "$POLL_SECONDS"; continue; }
         fi
         [[ "$state" == absent ]] && return 0
         sleep "$POLL_SECONDS"
@@ -1401,6 +1555,7 @@ ensure_cluster_instance() {
             --tags "$(tags_args | head -n1)" "$(tags_args | tail -n1)" >/dev/null
         arm_cleanup
     fi
+    record_monitoring_resource_id "$region" "$identifier"
     wait_instance_available "$region" "$identifier"
 }
 
@@ -1441,6 +1596,7 @@ ensure_rds_instance() {
         aws_region "$PRIMARY_REGION" rds create-db-instance --cli-input-json "file://${file}" >/dev/null
         arm_cleanup
     fi
+    record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     wait_instance_available "$PRIMARY_REGION" "$identifier"
 }
 
@@ -1465,6 +1621,7 @@ ensure_read_replica() {
         aws_region "$PRIMARY_REGION" rds create-db-instance-read-replica "${args[@]}" >/dev/null
         arm_cleanup
     fi
+    record_monitoring_resource_id "$PRIMARY_REGION" "$identifier"
     wait_instance_available "$PRIMARY_REGION" "$identifier"
     file="$(state_dir)/read-replica-parameter-group.json"
     aws_region "$PRIMARY_REGION" rds describe-db-instances --db-instance-identifier "$identifier" --output json >"$file"
@@ -1478,6 +1635,7 @@ create_matrix() {
     generate_secret
     load_secret
     arm_cleanup
+    initialize_monitoring_tracking
     ensure_support_resources
     load_support_state
     east_runner="$(ensure_runner "$PRIMARY_REGION" "$AWS_TOPOLOGY_EAST_VPC_ID" "$AWS_TOPOLOGY_EAST_SUBNET_IDS" east "$EAST_RUNNER_AMI")"
@@ -1581,10 +1739,61 @@ addressable_instances() {
     printf '%s|%s\n' "$PRIMARY_REGION" "$multi"
 }
 
+monitoring_tracking_file() { printf '%s/monitoring-streams.tsv\n' "$(state_dir)"; }
+
+initialize_monitoring_tracking() {
+    local file
+    file="$(monitoring_tracking_file)"
+    mkdir -p "$(state_dir)"
+    if [[ ! -f "$file" ]]; then
+        while IFS='|' read -r region identifier; do printf '%s\t%s\t\n' "$region" "$identifier"; done < <(addressable_instances) >"$file"
+    fi
+    chmod 600 "$file"
+}
+
+capture_monitoring_resource_id() {
+    local region="$1" identifier="$2" file resource_id temp
+    file="$(monitoring_tracking_file)"
+    resource_id="$(aws_region "$region" rds describe-db-instances --db-instance-identifier "$identifier" \
+        --query 'DBInstances[0].DbiResourceId' --output text)" || return 1
+    [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
+    temp="${file}.new"
+    awk -F '\t' -v OFS='\t' -v region="$region" -v identifier="$identifier" -v resource_id="$resource_id" '
+      $1==region && $2==identifier {$3=resource_id; found=1} {print $1,$2,$3} END{if(!found) exit 1}
+    ' "$file" >"$temp" || { rm -f "$temp"; return 1; }
+    mv "$temp" "$file"
+    chmod 600 "$file"
+}
+
+record_monitoring_resource_id() {
+    initialize_monitoring_tracking
+    wait_until "Enhanced Monitoring resource ID for $2" capture_monitoring_resource_id "$1" "$2"
+}
+
+monitoring_tracking_complete() {
+    local file expected actual
+    file="$(monitoring_tracking_file)"
+    [[ -f "$file" ]] || return 1
+    expected="$(addressable_instances | tr '|' '\t' | sort)"
+    actual="$(awk -F '\t' 'NF==3 && $3~/^db-[A-Za-z0-9]+$/{print $1 "\t" $2}' "$file" | sort)"
+    [[ "$(awk -F '\t' 'NF==3 && $3~/^db-[A-Za-z0-9]+$/{count++} END{print count+0}' "$file")" -eq 13 ]] || return 1
+    [[ "$(awk -F '\t' 'NF==3 && $3~/^db-[A-Za-z0-9]+$/{seen[$3]=1} END{for(id in seen) count++; print count+0}' "$file")" -eq 13 ]] || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
+recover_monitoring_resource_ids() {
+    local region identifier resource_id failed=0
+    initialize_monitoring_tracking
+    while IFS=$'\t' read -r region identifier resource_id; do
+        [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] && continue
+        capture_monitoring_resource_id "$region" "$identifier" || failed=1
+    done <"$(monitoring_tracking_file)"
+    ((failed == 0)) && monitoring_tracking_complete
+}
+
 wait_monitoring_events() {
     local region="$1" identifier="$2" resource_id file deadline
-    resource_id="$(aws_region "$region" rds describe-db-instances --db-instance-identifier "$identifier" \
-        --query 'DBInstances[0].DbiResourceId' --output text)"
+    resource_id="$(awk -F '\t' -v region="$region" -v identifier="$identifier" '$1==region && $2==identifier{print $3}' "$(monitoring_tracking_file)")"
     [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || die "missing resource ID for Enhanced Monitoring"
     file="$(state_dir)/monitoring-${region}-${identifier}.json"
     deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
@@ -1592,8 +1801,6 @@ wait_monitoring_events() {
         aws_region "$region" logs get-log-events --log-group-name RDSOSMetrics \
             --log-stream-name "$resource_id" --limit 1 --no-start-from-head --output json >"$file" 2>/dev/null || true
         if [[ -s "$file" ]] && assert_monitoring_events "$file" "$resource_id" 2>/dev/null; then
-            printf '%s\t%s\n' "$region" "$resource_id" >>"$(state_dir)/monitoring-streams.tsv"
-            chmod 600 "$(state_dir)/monitoring-streams.tsv"
             rm -f "$file"
             return 0
         fi
@@ -1604,6 +1811,7 @@ wait_monitoring_events() {
 
 wait_all_monitoring_events() {
     local region identifier
+    monitoring_tracking_complete || die "Enhanced Monitoring resource ID tracking is incomplete"
     while IFS='|' read -r region identifier; do
         wait_monitoring_events "$region" "$identifier"
     done < <(addressable_instances)
@@ -1648,7 +1856,7 @@ send_ssm_commands() {
     printf '%s\t%s\t%s\n' "$region" "$instance" "$command_id" >>"$record"
     chmod 600 "$record"
     if [[ "$mode" == cleanup ]]; then
-        wait_until_nonfatal "SSM command $label" ssm_command_succeeded "$region" "$instance" "$command_id"
+        cleanup_wait_until "SSM command $label" ssm_command_succeeded "$region" "$instance" "$command_id"
     else
         wait_until "SSM command $label" ssm_command_succeeded "$region" "$instance" "$command_id"
     fi
@@ -1825,27 +2033,6 @@ add_exact_provider_expectations() {
     chmod 600 "$expectation"
 }
 
-assert_exact_native_contract() {
-    local current="$1" upstreams="$2" sid_map="$3" marker="$4" source replica source_sid replica_sid source_member replica_primary
-    jq -s -e --slurpfile sidmap "$sid_map" --argjson marker "$marker" '
-      . as $current | all($sidmap[]; .sid as $sid |
-        [$current[]|select(.sid==$sid and (.relation_type|IN("aurora_cluster","aurora_global_database","rds_read_replica","rds_multi_az")|not))] as $native |
-        ($native|length)==1 and all($native[];.relation_type|IN("standalone","async_replication"))) and
-      all($current[]|select(.relation_type|IN("aurora_cluster","aurora_global_database","rds_read_replica","rds_multi_az")|not);
-        .sid as $sid | any($sidmap[];.sid==$sid)) and
-      all($current[];.last_seen_epoch_ms >= $marker)
-    ' "$current" >/dev/null || die "every AWS SID must have a current native MySQL relation"
-    source="$(resource_name rds-source)"; replica="$(resource_name rds-replica)"
-    source_sid="$(jq -sr --arg id "$source" 'map(select(.provider_id==$id))|if length==1 then .[0].sid else error("source SID missing") end' "$sid_map")"
-    replica_sid="$(jq -sr --arg id "$replica" 'map(select(.provider_id==$id))|if length==1 then .[0].sid else error("replica SID missing") end' "$sid_map")"
-    source_member="$(jq -sr --argjson sid "$source_sid" 'map(select(.sid==$sid and .relation_type=="standalone"))|if length==1 then .[0].member_key else error("source native member missing") end' "$current")"
-    replica_primary="$(jq -sr --argjson sid "$replica_sid" 'map(select(.sid==$sid and .relation_type=="async_replication"))|if length==1 then .[0].primary_member_key else error("replica native source missing") end' "$current")"
-    [[ "$source_member" == "$replica_primary" ]] || die "native replica primary does not match source member"
-    jq -s -e --argjson sid "$replica_sid" --arg source "$source_member" --argjson marker "$marker" '
-      map(select(.sid==$sid and .upstream_member_key==$source and .last_seen_epoch_ms >= $marker))|length==1
-    ' "$upstreams" >/dev/null || die "native replica upstream edge does not match the exact source member"
-}
-
 marker_ms() { date -u +%s%3N; }
 
 relation_value_for_provider() {
@@ -1860,21 +2047,26 @@ relation_value_for_provider() {
 
 collect_transition() {
     local label="$1" marker="$2" expectation="$3" map_file="$4"
-    local sids current upstream pairs observations observations_raw deadline
+    local sids current upstream pairs observations observations_raw deadline identities native_count
     sids="$(jq -sr 'map(.sid)|sort|map(tostring)|join(",")' "$map_file")"
     current="$(evidence_dir)/transitions/${marker}-${label}-current.jsonl"
     upstream="$(evidence_dir)/transitions/${marker}-${label}-upstreams.jsonl"
     observations="$(evidence_dir)/transitions/${marker}-${label}-observations.jsonl"
     observations_raw="$(state_dir)/${marker}-${label}-observations.raw.jsonl"
+    identities="$(state_dir)/native-identities.json"
     mkdir -p "$(dirname "$current")"
     deadline=$(( $(date +%s) + PERSISTENCE_TIMEOUT_SECONDS ))
     while :; do
         platform_mysql "$(current_state_query "$sids" "$marker")" >"$current"
         platform_mysql "$(upstream_state_query "$sids" "$marker")" >"$upstream"
+        native_count="$(jq '[.relations[]?|select(.relation_type=="standalone" or .relation_type=="async_replication")]|length' "$expectation")"
+        if [[ "$(jq -sr 'map(.sid)|unique|length' "$current")" == 13 && "$native_count" == 0 ]]; then
+            if [[ ! -s "$identities" ]]; then capture_native_identity_map "$current" "$map_file" "$identities" 2>/dev/null || true; fi
+            if [[ -s "$identities" ]]; then add_exact_native_expectations "$expectation" "$map_file" "$identities" "$label" 2>/dev/null || true; fi
+        fi
         if [[ -s "$current" ]] && [[ "$(jq -sr 'map(.sid)|unique|length' "$current")" == 13 ]] && \
             assert_transition_state "$label" "$current" "$upstream" "$expectation" "$marker" 2>/dev/null && \
-            { [[ "$(jq '.relations//[]|length' "$expectation")" == 0 ]] || { assert_exact_sid_contract "$current" "$upstream" "$expectation" 2>/dev/null && \
-                assert_exact_native_contract "$current" "$upstream" "$map_file" "$marker" 2>/dev/null; }; }; then break; fi
+            { [[ "$(jq '.relations//[]|length' "$expectation")" == 0 ]] || assert_exact_sid_contract "$current" "$upstream" "$expectation" 2>/dev/null; }; then break; fi
         (($(date +%s) < deadline)) || die "Platform persistence timeout for $label"
         sleep 10
     done
@@ -2044,51 +2236,46 @@ identifier_from_arn() { printf '%s\n' "${1##*:}"; }
 cleanup_resources_impl() {
     local cleanup_failed=0
     run_cleanup_steps stop_agents || cleanup_failed=1
-    local dir region arn id sg global_id cluster_arn cluster_region runner account bucket runner_role runner_profile monitor_role deadline post ownership_file
+    local dir region arn id sg global_id cluster_arn cluster_region runner account bucket runner_role runner_profile monitor_role post ownership_file
     dir="$(state_dir)/cleanup"
     mkdir -p "$dir"
-    capture_inventory "$dir/before.json" || true
+    capture_inventory "$dir/before.json" || cleanup_failed=1
+    recover_monitoring_resource_ids || { log "Enhanced Monitoring resource ID recovery incomplete"; cleanup_failed=1; }
 
     # Addressable databases must disappear before cluster/global/network dependencies.
     for region in "$PRIMARY_REGION" "$SECONDARY_REGION"; do
-        inventory_region "$region" "$dir/${region}.json" || continue
+        inventory_region "$region" "$dir/${region}.json" || { cleanup_failed=1; continue; }
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            aws_region "$region" rds describe-db-instances --db-instance-identifier "$id" \
-                --query 'DBInstances[0].DbiResourceId' --output text 2>/dev/null |
-                awk -v region="$region" '/^db-[A-Za-z0-9]+$/ {print region "\t" $0}' >>"$(state_dir)/monitoring-streams.tsv" || true
-            aws_region "$region" rds delete-db-instance --db-instance-identifier "$id" --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || true
+            cleanup_aws_region "$region" rds delete-db-instance --db-instance-identifier "$id" --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || cleanup_failed=1
         done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source)|not)' "$dir/${region}.json")
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            aws_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || true
+            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
         done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source)|not)' "$dir/${region}.json")
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            aws_region "$region" rds describe-db-instances --db-instance-identifier "$id" \
-                --query 'DBInstances[0].DbiResourceId' --output text 2>/dev/null |
-                awk -v region="$region" '/^db-[A-Za-z0-9]+$/ {print region "\t" $0}' >>"$(state_dir)/monitoring-streams.tsv" || true
-            aws_region "$region" rds delete-db-instance --db-instance-identifier "$id" --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || true
-            aws_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || true
+            cleanup_aws_region "$region" rds delete-db-instance --db-instance-identifier "$id" --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || cleanup_failed=1
+            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
         done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source))' "$dir/${region}.json")
     done
-    if [[ -f "$(state_dir)/monitoring-streams.tsv" ]]; then
-        while IFS=$'\t' read -r region id; do
-            [[ -n "$id" ]] && aws_region "$region" logs delete-log-stream --log-group-name RDSOSMetrics --log-stream-name "$id" >/dev/null 2>&1 || true
-        done <"$(state_dir)/monitoring-streams.tsv"
+    if [[ -f "$(monitoring_tracking_file)" ]]; then
+        while IFS=$'\t' read -r region identifier id; do
+            [[ -n "$id" ]] && delete_monitoring_stream_until_absent "$region" "$id" || cleanup_failed=1
+        done <"$(monitoring_tracking_file)"
     fi
 
     # Aurora Global members must be detached before regional clusters can be removed.
-    inventory_global_clusters "$dir/globals.json" || printf '[]\n' >"$dir/globals.json"
+    inventory_global_clusters "$dir/globals.json" || { cleanup_failed=1; printf '[]\n' >"$dir/globals.json"; }
     while IFS= read -r arn; do
         global_id="$(identifier_from_arn "$arn")"
         while IFS= read -r cluster_arn; do
             [[ -n "$cluster_arn" ]] || continue
             cluster_region="${cluster_arn#arn:aws:rds:}"; cluster_region="${cluster_region%%:*}"
-            aws_region "$cluster_region" rds remove-from-global-cluster \
-                --global-cluster-identifier "$global_id" --db-cluster-identifier "$cluster_arn" >/dev/null 2>&1 || true
-            wait_until_nonfatal "global member detachment" global_member_absent "$global_id" "$cluster_arn" || cleanup_failed=1
-        done < <(aws_region "$PRIMARY_REGION" rds describe-global-clusters --global-cluster-identifier "$global_id" \
+            cleanup_aws_region "$cluster_region" rds remove-from-global-cluster \
+                --global-cluster-identifier "$global_id" --db-cluster-identifier "$cluster_arn" >/dev/null 2>&1 || cleanup_failed=1
+            cleanup_wait_until "global member detachment" global_member_absent "$global_id" "$cluster_arn" || cleanup_failed=1
+        done < <(cleanup_aws_region "$PRIMARY_REGION" rds describe-global-clusters --global-cluster-identifier "$global_id" \
             --output json 2>/dev/null | jq -r '.GlobalClusters[0].GlobalClusterMembers|sort_by(.IsWriter)|.[].DBClusterArn')
     done < <(jq -r '.[].arn' "$dir/globals.json")
 
@@ -2096,61 +2283,61 @@ cleanup_resources_impl() {
         [[ -f "$dir/${region}.json" ]] || continue
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            aws_region "$region" rds delete-db-snapshot --db-snapshot-identifier "$id" >/dev/null 2>&1 || true
+            cleanup_aws_region "$region" rds delete-db-snapshot --db-snapshot-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1
         done < <(jq -r '.snapshots[]' "$dir/${region}.json")
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            aws_region "$region" rds delete-db-cluster --db-cluster-identifier "$id" --skip-final-snapshot >/dev/null 2>&1 || true
+            cleanup_aws_region "$region" rds delete-db-cluster --db-cluster-identifier "$id" --skip-final-snapshot >/dev/null 2>&1 || cleanup_failed=1
         done < <(jq -r '.clusters[]' "$dir/${region}.json")
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            aws_region "$region" rds wait db-cluster-deleted --db-cluster-identifier "$id" >/dev/null 2>&1 || true
+            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-cluster-deleted --db-cluster-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
         done < <(jq -r '.clusters[]' "$dir/${region}.json")
     done
     while IFS= read -r arn; do
         id="$(identifier_from_arn "$arn")"
-        aws_region "$PRIMARY_REGION" rds delete-global-cluster --global-cluster-identifier "$id" >/dev/null 2>&1 || true
+        cleanup_aws_region "$PRIMARY_REGION" rds delete-global-cluster --global-cluster-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1
     done < <(jq -r '.[].arn' "$dir/globals.json")
 
     # Stop SSM work first, then terminate runners and wait for their tagged ENIs.
     for region in "$PRIMARY_REGION" "$SECONDARY_REGION"; do
         while IFS= read -r runner; do
             [[ -n "$runner" ]] || continue
-            aws_region "$region" ec2 terminate-instances --instance-ids "$runner" >/dev/null 2>&1 || true
-            aws_region "$region" ec2 wait instance-terminated --instance-ids "$runner" >/dev/null 2>&1 || true
-        done < <(aws_region "$region" ec2 describe-instances \
+            cleanup_aws_region "$region" ec2 terminate-instances --instance-ids "$runner" >/dev/null 2>&1 || cleanup_failed=1
+            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" ec2 wait instance-terminated --instance-ids "$runner" >/dev/null 2>&1 || cleanup_failed=1; fi
+        done < <(cleanup_aws_region "$region" ec2 describe-instances \
             --filters "Name=tag:${TAG_RUN_KEY},Values=$(run_id)" "Name=tag:${TAG_MANAGED_KEY},Values=true" \
             "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
             --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null | tr '\t' '\n')
-        wait_until_nonfatal "runner ENI deletion in $region" runner_enis_absent "$region" || cleanup_failed=1
+        cleanup_wait_until "runner ENI deletion in $region" runner_enis_absent "$region" || cleanup_failed=1
     done
 
     for region in "$PRIMARY_REGION" "$SECONDARY_REGION"; do
-        inventory_region "$region" "$dir/${region}-late.json" || continue
+        inventory_region "$region" "$dir/${region}-late.json" || { cleanup_failed=1; continue; }
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
             if [[ "$arn" == *":cluster-pg:"* ]]; then
-                aws_region "$region" rds delete-db-cluster-parameter-group --db-cluster-parameter-group-name "$id" >/dev/null 2>&1 || true
+                cleanup_aws_region "$region" rds delete-db-cluster-parameter-group --db-cluster-parameter-group-name "$id" >/dev/null 2>&1 || cleanup_failed=1
             else
-                aws_region "$region" rds delete-db-parameter-group --db-parameter-group-name "$id" >/dev/null 2>&1 || true
+                cleanup_aws_region "$region" rds delete-db-parameter-group --db-parameter-group-name "$id" >/dev/null 2>&1 || cleanup_failed=1
             fi
         done < <(jq -r '.parameter_groups[]' "$dir/${region}-late.json")
         while IFS= read -r arn; do
             sg="${arn##*/}"
-            aws_region "$region" ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 || true
+            cleanup_aws_region "$region" ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 || cleanup_failed=1
         done < <(jq -r '.security_groups[]' "$dir/${region}-late.json")
         while IFS= read -r arn; do
             sg="${arn##*/}"
-            aws_region "$region" ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 || true
+            cleanup_aws_region "$region" ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 || cleanup_failed=1
         done < <(jq -r '.security_groups[]' "$dir/${region}-late.json")
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            aws_region "$region" rds delete-db-subnet-group --db-subnet-group-name "$id" >/dev/null 2>&1 || true
+            cleanup_aws_region "$region" rds delete-db-subnet-group --db-subnet-group-name "$id" >/dev/null 2>&1 || cleanup_failed=1
         done < <(jq -r '.subnet_groups[]' "$dir/${region}-late.json")
     done
 
     # Private delivery objects precede the bucket; instance profile precedes roles.
-    account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+    account="$(aws_global sts get-caller-identity --query Account --output text 2>/dev/null || true)"
     bucket="${S3_BUCKET:-releem-topology-$(printf '%s' "$account" | sha256sum | cut -c1-12)-$(run_id)}"
     runner_role="${RUNNER_ROLE:-$(resource_name runner-role)}"
     runner_profile="${RUNNER_PROFILE:-$(resource_name runner-profile)}"
@@ -2169,17 +2356,17 @@ cleanup_resources_impl() {
                 log "S3 object inventory was not valid JSON"
                 cleanup_failed=1
             elif jq -e '.Objects|length>0' "$dir/delete-objects.json" >/dev/null; then
-                aws_region "$PRIMARY_REGION" s3api delete-objects --bucket "$bucket" --delete "file://$dir/delete-objects.json" >/dev/null 2>&1 || true
+                aws_region "$PRIMARY_REGION" s3api delete-objects --bucket "$bucket" --delete "file://$dir/delete-objects.json" >/dev/null 2>&1 || cleanup_failed=1
             fi
-            aws_region "$PRIMARY_REGION" s3api delete-bucket --bucket "$bucket" >/dev/null 2>&1 || true
+            aws_region "$PRIMARY_REGION" s3api delete-bucket --bucket "$bucket" >/dev/null 2>&1 || cleanup_failed=1
         fi
-        aws iam remove-role-from-instance-profile --instance-profile-name "$runner_profile" --role-name "$runner_role" >/dev/null 2>&1 || true
-        aws iam delete-instance-profile --instance-profile-name "$runner_profile" >/dev/null 2>&1 || true
-        aws iam delete-role-policy --role-name "$runner_role" --policy-name ReleemTopologyRunnerRead >/dev/null 2>&1 || true
-        aws iam detach-role-policy --role-name "$runner_role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null 2>&1 || true
-        aws iam detach-role-policy --role-name "$monitor_role" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole >/dev/null 2>&1 || true
-        aws iam delete-role --role-name "$runner_role" >/dev/null 2>&1 || true
-        aws iam delete-role --role-name "$monitor_role" >/dev/null 2>&1 || true
+        cleanup_aws iam remove-role-from-instance-profile --instance-profile-name "$runner_profile" --role-name "$runner_role" >/dev/null 2>&1 || cleanup_failed=1
+        cleanup_aws iam delete-instance-profile --instance-profile-name "$runner_profile" >/dev/null 2>&1 || cleanup_failed=1
+        cleanup_aws iam delete-role-policy --role-name "$runner_role" --policy-name ReleemTopologyRunnerRead >/dev/null 2>&1 || cleanup_failed=1
+        cleanup_aws iam detach-role-policy --role-name "$runner_role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null 2>&1 || cleanup_failed=1
+        cleanup_aws iam detach-role-policy --role-name "$monitor_role" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole >/dev/null 2>&1 || cleanup_failed=1
+        cleanup_aws iam delete-role --role-name "$runner_role" >/dev/null 2>&1 || cleanup_failed=1
+        cleanup_aws iam delete-role --role-name "$monitor_role" >/dev/null 2>&1 || cleanup_failed=1
     else
         log "support cleanup skipped because exact ownership could not be proven"
         cleanup_failed=1
@@ -2189,18 +2376,19 @@ cleanup_resources_impl() {
     rm -f "$(secret_file)" "$(state_dir)"/create-*.json "$(state_dir)"/ssm-* \
         "$(state_dir)"/runner-*.json "$(state_dir)"/runner-policy.json "$(state_dir)"/trust.json 2>/dev/null || true
     post="$(evidence_dir)/post-cleanup-inventory.json"
-    deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
-    while :; do
+    local remaining sleep_seconds
+    while remaining="$(cleanup_remaining_seconds)"; do
         rm -f "$post"
         if (set -e; capture_inventory "$post") && [[ -s "$post" ]] &&
             assert_inventory_empty "$post" 2>/dev/null && monitoring_streams_absent; then break; fi
-        if (($(date +%s) >= deadline)); then
-            log "cleanup did not reach terminal absence"
-            cleanup_failed=1
-            break
-        fi
-        sleep "$POLL_SECONDS"
+        sleep_seconds="$(cleanup_poll_seconds "$POLL_SECONDS" "$remaining")"
+        ((sleep_seconds > 0)) && sleep "$sleep_seconds"
     done
+    if ! cleanup_remaining_seconds >/dev/null; then
+        CLEANUP_BUDGET_EXHAUSTED=true
+        log "cleanup budget exhausted; run destroy with exact confirmation"
+        cleanup_failed=1
+    fi
     if [[ -s "$post" ]]; then
         (assert_inventory_empty "$post") || cleanup_failed=1
         if [[ -f "$(evidence_dir)/preflight/inventory-before.json" ]]; then
@@ -2232,6 +2420,7 @@ cleanup_resources() {
     [[ $- == *e* ]] && restore_errexit=true
     CLEANUP_RUNNING=true
     PENDING_SIGNAL_STATUS=0
+    initialize_cleanup_deadline
     set +e
     stop_watchdog
     trap 'defer_cleanup_signal 129' HUP
@@ -2263,14 +2452,31 @@ runner_enis_absent() {
     [[ "$count" == 0 ]]
 }
 
+monitoring_stream_count() {
+    local region="$1" id="$2" count
+    count="$(aws_region "$region" logs describe-log-streams --log-group-name RDSOSMetrics \
+        --log-stream-name-prefix "$id" --query "length(logStreams[?logStreamName=='${id}'])" --output text 2>/dev/null)" || return 1
+    [[ "$count" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$count"
+}
+
+delete_monitoring_stream_until_absent() {
+    local region="$1" id="$2" count
+    count="$(monitoring_stream_count "$region" "$id")" || return 1
+    [[ "$count" == 0 ]] && return 0
+    [[ "$count" == 1 ]] || return 1
+    aws_region "$region" logs delete-log-stream --log-group-name RDSOSMetrics --log-stream-name "$id" >/dev/null 2>&1 || return 1
+    count="$(monitoring_stream_count "$region" "$id")" || return 1
+    [[ "$count" == 0 ]]
+}
+
 monitoring_streams_absent() {
-    local region id count
-    [[ -f "$(state_dir)/monitoring-streams.tsv" ]] || return 0
-    while IFS=$'\t' read -r region id; do
-        count="$(aws_region "$region" logs describe-log-streams --log-group-name RDSOSMetrics \
-            --log-stream-name-prefix "$id" --query "length(logStreams[?logStreamName=='${id}'])" --output text 2>/dev/null)" || return 1
+    local region identifier id count
+    monitoring_tracking_complete || return 1
+    while IFS=$'\t' read -r region identifier id; do
+        count="$(monitoring_stream_count "$region" "$id")" || return 1
         [[ "$count" == 0 ]] || return 1
-    done <"$(state_dir)/monitoring-streams.tsv"
+    done <"$(monitoring_tracking_file)"
 }
 
 cleanup_once() {
@@ -2307,6 +2513,7 @@ run_matrix() {
     require_runtime
     for command in aws jq openssl mysql curl timeout tar sha256sum; do require_command "$command"; done
     validate_runtime_deadline "$RUNTIME_DEADLINE_SECONDS"
+    validate_cleanup_deadline "$CLEANUP_DEADLINE_SECONDS"
     RUN_DEADLINE_EPOCH=$(( $(date +%s) + RUNTIME_DEADLINE_SECONDS ))
     trap on_exit EXIT
     trap 'on_signal HUP 129' HUP

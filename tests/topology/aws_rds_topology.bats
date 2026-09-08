@@ -88,7 +88,7 @@ setup() {
 }
 
 @test "IAM absence accepts only NoSuchEntity and ownership rejects empty relationships" {
-    aws() { printf '%s\n' 'NoSuchEntity: role was not found' >&2; return 254; }
+    aws() { printf '%s\n' 'An error occurred (NoSuchEntity) when calling the GetRole operation: Role not found' >&2; return 254; }
     run iam_entity_presence role missing-role
     [ "$status" -eq 0 ]
     [ "$output" = absent ]
@@ -170,7 +170,7 @@ setup() {
       '{"sid":202,"relation_type":"galera_cluster","member_key":"mysql:replica","last_seen_epoch_ms":1710000004000}' >"$current"
     printf '%s\n' '{"sid":202,"upstream_member_key":"mysql:source","last_seen_epoch_ms":1710000004000}' >"$upstreams"
 
-    run assert_exact_native_contract "$current" "$upstreams" "$sidmap" 1710000003500
+    run capture_native_identity_map "$current" "$sidmap" "$TEST_TMPDIR/native-identities.json"
 
     [ "$status" -ne 0 ]
 }
@@ -362,6 +362,205 @@ EOF
     [ "$status" -ne 0 ]
 }
 
+@test "AWS absence classifiers accept only standard operation-specific CLI envelopes" {
+    error_file="$TEST_TMPDIR/aws-error"
+    printf '%s\n' 'An error occurred (NoSuchEntity) when calling the GetRole operation: Role not found' >"$error_file"
+    run classify_iam_get_result 254 "$error_file" GetRole
+    [ "$status" -eq 0 ]
+    [ "$output" = absent ]
+
+    printf '%s\n' 'proxy wrapper: cached NoSuchEntity from GetRole' >"$error_file"
+    run classify_iam_get_result 254 "$error_file" GetRole
+    [ "$status" -ne 0 ]
+
+    printf '%s\n' 'An error occurred (404) when calling the HeadObject operation: Not Found' >"$error_file"
+    run classify_s3_head_result 254 "$error_file" HeadObject
+    [ "$status" -eq 0 ]
+
+    printf '%s\n' 'wrapper saw 404 Not Found while proxying HeadObject' >"$error_file"
+    run classify_s3_head_result 254 "$error_file" HeadObject
+    [ "$status" -ne 0 ]
+
+    printf '%s\n' 'An error occurred (NoSuchKey) when calling the HeadBucket operation: Missing' >"$error_file"
+    run classify_s3_head_result 254 "$error_file" HeadBucket
+    [ "$status" -ne 0 ]
+
+    printf '%s\n' 'An error occurred (404) when calling the HeadBucket operation: Not Found' >"$error_file"
+    run classify_s3_head_result 255 "$error_file" HeadBucket
+    [ "$status" -ne 0 ]
+}
+
+@test "native expectation builds exact closed rows and one upstream for all 13 SIDs" {
+    sidmap="$TEST_TMPDIR/native-13-sids.jsonl"
+    current="$TEST_TMPDIR/native-13-current.jsonl"
+    providers="$TEST_TMPDIR/native-13-provider.json"
+    identities="$TEST_TMPDIR/native-13-identities.json"
+    expected="$TEST_TMPDIR/native-13-expected.json"
+    : >"$sidmap"; : >"$current"
+    sid=100
+    while IFS='|' read -r _ identifier; do
+        sid=$((sid + 1))
+        printf '{"sid":%d,"provider_id":"%s"}\n' "$sid" "$identifier" >>"$sidmap"
+        if [[ "$identifier" == *-rds-replica ]]; then
+            printf '{"sid":%d,"relation_type":"async_replication","group_key":"uuid-source","parent_group_key":null,"member_key":"uuid-%d","primary_member_key":"uuid-source","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}\n' "$sid" "$sid" >>"$current"
+        else
+            member="uuid-$sid"; [[ "$identifier" == *-rds-source ]] && member=uuid-source
+            printf '{"sid":%d,"relation_type":"standalone","group_key":"%s","parent_group_key":null,"member_key":"%s","primary_member_key":null,"role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}\n' "$sid" "$member" "$member" >>"$current"
+        fi
+    done < <(addressable_instances)
+    jq -s '{marker_epoch_ms:1710000003500,relations:map({sid,relation_type:"rds_multi_az",group_key:("provider:"+(.sid|tostring)),parent_group_key:null,member_key:("db:"+(.sid|tostring)),primary_member_key:("db:"+(.sid|tostring)),role:"primary",is_writer:1,is_reader:1,replication_state:"unknown"}),upstreams:[]}' "$sidmap" >"$providers"
+
+    run capture_native_identity_map "$current" "$sidmap" "$identities"
+    [ "$status" -eq 0 ]
+    cp "$providers" "$expected"
+    run add_exact_native_expectations "$expected" "$sidmap" "$identities" aws-baseline
+    [ "$status" -eq 0 ]
+    run jq -e '([.relations[]|select(.relation_type=="standalone" or .relation_type=="async_replication")]|length)==13 and (.upstreams|length)==1 and .upstreams[0].channel_key=="default" and .upstreams[0].upstream_member_key=="uuid-source"' "$expected"
+    [ "$status" -eq 0 ]
+}
+
+@test "closed topology rejects Aurora async rows wrong native fields and extra upstreams" {
+    expected="$TEST_TMPDIR/closed-expected.json"
+    current="$TEST_TMPDIR/closed-current.jsonl"
+    upstreams="$TEST_TMPDIR/closed-upstreams.jsonl"
+    cat >"$expected" <<'EOF'
+{"marker_epoch_ms":1710000003500,"relations":[{"sid":101,"relation_type":"aurora_cluster","group_key":"aurora:c","parent_group_key":null,"member_key":"db:a","primary_member_key":"db:a","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy"},{"sid":101,"relation_type":"standalone","group_key":"uuid-a","parent_group_key":null,"member_key":"uuid-a","primary_member_key":null,"role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy"}],"upstreams":[]}
+EOF
+    jq -c '.relations[] + {last_seen_epoch_ms:1710000004000}' "$expected" >"$current"
+    : >"$upstreams"
+    run assert_exact_sid_contract "$current" "$upstreams" "$expected"
+    [ "$status" -eq 0 ]
+
+    jq -c 'select(.relation_type!="standalone"),select(.relation_type=="standalone")|if .relation_type=="standalone" then .relation_type="async_replication" else . end' "$current" >"$current.bad"
+    run assert_exact_sid_contract "$current.bad" "$upstreams" "$expected"
+    [ "$status" -ne 0 ]
+
+    jq -c 'if .relation_type=="standalone" then .group_key="wrong"|.is_writer=0|.is_reader=0|.replication_state="stopped" else . end' "$current" >"$current.bad"
+    run assert_exact_sid_contract "$current.bad" "$upstreams" "$expected"
+    [ "$status" -ne 0 ]
+
+    printf '%s\n' '{"sid":101,"channel_key":"unexpected","upstream_member_key":"wrong-global","replication_state":"healthy","last_seen_epoch_ms":1710000004000}' >"$upstreams"
+    run assert_exact_sid_contract "$current" "$upstreams" "$expected"
+    [ "$status" -ne 0 ]
+}
+
+@test "ClickHouse closed snapshot rejects an extra native relation" {
+    current="$TEST_TMPDIR/ch-closed-current.jsonl"
+    observations="$TEST_TMPDIR/ch-closed-observations.jsonl"
+    printf '%s\n' '{"sid":101,"last_rid":"rid-a","relation_type":"standalone","group_key":"uuid-a","parent_group_key":null,"member_key":"uuid-a","primary_member_key":null,"role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy"}' >"$current"
+    printf '%s\n' '{"sid":101,"rid":"rid-a","observed_epoch_ms":1710000004000,"relations":"[{\"relation_type\":\"standalone\",\"group_key\":\"uuid-a\",\"parent_group_key\":null,\"member_key\":\"uuid-a\",\"primary_member_key\":null,\"role\":\"primary\",\"is_writer\":1,\"is_reader\":1,\"replication_state\":\"healthy\"},{\"relation_type\":\"async_replication\",\"group_key\":\"wrong\",\"parent_group_key\":null,\"member_key\":\"uuid-a\",\"primary_member_key\":\"wrong\",\"role\":\"replica\",\"is_writer\":0,\"is_reader\":1,\"replication_state\":\"healthy\"}]"}' >"$observations"
+    run assert_selected_observations "$observations" "$current" 101:rid-a 1710000003500 1
+    [ "$status" -ne 0 ]
+}
+
+@test "instance tracking precedes readiness failure and incomplete tracking blocks terminal success" {
+    initialize_monitoring_tracking
+    MONITORING_ROLE_ARN=arn:aws:iam::111111111111:role/releem-monitoring
+    instance_exists() { return 1; }
+    aws_region() {
+        case "$*" in
+            *create-db-instance*) return 0 ;;
+            *describe-db-instances*) printf '%s\n' db-TRACKED1 ;;
+            *) return 1 ;;
+        esac
+    }
+    wait_instance_available() { return 1; }
+
+    run ensure_cluster_instance us-east-1 releem-task13-20260908-aurora-provisioned-1 cluster db.t3.small pg
+    [ "$status" -ne 0 ]
+    run awk -F '\t' '$2=="releem-task13-20260908-aurora-provisioned-1" && $3=="db-TRACKED1"{found=1} END{exit !found}' "$(monitoring_tracking_file)"
+    [ "$status" -eq 0 ]
+
+    aws_region() { return 1; }
+    run recover_monitoring_resource_ids
+    [ "$status" -ne 0 ]
+    run monitoring_streams_absent
+    [ "$status" -ne 0 ]
+}
+
+@test "terminal monitoring tracking rejects duplicate resource IDs" {
+    initialize_monitoring_tracking
+    awk -F '\t' -v OFS='\t' '{$3="db-DUPLICATE"; print}' "$(monitoring_tracking_file)" >"$(monitoring_tracking_file).new"
+    mv "$(monitoring_tracking_file).new" "$(monitoring_tracking_file)"
+
+    run monitoring_tracking_complete
+
+    [ "$status" -ne 0 ]
+}
+
+@test "monitoring stream cleanup is idempotent and fails closed on ambiguous reads" {
+    calls="$TEST_TMPDIR/log-calls"
+    aws_region() {
+        printf '%s\n' "$*" >>"$calls"
+        case "$*" in
+            *describe-log-streams*) printf '0\n' ;;
+            *) return 1 ;;
+        esac
+    }
+
+    run delete_monitoring_stream_until_absent us-east-1 db-TRACKED1
+    [ "$status" -eq 0 ]
+    run grep -c delete-log-stream "$calls"
+    [ "$status" -ne 0 ]
+
+    aws_region() { return 255; }
+    run delete_monitoring_stream_until_absent us-east-1 db-TRACKED1
+    [ "$status" -ne 0 ]
+}
+
+@test "cleanup budget is shared across retries and exhaustion still runs later phases" {
+    marker="$TEST_TMPDIR/cleanup-budget"
+    CLEANUP_ARMED=true
+    CLEANUP_DEADLINE_EPOCH=$(( $(date +%s) - 1 ))
+    expired_epoch="$CLEANUP_DEADLINE_EPOCH"
+    declare -F cleanup_wait_until >/dev/null
+    cleanup_resources_impl() {
+        failed=0
+        cleanup_wait_until "expired waiter" false || failed=1
+        printf 'delete-issued\n' >>"$marker"
+        return "$failed"
+    }
+
+    cleanup_once || first_status=$?
+    [ "${first_status:-0}" -ne 0 ]
+    [ "$(<"$marker")" = delete-issued ]
+    [ "$CLEANUP_DONE" = false ]
+    [ "$CLEANUP_DEADLINE_EPOCH" -eq "$expired_epoch" ]
+
+    cleanup_once || second_status=$?
+    [ "${second_status:-0}" -ne 0 ]
+    [ "$(wc -l <"$marker")" -eq 2 ]
+    [ "$CLEANUP_DEADLINE_EPOCH" -eq "$expired_epoch" ]
+}
+
+@test "cleanup deadline must leave bounded deletion reserve" {
+    run validate_cleanup_deadline 10
+    [ "$status" -ne 0 ]
+    run validate_cleanup_deadline 3600
+    [ "$status" -eq 0 ]
+}
+
+@test "terminal cleanup polling never sleeps beyond its remaining deadline" {
+    run cleanup_poll_seconds 20 7
+    [ "$status" -eq 0 ]
+    [ "$output" = 7 ]
+
+    run cleanup_poll_seconds 20 25
+    [ "$status" -eq 0 ]
+    [ "$output" = 20 ]
+}
+
+@test "Global convergence allows omitted writer sync but rejects disconnected secondary" {
+    good="$TEST_TMPDIR/global-optional-good.json"
+    bad="$TEST_TMPDIR/global-optional-bad.json"
+    printf '%s\n' '{"Status":"available","GlobalClusterMembers":[{"DBClusterArn":"arn:old","IsWriter":false,"SynchronizationStatus":"connected"},{"DBClusterArn":"arn:new","IsWriter":true}]}' >"$good"
+    printf '%s\n' '{"Status":"available","GlobalClusterMembers":[{"DBClusterArn":"arn:old","IsWriter":false,"SynchronizationStatus":"pending-resync"},{"DBClusterArn":"arn:new","IsWriter":true}]}' >"$bad"
+    run assert_global_switchover_converged "$good" arn:new arn:old
+    [ "$status" -eq 0 ]
+    run assert_global_switchover_converged "$bad" arn:new arn:old
+    [ "$status" -ne 0 ]
+}
+
 @test "destroy rejects an untagged deterministic database name" {
     collisions="$TEST_TMPDIR/destroy-collisions.json"
     owned="$TEST_TMPDIR/destroy-owned.json"
@@ -512,11 +711,11 @@ EOF
     cat >"$current" <<'EOF'
 {"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":null,"member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
 {"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
-{"sid":202,"relation_type":"async_replication","group_key":"native:replica-a","parent_group_key":null,"member_key":"mysql:replica-a","primary_member_key":null,"role":"replica","is_writer":0,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
+{"sid":202,"relation_type":"async_replication","group_key":"mysql:source-a","parent_group_key":null,"member_key":"mysql:replica-a","primary_member_key":"mysql:source-a","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
 EOF
     printf '%s\n' '{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy","last_seen_epoch_ms":1710000004000}' >"$upstreams"
     cat >"$expected" <<'EOF'
-{"marker_epoch_ms":1710000003500,"relations":[{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":null,"member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy"},{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy"},{"sid":202,"relation_type":"async_replication","member_key":"mysql:replica-a","role":"replica"}],"upstreams":[{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy"}]}
+{"marker_epoch_ms":1710000003500,"relations":[{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":null,"member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy"},{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy"},{"sid":202,"relation_type":"async_replication","group_key":"mysql:source-a","parent_group_key":null,"member_key":"mysql:replica-a","primary_member_key":"mysql:source-a","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy"}],"upstreams":[{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy"}]}
 EOF
 
     run assert_exact_sid_contract "$current" "$upstreams" "$expected"
@@ -655,7 +854,8 @@ EOF
       .ordinary_mysql.instances==3 and .ordinary_mysql.engine_version=="8.0.43" and
       .ordinary_mysql.instance_class=="db.t3.micro" and .ordinary_mysql.allocated_storage_gib_each==20 and
       .ordinary_mysql.allocated_storage_gib_total==60 and .runners.encrypted_root_gib_total==16 and
-      .enhanced_monitoring_interval_seconds==1 and .runtime_deadline_seconds==14400
+      .enhanced_monitoring_interval_seconds==1 and .runtime_deadline_seconds==14400 and
+      .cleanup_deadline_seconds==3600 and .cleanup_delete_reserve_seconds==600 and .total_advertised_max_seconds==18000
     ' "$summary"
 
     [ "$status" -eq 0 ]

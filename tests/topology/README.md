@@ -230,7 +230,11 @@ generates the database password in a mode-`0600` file under `/tmp`.
 on success, assertion failure, `EXIT`, `INT`, `TERM`, or `HUP` after mutation
 begins. `AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS` defaults to four hours and must
 remain between 10 minutes and six hours; expiry sends `TERM`, cleans once, and
-exits with status 143:
+exits with status 143. Cleanup has a separate one-hour shared deadline, with
+the final ten minutes reserved for bounded dependency deletion attempts. All
+automatic cleanup attempts reuse that same deadline; after exhaustion the
+harness returns nonzero and requires exact-confirmed `destroy`. The advertised
+default maximum is therefore five hours:
 
 | Topology | Region and members |
 | --- | --- |
@@ -246,6 +250,10 @@ a one-second interval. Before Agent startup, the harness requires at least one
 event in the exact `RDSOSMetrics/<DBInstanceResourceID>` stream. The runner
 role permits only SSM management, reads of its exact private S3 run prefix,
 `logs:GetLogEvents` for `RDSOSMetrics`, and `rds:Describe*`.
+The harness initializes an exact 13-instance monitoring manifest and records
+each resource ID immediately after that instance becomes describable, before
+its availability wait. Cleanup retries missing IDs before deleting databases;
+an incomplete or duplicate manifest makes terminal cleanup fail closed.
 
 The reviewed `/tmp/releem-agent-db-topology-x86_64` binary and mode-`0600`
 Agent/MySQL configuration archives are transported as server-side-encrypted
@@ -271,9 +279,11 @@ then use only tenant UID, SID, current RID, and millisecond transition markers.
 Assertions map each exact SID back to AWS instance/cluster/global resource IDs,
 ARNs, endpoints, writers, and sources. Every provider row is matched exactly,
 including parent, primary, role, writer/reader flags, and replication state;
-unlisted provider or native rows are rejected. Every SID requires exactly one
-documented native MySQL relation, and the native
-read-replica upstream must equal the source's member key. ClickHouse snapshots
+unlisted provider or native rows are rejected. A validated baseline identity
+map generates one exact native relation for every one of the 13 SIDs and
+transition-specific writer/reader/state expectations. The complete upstream
+set contains only the expected ordinary replica channel/source/state; extra
+channels, including spurious Global Database upstreams, fail. ClickHouse snapshots
 parse primary/source edges only from the persisted ClickHouse relations JSON,
 label that evidence as ClickHouse-sourced, and compare it with current MySQL
 state without hostname inference or `LIMIT 1 BY`.
@@ -288,6 +298,10 @@ groups, snapshots, SSM local artifacts, and secret files. It polls both regions
 until the combined run inventory is empty. AWS retains completed SSM command
 history as an account audit record; the API has no delete operation for that
 record, but no command output or credentials are stored in it.
+AWS API calls during cleanup have short per-call timeouts and waiters consume
+only the remaining shared wait budget. Explicit absence classification accepts
+only standard operation-specific AWS CLI service-error envelopes and rejects
+ambiguous wrapper, proxy, timeout, or authorization text.
 
 Only an untrappable termination such as `SIGKILL` can bypass the EXIT trap.
 Recover by confirming the exact run ID. `destroy` is only for the same single
