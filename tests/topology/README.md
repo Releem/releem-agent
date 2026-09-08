@@ -185,8 +185,10 @@ deterministic `releem-<run-id>-` name and the exact
 The read-only `preflight` command intersects both regions when selecting the
 latest available Aurora MySQL 3 version and smallest common orderable class.
 It also selects the current Serverless v2 minimum ACU, a current MySQL 8.0
-version/class, and the regional Amazon Linux 2023 runner images. Quotas,
-private subnet properties, collisions, and the hourly configuration shape are
+version/class, and the regional Amazon Linux 2023 runner images. Exact regional
+RDS instance/cluster and standard EC2 vCPU use is checked against the matrix's
+required headroom. Quotas, private subnet routes, deterministic-name collisions
+independent of tags, and the bounded hourly configuration shape are
 written under `/tmp/releem-db-topology-evidence/aws/<run-id>/preflight/`.
 Review `summary.json`, both quota files, and `inventory-before.json` before
 authorizing a live run. The cost shape is 7 provisioned Aurora instances, 3
@@ -197,8 +199,9 @@ hard-coded currency estimate.
 
 The operator supplies two existing VPCs and at least two private subnets in
 different availability zones per region. Subnets must not auto-assign public
-addresses and must have outbound access to SSM, S3, Releem, and AWS APIs via
-NAT or VPC endpoints. The harness creates one no-ingress SSM runner security
+addresses. Every selected runner subnet must have an active NAT default route,
+because the runner needs outbound access to the public Releem endpoint in
+addition to SSM, S3, and AWS APIs. The harness creates one no-ingress SSM runner security
 group and one runner-only MySQL security group in each VPC. Both EC2 runners
 have no public address, encrypted `gp3` root volumes, IMDSv2 enforcement, and
 no inbound rules.
@@ -221,7 +224,9 @@ generates the database password in a mode-`0600` file under `/tmp`.
 
 `run` creates this exact matrix and always invokes dependency-ordered cleanup
 on success, assertion failure, `EXIT`, `INT`, `TERM`, or `HUP` after mutation
-begins:
+begins. `AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS` defaults to four hours and must
+remain between 10 minutes and six hours; expiry sends `TERM`, cleans once, and
+exits with status 143:
 
 | Topology | Region and members |
 | --- | --- |
@@ -239,8 +244,13 @@ role permits only SSM management, reads of its exact private S3 run prefix,
 `logs:GetLogEvents` for `RDSOSMetrics`, and `rds:Describe*`.
 
 The reviewed `/tmp/releem-agent-db-topology-x86_64` binary and mode-`0600`
-Agent/MySQL configuration files are uploaded as server-side-encrypted private
-S3 objects. SSM commands contain only fixed object paths and resource names;
+Agent/MySQL configuration archives are transported as server-side-encrypted
+private S3 objects. A one-day lifecycle is installed before upload, and each
+secret-bearing `configs.tar` object is independently retried to confirmed
+absence immediately after its runner bootstraps; only the non-secret binary
+may remain until cleanup. Generated credentials otherwise remain in local and
+runner-local mode-`0600` files and are deleted during cleanup. SSM commands
+contain only fixed object paths and resource names;
 API keys and database passwords are never command parameters or command
 output. SSM CloudWatch and S3 command output are disabled. Agent processes run
 inside their regional VPC while remaining external to the database hosts.
@@ -250,12 +260,16 @@ tests/topology/aws_rds_topology.sh run
 ```
 
 The harness verifies provisioned failover, a Serverless v2 capacity change and
-load event, a managed Global Database switchover, read-replica SQL stop/start,
+bounded load event using before/during/after `ServerlessDatabaseCapacity` and
+`ACUUtilization` CloudWatch evidence, a managed Global Database switchover, read-replica SQL stop/start,
 and Multi-AZ failover. Persistence queries first resolve the exact test SIDs,
 then use only tenant UID, SID, current RID, and millisecond transition markers.
-Assertions cover canonical provider keys, roles, writer changes, parent/source
-edges, native MySQL replication state, Serverless facts, monotonic timestamps,
-and ClickHouse relation snapshots without hostname inference or `LIMIT 1 BY`.
+Assertions map each exact SID back to AWS instance/cluster/global resource IDs,
+ARNs, endpoints, writers, and sources. Every expected AWS provider relation is
+matched exactly, every SID requires its native MySQL relation, and the native
+read-replica upstream must equal the source's member key. ClickHouse snapshots
+retain primary/parent keys and the corresponding source-edge evidence without
+hostname inference or `LIMIT 1 BY`.
 
 Cleanup stops Agent processes, deletes DB instances and Enhanced Monitoring
 streams, detaches Global Database members, then removes regional clusters,
@@ -267,8 +281,11 @@ history as an account audit record; the API has no delete operation for that
 record, but no command output or credentials are stored in it.
 
 Only an untrappable termination such as `SIGKILL` can bypass the EXIT trap.
-Recover by confirming the exact run ID; `destroy` does not use preflight
-selection and deletes only exactly tagged/named resources:
+Recover by confirming the exact run ID. `destroy` is only for the same single
+run, inventories deterministic names independently of tags, and verifies exact
+resource tags plus S3/IAM policy, role, and instance-profile relationships
+before its first deletion. Missing or foreign ownership fails closed; recovery
+never adopts a same-named resource:
 
 ```bash
 export AWS_TOPOLOGY_CONFIRM_DESTROY="$AWS_TOPOLOGY_RUN_ID"

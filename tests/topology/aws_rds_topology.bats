@@ -95,16 +95,86 @@ EOF
     [ "$status" -ne 0 ]
 }
 
-@test "create planner is idempotent for existing owned resources" {
-    desired="$TEST_TMPDIR/desired.txt"
-    existing="$TEST_TMPDIR/existing.txt"
-    printf '%s\n' network subnet-group security-group cluster/provisioned instance/provisioned-1 >"$desired"
-    printf '%s\n' security-group cluster/provisioned >"$existing"
+@test "TERM cleans exactly once exits 143 and never resumes" {
+    marker="$TEST_TMPDIR/signal-cleanup"
+    CLEANUP_ARMED=true
+    cleanup_resources() { printf 'cleanup\n' >>"$marker"; }
 
-    run plan_missing_resources "$desired" "$existing"
+    run on_signal TERM 143
+
+    [ "$status" -eq 143 ]
+    [ "$(wc -l <"$marker")" -eq 1 ]
+    [[ "$output" != *resumed* ]]
+}
+
+@test "EXIT before first resource performs local cleanup only" {
+    marker="$TEST_TMPDIR/unarmed-cleanup"
+    cleanup_resources() { printf 'cloud\n' >>"$marker"; }
+    secret_file() { printf '%s\n' "$TEST_TMPDIR/local-secret"; }
+    printf 'secret\n' >"$(secret_file)"
+    CLEANUP_ARMED=false
+
+    run on_exit 0
 
     [ "$status" -eq 0 ]
-    [ "$output" = $'network\nsubnet-group\ninstance/provisioned-1' ]
+    [ ! -e "$marker" ]
+    [ ! -e "$(secret_file)" ]
+}
+
+@test "cleanup steps continue after an SSM stop failure" {
+    marker="$TEST_TMPDIR/cleanup-steps"
+    failed_stop() { printf 'stop\n' >>"$marker"; return 1; }
+    delete_databases() { printf 'databases\n' >>"$marker"; }
+    delete_support() { printf 'support\n' >>"$marker"; }
+
+    run run_cleanup_steps failed_stop delete_databases delete_support
+
+    [ "$status" -ne 0 ]
+    [ "$(<"$marker")" = $'stop\ndatabases\nsupport' ]
+}
+
+@test "destroy ownership rejects foreign bucket and mismatched IAM relationships" {
+    fixture="$TEST_TMPDIR/support-ownership.json"
+    cat >"$fixture" <<'EOF'
+{"bucket":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"}},"runner_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"inline_policy_name":"ReleemTopologyRunnerRead","inline_policy":{"Version":"2012-10-17","Statement":[{"Sid":"ReadRunObjects","Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/task13-20260908/*"]},{"Sid":"ReadEnhancedMonitoring","Effect":"Allow","Action":["logs:GetLogEvents"],"Resource":["arn:aws:logs:*:*:log-group:RDSOSMetrics:log-stream:*"]},{"Sid":"DescribeRDS","Effect":"Allow","Action":["rds:Describe*"],"Resource":["*"]}]},"attached_policies":["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]},"monitoring_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"attached_policies":["arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"]},"instance_profile":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"roles":["releem-task13-20260908-runner-role"]}}
+EOF
+    run assert_destroy_support_ownership "$fixture" 'arn:aws:s3:::bucket/task13-20260908/*' releem-task13-20260908-runner-role releem-task13-20260908-monitoring-role
+    [ "$status" -eq 0 ]
+
+    cat >"$fixture" <<'EOF'
+{"bucket":{"exists":true,"tags":{"releem-topology-run":"foreign","releem-topology-managed":"true"}},"runner_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"inline_policy_name":"WrongPolicy","inline_policy":{}},"monitoring_role":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"attached_policy":"arn:aws:iam::aws:policy/ReadOnlyAccess"},"instance_profile":{"exists":true,"tags":{"releem-topology-run":"task13-20260908","releem-topology-managed":"true"},"roles":["foreign-role"]}}
+EOF
+
+    run assert_destroy_support_ownership "$fixture" bucket/task13-20260908/* releem-task13-20260908-runner-role releem-task13-20260908-monitoring-role
+
+    [ "$status" -ne 0 ]
+}
+
+@test "S3 ownership probing treats only an explicit 404 as absent" {
+    error_file="$TEST_TMPDIR/s3-head-error"
+    printf '%s\n' 'An error occurred (404) when calling the HeadBucket operation: Not Found' >"$error_file"
+    run classify_s3_head_result 254 "$error_file"
+    [ "$status" -eq 0 ]
+    [ "$output" = absent ]
+
+    printf '%s\n' 'An error occurred (403) when calling the HeadBucket operation: Forbidden' >"$error_file"
+    run classify_s3_head_result 254 "$error_file"
+    [ "$status" -ne 0 ]
+}
+
+@test "destroy rejects an untagged deterministic database name" {
+    collisions="$TEST_TMPDIR/destroy-collisions.json"
+    owned="$TEST_TMPDIR/destroy-owned.json"
+    printf '%s\n' '{"expected":[],"existing":["releem-task13-20260908-rds-source"]}' >"$collisions"
+    printf '%s\n' '{"instances":["arn:aws:rds:us-east-1:111111111111:db:releem-task13-20260908-rds-source"],"clusters":[],"global_clusters":[],"parameter_groups":[],"security_groups":[],"subnet_groups":[],"snapshots":[],"runners":[],"enis":[],"ssm_artifacts":[],"monitoring_streams":[],"s3_objects":[],"s3_buckets":[],"instance_profiles":[],"iam_policies":[],"iam_roles":[]}' >"$owned"
+    run assert_deterministic_resources_owned "$collisions" "$owned"
+    [ "$status" -eq 0 ]
+
+    printf '%s\n' '{"instances":[],"clusters":[],"global_clusters":[],"parameter_groups":[],"security_groups":[],"subnet_groups":[],"snapshots":[],"runners":[],"enis":[],"ssm_artifacts":[],"monitoring_streams":[],"s3_objects":[],"s3_buckets":[],"instance_profiles":[],"iam_policies":[],"iam_roles":[]}' >"$owned"
+
+    run assert_deterministic_resources_owned "$collisions" "$owned"
+
+    [ "$status" -ne 0 ]
 }
 
 @test "cleanup plan is dependency ordered and includes secret last" {
@@ -141,6 +211,18 @@ EOF
 
     printf '%s\n' '{"instances":["left"],"clusters":[],"security_groups":[]}' >"$after"
     run assert_inventory_matches "$before" "$after"
+    [ "$status" -ne 0 ]
+}
+
+@test "terminal absence fails closed when AWS inventory reads fail" {
+    mkdir -p "$(state_dir)"
+    printf '%s\t%s\n' us-east-1 db-RESOURCE >"$(state_dir)/monitoring-streams.tsv"
+    aws_region() { return 1; }
+
+    run monitoring_streams_absent
+    [ "$status" -ne 0 ]
+
+    run runner_enis_absent us-east-1
     [ "$status" -ne 0 ]
 }
 
@@ -207,6 +289,161 @@ EOF
 
     [ "$status" -eq 0 ]
     [ "$output" = $'--monitoring-interval\n1\n--monitoring-role-arn\narn:aws:iam::111111111111:role/releem-monitoring' ]
+}
+
+@test "same-region read replica omits unsupported parameter group option and validates inheritance" {
+    fixture="$TEST_TMPDIR/read-replica.json"
+    export MYSQL_INSTANCE_CLASS=db.t3.micro
+    export MONITORING_ROLE_ARN=arn:aws:iam::111111111111:role/releem-monitoring
+    printf '%s\n' '{"DBInstances":[{"DBInstanceIdentifier":"replica","DBParameterGroups":[{"DBParameterGroupName":"expected","ParameterApplyStatus":"in-sync"}]}]}' >"$fixture"
+
+    run read_replica_create_arguments replica source subnet sg
+    [ "$status" -eq 0 ]
+    [[ "$output" != *'--db-parameter-group-name'* ]]
+
+    run assert_read_replica_parameter_group "$fixture" expected
+    [ "$status" -eq 0 ]
+}
+
+@test "exact SID contract rejects a replica source mismatch that broad counts accept" {
+    current="$TEST_TMPDIR/current-exact.jsonl"
+    upstreams="$TEST_TMPDIR/upstreams-exact.jsonl"
+    expected="$TEST_TMPDIR/expected-exact.json"
+    cat >"$current" <<'EOF'
+{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":null,"member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary","is_writer":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
+{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica","is_writer":0,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
+{"sid":202,"relation_type":"async_replication","group_key":"native:replica-a","parent_group_key":null,"member_key":"mysql:replica-a","primary_member_key":null,"role":"replica","is_writer":0,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}
+EOF
+    printf '%s\n' '{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy","last_seen_epoch_ms":1710000004000}' >"$upstreams"
+    cat >"$expected" <<'EOF'
+{"marker_epoch_ms":1710000003500,"relations":[{"sid":101,"relation_type":"rds_read_replica","group_key":"rds:source-a","member_key":"db:source-a","primary_member_key":"db:source-a","role":"primary"},{"sid":202,"relation_type":"rds_read_replica","group_key":"rds:source-a","parent_group_key":"rds:source-a","member_key":"db:replica-a","primary_member_key":"db:source-a","role":"replica"},{"sid":202,"relation_type":"async_replication","member_key":"mysql:replica-a","role":"replica"}],"upstreams":[{"sid":202,"channel_key":"default","upstream_member_key":"mysql:source-a","replication_state":"healthy"}]}
+EOF
+
+    run assert_exact_sid_contract "$current" "$upstreams" "$expected"
+    [ "$status" -eq 0 ]
+
+    printf '%s\n' '{"sid":202,"channel_key":"default","upstream_member_key":"mysql:wrong-source","replication_state":"healthy","last_seen_epoch_ms":1710000004000}' >"$upstreams"
+    run assert_exact_sid_contract "$current" "$upstreams" "$expected"
+    [ "$status" -ne 0 ]
+}
+
+@test "exact SID contract rejects a wrong global parent that broad role counts accept" {
+    current="$TEST_TMPDIR/global-current.jsonl"
+    upstreams="$TEST_TMPDIR/global-upstreams.jsonl"
+    expected="$TEST_TMPDIR/global-expected.json"
+    : >"$upstreams"
+    cat >"$current" <<'EOF'
+{"sid":301,"relation_type":"aurora_global_database","group_key":"aurora-global:g1","parent_group_key":null,"member_key":"arn:east:writer","primary_member_key":null,"role":"primary_cluster_member","last_seen_epoch_ms":1710000004000}
+{"sid":302,"relation_type":"aurora_global_database","group_key":"aurora-global:g1","parent_group_key":"arn:west:wrong","member_key":"arn:west:reader","primary_member_key":null,"role":"replica_cluster_member","last_seen_epoch_ms":1710000004000}
+EOF
+    cat >"$expected" <<'EOF'
+{"marker_epoch_ms":1710000003500,"relations":[{"sid":301,"relation_type":"aurora_global_database","group_key":"aurora-global:g1","parent_group_key":null,"member_key":"arn:east:writer","role":"primary_cluster_member"},{"sid":302,"relation_type":"aurora_global_database","group_key":"aurora-global:g1","parent_group_key":"arn:east:cluster","member_key":"arn:west:reader","role":"replica_cluster_member"}],"upstreams":[]}
+EOF
+
+    run assert_exact_sid_contract "$current" "$upstreams" "$expected"
+
+    [ "$status" -ne 0 ]
+}
+
+@test "AWS identity mapping derives exact Aurora and global keys from resource IDs" {
+    addressable_instances() { printf '%s\n' 'us-east-1|global-east-1'; }
+    aws_region() {
+        case "$*" in
+            *'describe-db-instances'*) printf '%s\n' '{"DBInstanceIdentifier":"global-east-1","DBInstanceArn":"arn:aws:rds:us-east-1:111111111111:db:global-east-1","DbiResourceId":"db-INSTANCE1","DBClusterIdentifier":"global-east","Endpoint":{"Address":"global-east-1.example","Port":3306},"ReadReplicaDBInstanceIdentifiers":[],"MultiAZ":false}' ;;
+            *'describe-db-clusters'*) printf '%s\n' '{"DBClusterIdentifier":"global-east","DBClusterArn":"arn:aws:rds:us-east-1:111111111111:cluster:global-east","DbClusterResourceId":"cluster-REGIONAL1","GlobalClusterIdentifier":"global-one","DBClusterMembers":[{"DBInstanceIdentifier":"global-east-1","IsClusterWriter":true}]}' ;;
+            *'describe-global-clusters'*) printf '%s\n' '{"GlobalClusterIdentifier":"global-one","GlobalClusterResourceId":"cluster-GLOBAL1","GlobalClusterMembers":[{"DBClusterArn":"arn:aws:rds:us-east-1:111111111111:cluster:global-east","IsWriter":true}]}' ;;
+            *) return 1 ;;
+        esac
+    }
+    fixture="$TEST_TMPDIR/aws-identity.jsonl"
+
+    run capture_aws_identity_map "$fixture"
+
+    [ "$status" -eq 0 ]
+    run jq -e '.endpoint=="global-east-1.example" and (.relations|length)==2 and .relations[0].group_key=="aurora:cluster-REGIONAL1" and .relations[0].primary_member_key=="arn:aws:rds:us-east-1:111111111111:db:global-east-1" and .relations[1].group_key=="aurora-global:cluster-GLOBAL1" and .relations[1].parent_group_key==null' "$fixture"
+    [ "$status" -eq 0 ]
+}
+
+@test "ClickHouse snapshot comparison includes primary parent and source edge identity" {
+    current="$TEST_TMPDIR/current-edge.jsonl"
+    observations="$TEST_TMPDIR/observations-edge.jsonl"
+    printf '%s\n' '{"sid":101,"last_rid":"rid-a","relation_type":"rds_read_replica","group_key":"rds:g","parent_group_key":"rds:g","member_key":"db:replica","primary_member_key":"db:source","upstream_member_key":"mysql:source","role":"replica","is_writer":0,"replication_state":"healthy"}' >"$current"
+    printf '%s\n' '{"sid":101,"rid":"rid-a","observed_epoch_ms":1710000003123,"relations":"[{\"relation_type\":\"rds_read_replica\",\"group_key\":\"rds:g\",\"parent_group_key\":\"rds:wrong\",\"member_key\":\"db:replica\",\"primary_member_key\":\"db:wrong\",\"upstream_member_key\":\"mysql:wrong\",\"role\":\"replica\",\"is_writer\":0,\"replication_state\":\"healthy\"}]"}' >"$observations"
+
+    run assert_selected_observations "$observations" "$current" '101:rid-a' 1710000003123 1
+
+    [ "$status" -ne 0 ]
+}
+
+@test "credential transport has one-day expiry and immediate bootstrap deletion" {
+    lifecycle="$TEST_TMPDIR/lifecycle.json"
+    bucket_lifecycle_configuration >"$lifecycle"
+
+    run jq -e '(.Rules|length)==1 and .Rules[0].Status=="Enabled" and .Rules[0].Filter.Prefix=="task13-20260908/" and .Rules[0].Expiration.Days==1' "$lifecycle"
+    [ "$status" -eq 0 ]
+
+    run bootstrap_secret_object_keys
+    [ "$status" -eq 0 ]
+    [ "$output" = $'task13-20260908/east/configs.tar\ntask13-20260908/west/configs.tar' ]
+}
+
+@test "Serverless scale evidence requires capacity movement under bounded load" {
+    good="$TEST_TMPDIR/serverless-good.json"
+    bad="$TEST_TMPDIR/serverless-bad.json"
+    printf '%s\n' '{"before":{"capacity":0.5,"acu_utilization":12},"during":{"capacity":1.5,"acu_utilization":76},"after":{"capacity":0.5,"acu_utilization":18},"attempts":2}' >"$good"
+    printf '%s\n' '{"before":{"capacity":0.5,"acu_utilization":12},"during":{"capacity":0.5,"acu_utilization":76},"after":{"capacity":0.5,"acu_utilization":18},"attempts":3}' >"$bad"
+
+    run assert_serverless_scale_evidence "$good" 3
+    [ "$status" -eq 0 ]
+    run assert_serverless_scale_evidence "$bad" 3
+    [ "$status" -ne 0 ]
+}
+
+@test "preflight rejects deterministic collisions regardless of ownership tags" {
+    fixture="$TEST_TMPDIR/collisions.json"
+    printf '%s\n' '{"expected":["db/releem-task13-20260908-rds-source","role/releem-task13-20260908-runner-role"],"existing":[]}' >"$fixture"
+    run assert_no_deterministic_collisions "$fixture"
+    [ "$status" -eq 0 ]
+
+    printf '%s\n' '{"expected":["db/releem-task13-20260908-rds-source","role/releem-task13-20260908-runner-role"],"existing":["db/releem-task13-20260908-rds-source"]}' >"$fixture"
+
+    run assert_no_deterministic_collisions "$fixture"
+
+    [ "$status" -ne 0 ]
+}
+
+@test "preflight requires private subnet NAT egress" {
+    good="$TEST_TMPDIR/egress-good.json"
+    bad="$TEST_TMPDIR/egress-bad.json"
+    printf '%s\n' '{"subnets":[{"subnet_id":"subnet-a","routes":[{"destination":"0.0.0.0/0","nat_gateway_id":"nat-1","state":"active"}]},{"subnet_id":"subnet-b","routes":[{"destination":"0.0.0.0/0","nat_gateway_id":"nat-1","state":"active"}]}]}' >"$good"
+    printf '%s\n' '{"subnets":[{"subnet_id":"subnet-a","routes":[]},{"subnet_id":"subnet-b","routes":[{"destination":"0.0.0.0/0","gateway_id":"igw-1","state":"active"}]}]}' >"$bad"
+
+    run assert_private_subnet_egress "$good" 2
+    [ "$status" -eq 0 ]
+    run assert_private_subnet_egress "$bad" 2
+    [ "$status" -ne 0 ]
+}
+
+@test "preflight quota gate accounts for exact regional matrix headroom" {
+    fixture="$TEST_TMPDIR/quotas.json"
+    printf '%s\n' '{"us-east-1":{"db_instances":{"quota":40,"used":28,"required":11},"db_clusters":{"quota":40,"used":37,"required":3},"ec2_instances":{"quota":100,"used":99,"required":1}},"us-west-2":{"db_instances":{"quota":40,"used":38,"required":2},"db_clusters":{"quota":40,"used":39,"required":1},"ec2_instances":{"quota":100,"used":99,"required":1}}}' >"$fixture"
+    run assert_matrix_quota_headroom "$fixture"
+    [ "$status" -eq 0 ]
+
+    printf '%s\n' '{"us-east-1":{"db_instances":{"quota":40,"used":30,"required":11},"db_clusters":{"quota":40,"used":37,"required":3},"ec2_instances":{"quota":100,"used":99,"required":1}},"us-west-2":{"db_instances":{"quota":40,"used":38,"required":2},"db_clusters":{"quota":40,"used":39,"required":1},"ec2_instances":{"quota":100,"used":99,"required":1}}}' >"$fixture"
+
+    run assert_matrix_quota_headroom "$fixture"
+
+    [ "$status" -ne 0 ]
+}
+
+@test "global runtime deadline is bounded and validated" {
+    run validate_runtime_deadline 14400
+    [ "$status" -eq 0 ]
+    run validate_runtime_deadline 0
+    [ "$status" -ne 0 ]
+    run validate_runtime_deadline 999999
+    [ "$status" -ne 0 ]
 }
 
 @test "Enhanced Monitoring readiness requires stream events for exact resource ID" {
