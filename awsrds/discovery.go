@@ -66,6 +66,7 @@ type ServerlessV2ScalingConfiguration struct {
 type Metadata struct {
 	// TopologyIncomplete preserves usable target metadata when optional API discovery fails.
 	TopologyIncomplete bool
+	TopologyFacts      *AWSFacts
 	Partition          string
 	Region             string
 
@@ -118,14 +119,11 @@ func DiscoverInstance(ctx context.Context, client Client, identifier string) (Me
 	if err != nil {
 		return Metadata{}, err
 	}
-	metadata, err := metadataFromInstance(instance, true)
+	metadata, err := metadataFromInstance(instance, false)
 	if err != nil {
 		return Metadata{}, err
 	}
-	if metadata.IsAurora() {
-		return discoverAuroraInstance(ctx, client, instance, metadata)
-	}
-	return discoverRDSReadReplicas(ctx, client, instance, metadata)
+	return collectAWSFacts(ctx, client, instance, metadata), nil
 }
 
 // DiscoverInstanceForApply resolves only the target DB instance and, for
@@ -181,246 +179,8 @@ func discoverAuroraInstanceForApply(ctx context.Context, client Client, metadata
 	return metadata, nil
 }
 
-func discoverAuroraInstance(ctx context.Context, client Client, target types.DBInstance, metadata Metadata) (Metadata, error) {
-	if metadata.DBClusterIdentifier == "" {
-		return Metadata{}, fmt.Errorf("Aurora DB instance %q has no DB cluster identifier", metadata.DBInstanceIdentifier)
-	}
-
-	cluster, err := describeDBClusterInRegion(ctx, client, metadata.DBClusterIdentifier, metadata.Region)
-	if err != nil {
-		return Metadata{}, err
-	}
-	if err := populateClusterMetadata(&metadata, cluster, true); err != nil {
-		return Metadata{}, err
-	}
-	localWriters := 0
-	for _, member := range cluster.DBClusterMembers {
-		if aws.ToBool(member.IsClusterWriter) {
-			localWriters++
-		}
-	}
-	if localWriters != 1 {
-		return Metadata{}, fmt.Errorf("DB cluster %q has %d local writers", metadata.DBClusterIdentifier, localWriters)
-	}
-
-	matchingMembers := membersForInstance(cluster.DBClusterMembers, metadata.DBInstanceIdentifier)
-	switch len(matchingMembers) {
-	case 0:
-		return Metadata{}, fmt.Errorf("DB instance %q is not a member of DB cluster %q", metadata.DBInstanceIdentifier, metadata.DBClusterIdentifier)
-	case 1:
-		// Continue below.
-	default:
-		return Metadata{}, fmt.Errorf("DB instance %q has %d memberships in DB cluster %q", metadata.DBInstanceIdentifier, len(matchingMembers), metadata.DBClusterIdentifier)
-	}
-
-	seenMembers := make(map[string]struct{}, len(cluster.DBClusterMembers))
-	for _, declaredMember := range cluster.DBClusterMembers {
-		memberID := aws.ToString(declaredMember.DBInstanceIdentifier)
-		if memberID == "" {
-			return Metadata{}, fmt.Errorf("DB cluster %q declares a member without a DB instance identifier", metadata.DBClusterIdentifier)
-		}
-		normalizedMemberID := strings.ToLower(memberID)
-		if _, exists := seenMembers[normalizedMemberID]; exists {
-			return Metadata{}, fmt.Errorf("DB cluster %q declares DB instance %q more than once", metadata.DBClusterIdentifier, memberID)
-		}
-		seenMembers[normalizedMemberID] = struct{}{}
-
-		memberInstance := target
-		if !strings.EqualFold(memberID, metadata.DBInstanceIdentifier) {
-			memberInstance, err = describeDBInstanceInRegion(ctx, client, memberID, metadata.Region)
-			if err != nil {
-				return Metadata{}, fmt.Errorf("resolve member of DB cluster %q: %w", metadata.DBClusterIdentifier, err)
-			}
-		}
-		if memberClusterID := aws.ToString(memberInstance.DBClusterIdentifier); !strings.EqualFold(memberClusterID, metadata.DBClusterIdentifier) {
-			return Metadata{}, fmt.Errorf("DB cluster %q declares DB instance %q, but the instance declares cluster %q", metadata.DBClusterIdentifier, memberID, memberClusterID)
-		}
-
-		memberMetadata, err := metadataFromInstance(memberInstance, true)
-		if err != nil {
-			return Metadata{}, fmt.Errorf("resolve member of DB cluster %q: %w", metadata.DBClusterIdentifier, err)
-		}
-		if err := validateMemberLocation(metadata, memberMetadata, memberID); err != nil {
-			return Metadata{}, err
-		}
-		metadata.ClusterMembers = append(metadata.ClusterMembers, clusterMemberFromMetadata(memberMetadata, declaredMember))
-	}
-
-	metadata.DBClusterParameterGroupStatus = aws.ToString(matchingMembers[0].DBClusterParameterGroupStatus)
-	metadata.IsClusterWriter = aws.ToBool(matchingMembers[0].IsClusterWriter)
-	metadata.PromotionTier = aws.ToInt32(matchingMembers[0].PromotionTier)
-	if globalID := aws.ToString(cluster.GlobalClusterIdentifier); globalID != "" {
-		globalCluster, err := describeGlobalClusterInRegion(ctx, client, globalID, metadata.Region)
-		if err != nil {
-			metadata.GlobalClusterIdentifier = globalID
-			metadata.TopologyIncomplete = true
-			return metadata, nil
-		}
-		if err := discoverGlobalCluster(cluster, globalCluster, &metadata, globalID); err != nil {
-			return Metadata{}, err
-		}
-	}
-	return metadata, nil
-}
-
-func discoverGlobalCluster(localCluster types.DBCluster, globalCluster types.GlobalCluster, metadata *Metadata, globalID string) error {
-	metadata.GlobalClusterIdentifier = aws.ToString(globalCluster.GlobalClusterIdentifier)
-	metadata.GlobalClusterARN = aws.ToString(globalCluster.GlobalClusterArn)
-	metadata.GlobalClusterResourceID = aws.ToString(globalCluster.GlobalClusterResourceId)
-	if metadata.GlobalClusterARN == "" {
-		return fmt.Errorf("global cluster %q has no ARN", globalID)
-	}
-	if metadata.GlobalClusterResourceID == "" {
-		return fmt.Errorf("global cluster %q has no resource ID", globalID)
-	}
-	if err := mergeMetadataPartition(metadata, metadata.GlobalClusterARN, "global-cluster", metadata.GlobalClusterIdentifier); err != nil {
-		return fmt.Errorf("global cluster %q: %w", globalID, err)
-	}
-
-	localClusterARN := aws.ToString(localCluster.DBClusterArn)
-	if localClusterARN == "" {
-		return fmt.Errorf("DB cluster %q belongs to global cluster %q but has no ARN", metadata.DBClusterIdentifier, globalID)
-	}
-
-	localIdentity, err := parseRDSARN(localClusterARN, "cluster")
-	if err != nil {
-		return fmt.Errorf("DB cluster %q: %w", metadata.DBClusterIdentifier, err)
-	}
-	seenMembers := make(map[string]GlobalClusterMember, len(globalCluster.GlobalClusterMembers))
-	localMemberships := 0
-	primaryMembers := 0
-	for _, declaredMember := range globalCluster.GlobalClusterMembers {
-		clusterARN := aws.ToString(declaredMember.DBClusterArn)
-		identity, err := parseRDSARN(clusterARN, "cluster")
-		if err != nil {
-			return fmt.Errorf("global cluster %q member: %w", globalID, err)
-		}
-		if metadata.Partition != "" && identity.Partition != metadata.Partition {
-			return fmt.Errorf("global cluster %q member %q uses partition %q, want %q", globalID, identity.Identifier, identity.Partition, metadata.Partition)
-		}
-		memberKey := strings.ToLower(clusterARN)
-		if _, exists := seenMembers[memberKey]; exists {
-			return fmt.Errorf("global cluster %q declares DB cluster ARN %q more than once", globalID, clusterARN)
-		}
-		member := GlobalClusterMember{
-			DBClusterIdentifier:         identity.Identifier,
-			DBClusterARN:                clusterARN,
-			Region:                      identity.Region,
-			IsWriter:                    aws.ToBool(declaredMember.IsWriter),
-			SynchronizationStatus:       string(declaredMember.SynchronizationStatus),
-			GlobalWriteForwardingStatus: string(declaredMember.GlobalWriteForwardingStatus),
-		}
-		seenMembers[memberKey] = member
-		metadata.GlobalClusterMembers = append(metadata.GlobalClusterMembers, member)
-		if sameRDSIdentity(identity, localIdentity) {
-			localMemberships++
-			if metadata.Region != "" && identity.Region != metadata.Region {
-				return fmt.Errorf("DB cluster %q region %q conflicts with global cluster membership region %q", metadata.DBClusterIdentifier, metadata.Region, identity.Region)
-			}
-		}
-		if member.IsWriter {
-			primaryMembers++
-			metadata.GlobalClusterPrimaryDBClusterARN = member.DBClusterARN
-			metadata.GlobalClusterPrimaryRegion = member.Region
-		}
-	}
-
-	if localMemberships != 1 {
-		return fmt.Errorf("DB cluster %q has %d memberships in global cluster %q", metadata.DBClusterIdentifier, localMemberships, globalID)
-	}
-	if primaryMembers != 1 {
-		return fmt.Errorf("global cluster %q has %d primary DB clusters", globalID, primaryMembers)
-	}
-	if metadata.GlobalClusterPrimaryRegion == "" {
-		return fmt.Errorf("global cluster %q primary DB cluster ARN has no region", globalID)
-	}
-
-	for _, declaredMember := range globalCluster.GlobalClusterMembers {
-		for _, readerARN := range declaredMember.Readers {
-			reader, exists := seenMembers[strings.ToLower(readerARN)]
-			if !exists {
-				return fmt.Errorf("global cluster %q references reader DB cluster ARN %q without a membership", globalID, readerARN)
-			}
-			if reader.IsWriter {
-				return fmt.Errorf("global cluster %q references primary DB cluster %q as a reader", globalID, reader.DBClusterIdentifier)
-			}
-		}
-	}
-	return nil
-}
-
-func discoverRDSReadReplicas(ctx context.Context, client Client, target types.DBInstance, metadata Metadata) (Metadata, error) {
-	metadata.ReadReplicaSourceDBInstanceIdentifier = aws.ToString(target.ReadReplicaSourceDBInstanceIdentifier)
-	metadata.ReadReplicaDBInstanceIdentifiers = append([]string(nil), target.ReadReplicaDBInstanceIdentifiers...)
-
-	if sourceID := metadata.ReadReplicaSourceDBInstanceIdentifier; sourceID != "" {
-		if matchesDBInstanceReference(sourceID, target, target) {
-			return Metadata{}, fmt.Errorf("DB instance %q declares itself as its read-replica source", metadata.DBInstanceIdentifier)
-		}
-		source, err := describeDBInstanceInRegion(ctx, client, sourceID, metadata.Region)
-		if err != nil {
-			return Metadata{}, fmt.Errorf("resolve read-replica source for DB instance %q: %w", metadata.DBInstanceIdentifier, err)
-		}
-		related, err := relatedDBInstance(source)
-		if err != nil {
-			return Metadata{}, fmt.Errorf("resolve read-replica source for DB instance %q: %w", metadata.DBInstanceIdentifier, err)
-		}
-		declared := false
-		for _, reference := range source.ReadReplicaDBInstanceIdentifiers {
-			declared = declared || matchesDBInstanceReference(reference, target, source)
-		}
-		if !declared {
-			return Metadata{}, fmt.Errorf("DB instance %q declares source %q, but the source does not declare it as a read replica", metadata.DBInstanceIdentifier, sourceID)
-		}
-		metadata.HasReadReplicaSource = true
-		metadata.ReadReplicaSource = related
-	}
-
-	seenReplicas := make(map[string]struct{}, len(metadata.ReadReplicaDBInstanceIdentifiers))
-	for _, replicaID := range metadata.ReadReplicaDBInstanceIdentifiers {
-		if replicaID == "" {
-			return Metadata{}, fmt.Errorf("DB instance %q declares a read replica without an identifier", metadata.DBInstanceIdentifier)
-		}
-		if matchesDBInstanceReference(replicaID, target, target) {
-			return Metadata{}, fmt.Errorf("DB instance %q declares itself as a read replica", metadata.DBInstanceIdentifier)
-		}
-		replicaKey := strings.ToLower(replicaID)
-		if _, exists := seenReplicas[replicaKey]; exists {
-			return Metadata{}, fmt.Errorf("DB instance %q declares read replica %q more than once", metadata.DBInstanceIdentifier, replicaID)
-		}
-		seenReplicas[replicaKey] = struct{}{}
-
-		replica, err := describeDBInstanceInRegion(ctx, client, replicaID, metadata.Region)
-		if err != nil {
-			return Metadata{}, fmt.Errorf("resolve read replica of DB instance %q: %w", metadata.DBInstanceIdentifier, err)
-		}
-		if sourceID := aws.ToString(replica.ReadReplicaSourceDBInstanceIdentifier); !matchesDBInstanceReference(sourceID, target, replica) {
-			return Metadata{}, fmt.Errorf("DB instance %q declares read replica %q, but the replica declares source %q", metadata.DBInstanceIdentifier, replicaID, sourceID)
-		}
-		related, err := relatedDBInstance(replica)
-		if err != nil {
-			return Metadata{}, fmt.Errorf("resolve read replica of DB instance %q: %w", metadata.DBInstanceIdentifier, err)
-		}
-		metadata.ReadReplicas = append(metadata.ReadReplicas, related)
-	}
-	return metadata, nil
-}
-
-// Bare references are local to the declaring instance's region and account.
-func matchesDBInstanceReference(reference string, target, declaring types.DBInstance) bool {
-	identity, err := parseRDSARN(reference, "db")
-	if !strings.HasPrefix(reference, "arn:") {
-		identity, err = parseRDSARN(aws.ToString(declaring.DBInstanceArn), "db")
-		identity.Identifier = reference
-	}
-	want, wantErr := parseRDSARN(aws.ToString(target.DBInstanceArn), "db")
-	return err == nil && wantErr == nil && sameRDSIdentity(identity, want)
-}
-
-// LogFields returns a bounded discovery summary that omits endpoints, ARNs,
-// account IDs, resource IDs, raw API payloads, and credentials.
 func (m Metadata) LogFields() map[string]interface{} {
-	return map[string]interface{}{
+	fields := map[string]interface{}{
 		"topology_incomplete":               m.TopologyIncomplete,
 		"partition":                         m.Partition,
 		"region":                            m.Region,
@@ -433,18 +193,24 @@ func (m Metadata) LogFields() map[string]interface{} {
 		"db_cluster_identifier":             m.DBClusterIdentifier,
 		"db_cluster_parameter_group":        m.DBClusterParameterGroup,
 		"db_cluster_parameter_group_status": m.DBClusterParameterGroupStatus,
-		"cluster_member_count":              len(m.ClusterMembers),
 		"is_cluster_writer":                 m.IsClusterWriter,
 		"is_serverless_v2":                  m.IsServerlessV2,
 		"serverless_v2_min_capacity":        m.ServerlessV2ScalingConfiguration.MinCapacity,
 		"serverless_v2_max_capacity":        m.ServerlessV2ScalingConfiguration.MaxCapacity,
 		"instance_status":                   m.InstanceStatus,
 		"global_cluster_identifier":         m.GlobalClusterIdentifier,
-		"global_cluster_member_count":       len(m.GlobalClusterMembers),
-		"has_read_replica_source":           m.HasReadReplicaSource,
-		"read_replica_count":                len(m.ReadReplicas),
 		"multi_az":                          m.MultiAZ,
 	}
+	if m.TopologyFacts != nil {
+		for _, source := range []string{"Target", "Cluster", "GlobalCluster", "Peers", "Source", "Children"} {
+			status := m.TopologyFacts.Sources[source]
+			if status != "ok" && status != "unsupported" && status != "error" {
+				status = "error"
+			}
+			fields["source_"+source] = status
+		}
+	}
+	return fields
 }
 
 // IsAurora reports whether the discovered engine is Aurora-compatible.
@@ -760,36 +526,6 @@ func mergeMetadataLocation(metadata *Metadata, value, resourceType, identifier s
 	return nil
 }
 
-func mergeMetadataPartition(metadata *Metadata, value, resourceType, identifier string) error {
-	if value == "" {
-		return nil
-	}
-	identity, err := parseRDSARN(value, resourceType)
-	if err != nil {
-		return err
-	}
-	if !strings.EqualFold(identity.Identifier, identifier) {
-		return fmt.Errorf("%s ARN identifies %q, want %q", resourceType, identity.Identifier, identifier)
-	}
-	if metadata.Partition != "" && metadata.Partition != identity.Partition {
-		return fmt.Errorf("%s ARN partition %q conflicts with %q", resourceType, identity.Partition, metadata.Partition)
-	}
-	if metadata.Partition == "" {
-		metadata.Partition = identity.Partition
-	}
-	return nil
-}
-
-func validateMemberLocation(cluster Metadata, member Metadata, memberID string) error {
-	if cluster.Partition != "" && member.Partition != "" && cluster.Partition != member.Partition {
-		return fmt.Errorf("DB cluster %q member %q uses partition %q, want %q", cluster.DBClusterIdentifier, memberID, member.Partition, cluster.Partition)
-	}
-	if cluster.Region != "" && member.Region != "" && cluster.Region != member.Region {
-		return fmt.Errorf("DB cluster %q member %q uses region %q, want %q", cluster.DBClusterIdentifier, memberID, member.Region, cluster.Region)
-	}
-	return nil
-}
-
 func populateClusterMetadata(metadata *Metadata, cluster types.DBCluster, requireStableIdentity bool) error {
 	metadata.DBClusterARN = aws.ToString(cluster.DBClusterArn)
 	metadata.DBClusterResourceID = aws.ToString(cluster.DbClusterResourceId)
@@ -868,25 +604,6 @@ func metadataFromInstance(instance types.DBInstance, requireStableIdentity bool)
 	return metadata, nil
 }
 
-func relatedDBInstance(instance types.DBInstance) (RelatedDBInstance, error) {
-	metadata, err := metadataFromInstance(instance, true)
-	if err != nil {
-		return RelatedDBInstance{}, err
-	}
-	return RelatedDBInstance{
-		DBInstanceIdentifier: metadata.DBInstanceIdentifier,
-		DBInstanceARN:        metadata.DBInstanceARN,
-		DBInstanceResourceID: metadata.DBInstanceResourceID,
-		Endpoint:             metadata.Endpoint,
-		EndpointPort:         metadata.EndpointPort,
-		Engine:               metadata.Engine,
-		InstanceStatus:       metadata.InstanceStatus,
-		Partition:            metadata.Partition,
-		Region:               metadata.Region,
-		MultiAZ:              metadata.MultiAZ,
-	}, nil
-}
-
 func containsStringFold(values []string, want string) bool {
 	for _, value := range values {
 		if strings.EqualFold(value, want) {
@@ -904,4 +621,14 @@ func membersForInstance(members []types.DBClusterMember, identifier string) []ty
 		}
 	}
 	return matching
+}
+
+func matchesDBInstanceReference(reference string, target, declaring types.DBInstance) bool {
+	identity, err := parseRDSARN(reference, "db")
+	if !strings.HasPrefix(reference, "arn:") {
+		identity, err = parseRDSARN(aws.ToString(declaring.DBInstanceArn), "db")
+		identity.Identifier = reference
+	}
+	want, wantErr := parseRDSARN(aws.ToString(target.DBInstanceArn), "db")
+	return err == nil && wantErr == nil && sameRDSIdentity(identity, want)
 }

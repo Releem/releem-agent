@@ -1343,6 +1343,23 @@ EOF
     [ "$status" -ne 0 ]
 }
 
+@test "AWS Global secondary regional primary is not an autonomous writer" {
+    addressable_instances() { printf '%s\n' 'us-west-2|global-secondary-writer'; }
+    aws_region() {
+        case "$*" in
+            *'describe-db-instances'*) jq '.DBInstances[0]' "$BATS_TEST_DIRNAME/../../awsrds/testdata/aurora_global_secondary.json" ;;
+            *'describe-db-clusters'*) jq '.DBClusters[0]' "$BATS_TEST_DIRNAME/../../awsrds/testdata/aurora_global_secondary.json" ;;
+            *'describe-global-clusters'*) jq '.GlobalClusters[0]' "$BATS_TEST_DIRNAME/../../awsrds/testdata/aurora_global_secondary.json" ;;
+            *) return 1 ;;
+        esac
+    }
+    fixture="$TEST_TMPDIR/global-secondary-identity.jsonl"
+    run capture_aws_identity_map "$fixture"
+    [ "$status" -eq 0 ]
+    run jq -e '.relations[0].role=="primary" and .relations[0].is_writer==false and .relations[1].role=="replica_cluster_member" and .relations[1].is_writer==false' "$fixture"
+    [ "$status" -eq 0 ]
+}
+
 @test "credential transport has one-day expiry and immediate bootstrap deletion" {
     lifecycle="$TEST_TMPDIR/lifecycle.json"
     bucket_lifecycle_configuration >"$lifecycle"

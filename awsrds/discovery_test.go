@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -107,7 +106,7 @@ func TestDiscoverCrossRegionReplicas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ReadReplicaSource.Region != "eu-west-1" || len(got.ReadReplicas) != 1 || got.ReadReplicas[0].Region != "us-west-2" {
+	if len(got.TopologyFacts.Instances) != 2 || !strings.Contains(got.TopologyFacts.Instances[0].DBInstanceArn, ":eu-west-1:") || !strings.Contains(got.TopologyFacts.Instances[1].DBInstanceArn, ":us-west-2:") {
 		t.Fatalf("wrong related instances: %+v", got)
 	}
 	if !equalStrings(client.describeInstanceRegions, []string{"", "eu-west-1", "us-west-2"}) {
@@ -117,8 +116,8 @@ func TestDiscoverCrossRegionReplicas(t *testing.T) {
 	wrong := *source
 	wrong.DBInstanceArn = aws.String(strings.Replace(aws.ToString(source.DBInstanceArn), "123456789012", "999999999999", 1))
 	client.instancePages[describePageKey{identifier: aws.ToString(source.DBInstanceArn)}] = &rds.DescribeDBInstancesOutput{DBInstances: []types.DBInstance{wrong}}
-	if _, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier); err == nil {
-		t.Fatal("accepted wrong account")
+	if got, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier); err != nil || got.TopologyFacts.Sources["Source"] != "error" {
+		t.Fatal("wrong-account optional source was accepted or target monitoring failed")
 	}
 }
 
@@ -186,7 +185,7 @@ func TestDiscoverGlobalAPIFailurePreservesTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Endpoint == "" || got.DBInstanceIdentifier != fixture.TargetIdentifier || len(got.ClusterMembers) != 2 || !got.TopologyIncomplete || got.GlobalClusterIdentifier != "orders-global" {
+	if got.Endpoint == "" || got.DBInstanceIdentifier != fixture.TargetIdentifier || len(got.TopologyFacts.Cluster.DBClusterMembers) != 2 || !got.TopologyIncomplete || got.GlobalClusterIdentifier != "orders-global" {
 		t.Fatalf("lost local metadata: %+v", got)
 	}
 	if len(got.GlobalClusterMembers) != 0 || got.GlobalClusterARN != "" {
@@ -574,273 +573,6 @@ func TestDiscoverInstanceAcceptsDBInstanceARN(t *testing.T) {
 	}
 }
 
-func TestDiscoverInstanceAuroraRequiresExactlyOneLocalWriter(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		writerCount int
-	}{
-		{name: "no writer", writerCount: 0},
-		{name: "two writers", writerCount: 2},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			fixture := loadDiscoveryFixture(t, "aurora_global_primary.json")
-			for i := range fixture.DBClusters[0].DBClusterMembers {
-				fixture.DBClusters[0].DBClusterMembers[i].IsClusterWriter = aws.Bool(i < tt.writerCount)
-			}
-			client := fakeClientFromFixture(fixture)
-
-			_, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
-			want := fmt.Sprintf("has %d local writers", tt.writerCount)
-			if err == nil || !strings.Contains(err.Error(), want) {
-				t.Fatalf("DiscoverInstance(%q) error = %v, want containing %q", fixture.TargetIdentifier, err, want)
-			}
-		})
-	}
-}
-
-func TestDiscoverInstanceRequiresStableTopologyIdentities(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name            string
-		fixtureName     string
-		mutate          func(*discoveryFixture)
-		wantErrContains string
-	}{
-		{
-			name:        "target ARN",
-			fixtureName: "rds_multi_az.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBInstances[0].DBInstanceArn = nil
-			},
-			wantErrContains: "has no ARN",
-		},
-		{
-			name:        "target resource ID",
-			fixtureName: "rds_multi_az.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBInstances[0].DbiResourceId = nil
-			},
-			wantErrContains: "has no resource ID",
-		},
-		{
-			name:        "target region",
-			fixtureName: "rds_multi_az.json",
-			mutate: func(fixture *discoveryFixture) {
-				value := strings.Replace(aws.ToString(fixture.DBInstances[0].DBInstanceArn), ":us-east-1:", "::", 1)
-				fixture.DBInstances[0].DBInstanceArn = aws.String(value)
-			},
-			wantErrContains: "ARN has no region",
-		},
-		{
-			name:        "Aurora member ARN",
-			fixtureName: "aurora_global_primary.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBInstances[1].DBInstanceArn = nil
-			},
-			wantErrContains: "has no ARN",
-		},
-		{
-			name:        "Aurora member resource ID",
-			fixtureName: "aurora_global_primary.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBInstances[1].DbiResourceId = nil
-			},
-			wantErrContains: "has no resource ID",
-		},
-		{
-			name:        "Aurora member region",
-			fixtureName: "aurora_global_primary.json",
-			mutate: func(fixture *discoveryFixture) {
-				value := strings.Replace(aws.ToString(fixture.DBInstances[1].DBInstanceArn), ":us-east-1:", "::", 1)
-				fixture.DBInstances[1].DBInstanceArn = aws.String(value)
-			},
-			wantErrContains: "ARN has no region",
-		},
-		{
-			name:        "Aurora cluster ARN",
-			fixtureName: "aurora_global_primary.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBClusters[0].DBClusterArn = nil
-			},
-			wantErrContains: "has no ARN",
-		},
-		{
-			name:        "Aurora cluster resource ID",
-			fixtureName: "aurora_global_primary.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBClusters[0].DbClusterResourceId = nil
-			},
-			wantErrContains: "has no resource ID",
-		},
-		{
-			name:        "global cluster ARN",
-			fixtureName: "aurora_global_primary.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.GlobalClusters[0].GlobalClusterArn = nil
-			},
-			wantErrContains: "has no ARN",
-		},
-		{
-			name:        "global cluster resource ID",
-			fixtureName: "aurora_global_primary.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.GlobalClusters[0].GlobalClusterResourceId = nil
-			},
-			wantErrContains: "has no resource ID",
-		},
-		{
-			name:        "read-replica source ARN",
-			fixtureName: "rds_read_replica.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBInstances[1].DBInstanceArn = nil
-			},
-			wantErrContains: "has no ARN",
-		},
-		{
-			name:        "read-replica source resource ID",
-			fixtureName: "rds_read_replica.json",
-			mutate: func(fixture *discoveryFixture) {
-				fixture.DBInstances[1].DbiResourceId = nil
-			},
-			wantErrContains: "has no resource ID",
-		},
-		{
-			name:        "read-replica source region",
-			fixtureName: "rds_read_replica.json",
-			mutate: func(fixture *discoveryFixture) {
-				value := strings.Replace(aws.ToString(fixture.DBInstances[1].DBInstanceArn), ":us-east-1:", "::", 1)
-				fixture.DBInstances[1].DBInstanceArn = aws.String(value)
-			},
-			wantErrContains: "ARN has no region",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			fixture := loadDiscoveryFixture(t, tt.fixtureName)
-			tt.mutate(&fixture)
-			client := fakeClientFromFixture(fixture)
-
-			_, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
-			if err == nil || !strings.Contains(err.Error(), tt.wantErrContains) {
-				t.Fatalf("DiscoverInstance(%q) error = %v, want containing %q", fixture.TargetIdentifier, err, tt.wantErrContains)
-			}
-		})
-	}
-}
-
-func TestDiscoverInstanceAuroraProvisionedMembers(t *testing.T) {
-	t.Parallel()
-
-	const (
-		clusterID = "orders-provisioned"
-		readerID  = "orders-provisioned-reader"
-		writerID  = "orders-provisioned-writer"
-	)
-	client := &fakeClient{
-		instancePages: map[describePageKey]*rds.DescribeDBInstancesOutput{
-			{identifier: readerID}: {DBInstances: []types.DBInstance{{
-				DBInstanceIdentifier: aws.String(readerID),
-				DBInstanceArn:        aws.String("arn:aws:rds:us-east-1:123456789012:db:orders-provisioned-reader"),
-				DbiResourceId:        aws.String("db-reader-resource"),
-				DBInstanceClass:      aws.String("db.r7g.large"),
-				DBClusterIdentifier:  aws.String(clusterID),
-				DBInstanceStatus:     aws.String("available"),
-				Engine:               aws.String("aurora-mysql"),
-				Endpoint:             &types.Endpoint{Address: aws.String("reader.internal"), Port: aws.Int32(3306)},
-			}}},
-			{identifier: writerID}: {DBInstances: []types.DBInstance{{
-				DBInstanceIdentifier: aws.String(writerID),
-				DBInstanceArn:        aws.String("arn:aws:rds:us-east-1:123456789012:db:orders-provisioned-writer"),
-				DbiResourceId:        aws.String("db-writer-resource"),
-				DBInstanceClass:      aws.String("db.r7g.xlarge"),
-				DBClusterIdentifier:  aws.String(clusterID),
-				DBInstanceStatus:     aws.String("available"),
-				Engine:               aws.String("aurora-mysql"),
-				Endpoint:             &types.Endpoint{Address: aws.String("writer.internal"), Port: aws.Int32(3306)},
-			}}},
-		},
-		clusterPages: map[describePageKey]*rds.DescribeDBClustersOutput{
-			{identifier: clusterID}: {
-				Marker: aws.String("cluster-next"),
-			},
-			{identifier: clusterID, marker: "cluster-next"}: {DBClusters: []types.DBCluster{{
-				DBClusterIdentifier:     aws.String(clusterID),
-				DBClusterArn:            aws.String("arn:aws:rds:us-east-1:123456789012:cluster:orders-provisioned"),
-				DbClusterResourceId:     aws.String("cluster-resource"),
-				DBClusterParameterGroup: aws.String("orders-cluster-pg"),
-				Endpoint:                aws.String("cluster-writer.internal"),
-				ReaderEndpoint:          aws.String("cluster-reader.internal"),
-				EngineMode:              aws.String("provisioned"),
-				DBClusterMembers: []types.DBClusterMember{
-					{DBInstanceIdentifier: aws.String(writerID), IsClusterWriter: aws.Bool(true), PromotionTier: aws.Int32(0), DBClusterParameterGroupStatus: aws.String("in-sync")},
-					{DBInstanceIdentifier: aws.String(readerID), IsClusterWriter: aws.Bool(false), PromotionTier: aws.Int32(2), DBClusterParameterGroupStatus: aws.String("in-sync")},
-				},
-			}}},
-		},
-	}
-
-	got, err := DiscoverInstance(context.Background(), client, readerID)
-	if err != nil {
-		t.Fatalf("DiscoverInstance(%q) unexpected error: %v", readerID, err)
-	}
-	if got.Region != "us-east-1" || got.Partition != "aws" {
-		t.Errorf("DiscoverInstance(%q) region/partition = %q/%q, want us-east-1/aws", readerID, got.Region, got.Partition)
-	}
-	if got.DBClusterARN != "arn:aws:rds:us-east-1:123456789012:cluster:orders-provisioned" || got.DBClusterResourceID != "cluster-resource" {
-		t.Errorf("DiscoverInstance(%q) cluster identity = %q/%q, want fixture ARN/resource ID", readerID, got.DBClusterARN, got.DBClusterResourceID)
-	}
-	if got.ClusterEndpoint != "cluster-writer.internal" || got.ClusterReaderEndpoint != "cluster-reader.internal" {
-		t.Errorf("DiscoverInstance(%q) cluster endpoints = %q/%q, want writer/reader endpoints", readerID, got.ClusterEndpoint, got.ClusterReaderEndpoint)
-	}
-	if got.PromotionTier != 2 || got.IsClusterWriter {
-		t.Errorf("DiscoverInstance(%q) role = writer:%t tier:%d, want writer:false tier:2", readerID, got.IsClusterWriter, got.PromotionTier)
-	}
-	wantMembers := []ClusterMember{
-		{
-			DBInstanceIdentifier:          writerID,
-			DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-provisioned-writer",
-			DBInstanceResourceID:          "db-writer-resource",
-			DBInstanceClass:               "db.r7g.xlarge",
-			Endpoint:                      "writer.internal",
-			EndpointPort:                  3306,
-			InstanceStatus:                "available",
-			IsClusterWriter:               true,
-			PromotionTier:                 0,
-			DBClusterParameterGroupStatus: "in-sync",
-		},
-		{
-			DBInstanceIdentifier:          readerID,
-			DBInstanceARN:                 "arn:aws:rds:us-east-1:123456789012:db:orders-provisioned-reader",
-			DBInstanceResourceID:          "db-reader-resource",
-			DBInstanceClass:               "db.r7g.large",
-			Endpoint:                      "reader.internal",
-			EndpointPort:                  3306,
-			InstanceStatus:                "available",
-			IsClusterWriter:               false,
-			PromotionTier:                 2,
-			DBClusterParameterGroupStatus: "in-sync",
-		},
-	}
-	if !reflect.DeepEqual(got.ClusterMembers, wantMembers) {
-		t.Errorf("DiscoverInstance(%q) ClusterMembers = %#v, want %#v", readerID, got.ClusterMembers, wantMembers)
-	}
-	if !equalStrings(client.describeInstanceIDs, []string{readerID, writerID}) {
-		t.Errorf("DiscoverInstance(%q) DescribeDBInstances calls = %v, want target and writer", readerID, client.describeInstanceIDs)
-	}
-	if !equalStrings(client.describeClusterIDs, []string{clusterID, clusterID}) {
-		t.Errorf("DiscoverInstance(%q) DescribeDBClusters calls = %v, want both pages", readerID, client.describeClusterIDs)
-	}
-}
-
 func TestDescribeDBInstancePagesFollowsPagination(t *testing.T) {
 	t.Parallel()
 
@@ -942,158 +674,6 @@ func TestDescribeTopologyPagesRejectRepeatedMarkers(t *testing.T) {
 	}
 }
 
-func TestDiscoverInstanceAuroraServerlessV2(t *testing.T) {
-	t.Parallel()
-
-	const (
-		clusterID  = "orders-serverless"
-		instanceID = "orders-serverless-writer"
-	)
-	client := &fakeClient{
-		instancePages: map[describePageKey]*rds.DescribeDBInstancesOutput{
-			{identifier: instanceID}: {DBInstances: []types.DBInstance{{
-				DBInstanceIdentifier: aws.String(instanceID),
-				DBInstanceArn:        aws.String("arn:aws:rds:us-east-1:123456789012:db:orders-serverless-writer"),
-				DbiResourceId:        aws.String("db-orders-serverless-writer"),
-				DBInstanceClass:      aws.String("db.serverless"),
-				DBClusterIdentifier:  aws.String(clusterID),
-				DBInstanceStatus:     aws.String("available"),
-				Engine:               aws.String("aurora-mysql"),
-				Endpoint:             &types.Endpoint{Address: aws.String("serverless-writer.internal"), Port: aws.Int32(3306)},
-			}}},
-		},
-		clusterPages: map[describePageKey]*rds.DescribeDBClustersOutput{
-			{identifier: clusterID}: {DBClusters: []types.DBCluster{{
-				DBClusterIdentifier: aws.String(clusterID),
-				DBClusterArn:        aws.String("arn:aws:rds:us-east-1:123456789012:cluster:orders-serverless"),
-				DbClusterResourceId: aws.String("cluster-orders-serverless"),
-				EngineMode:          aws.String("provisioned"),
-				ServerlessV2ScalingConfiguration: &types.ServerlessV2ScalingConfigurationInfo{
-					MinCapacity:           aws.Float64(0),
-					MaxCapacity:           aws.Float64(16),
-					SecondsUntilAutoPause: aws.Int32(600),
-				},
-				DBClusterMembers: []types.DBClusterMember{{
-					DBInstanceIdentifier: aws.String(instanceID),
-					IsClusterWriter:      aws.Bool(true),
-					PromotionTier:        aws.Int32(0),
-				}},
-			}}},
-		},
-	}
-
-	got, err := DiscoverInstance(context.Background(), client, instanceID)
-	if err != nil {
-		t.Fatalf("DiscoverInstance(%q) unexpected error: %v", instanceID, err)
-	}
-	wantScaling := ServerlessV2ScalingConfiguration{MinCapacity: 0, MaxCapacity: 16, SecondsUntilAutoPause: 600}
-	if !got.IsServerlessV2 || !got.HasServerlessV2ScalingConfiguration || got.ServerlessV2ScalingConfiguration != wantScaling {
-		t.Errorf("DiscoverInstance(%q) Serverless v2 = member:%t configured:%t scaling:%#v, want true/true/%#v", instanceID, got.IsServerlessV2, got.HasServerlessV2ScalingConfiguration, got.ServerlessV2ScalingConfiguration, wantScaling)
-	}
-	if got.EngineMode != "provisioned" {
-		t.Errorf("DiscoverInstance(%q) EngineMode = %q, want provisioned for Serverless v2", instanceID, got.EngineMode)
-	}
-	if len(got.ClusterMembers) != 1 || !got.ClusterMembers[0].IsServerlessV2 {
-		t.Errorf("DiscoverInstance(%q) ClusterMembers = %#v, want one Serverless v2 member", instanceID, got.ClusterMembers)
-	}
-}
-
-func TestDiscoverInstanceAuroraGlobalPrimary(t *testing.T) {
-	t.Parallel()
-
-	fixture := loadDiscoveryFixture(t, "aurora_global_primary.json")
-	client := fakeClientFromFixture(fixture)
-	got, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
-	if err != nil {
-		t.Fatalf("DiscoverInstance(%q) unexpected error: %v", fixture.TargetIdentifier, err)
-	}
-
-	assertGlobalMetadata(t, fixture.TargetIdentifier, got, "us-east-1", "arn:aws:rds:us-east-1:123456789012:cluster:global-primary", true)
-	if !equalStrings(client.describeGlobalIDs, []string{"orders-global"}) {
-		t.Errorf("DiscoverInstance(%q) DescribeGlobalClusters calls = %v, want [orders-global]", fixture.TargetIdentifier, client.describeGlobalIDs)
-	}
-}
-
-func TestDiscoverInstanceAuroraGlobalSecondary(t *testing.T) {
-	t.Parallel()
-
-	fixture := loadDiscoveryFixture(t, "aurora_global_secondary.json")
-	client := fakeClientFromFixture(fixture)
-	got, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
-	if err != nil {
-		t.Fatalf("DiscoverInstance(%q) unexpected error: %v", fixture.TargetIdentifier, err)
-	}
-
-	assertGlobalMetadata(t, fixture.TargetIdentifier, got, "us-west-2", "arn:aws:rds:us-east-1:123456789012:cluster:global-primary", false)
-}
-
-func TestDiscoverInstanceRejectsGlobalMemberWithoutARNRegion(t *testing.T) {
-	t.Parallel()
-
-	fixture := loadDiscoveryFixture(t, "aurora_global_primary.json")
-	fixture.GlobalClusters[0].GlobalClusterMembers[1].DBClusterArn = aws.String("arn:aws:rds::123456789012:cluster:global-secondary")
-	fixture.GlobalClusters[0].GlobalClusterMembers[0].Readers = []string{"arn:aws:rds::123456789012:cluster:global-secondary"}
-	client := fakeClientFromFixture(fixture)
-
-	_, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
-	if err == nil || !strings.Contains(err.Error(), "cluster ARN has no region") {
-		t.Fatalf("DiscoverInstance(%q) error = %v, want missing cluster ARN region", fixture.TargetIdentifier, err)
-	}
-}
-
-func TestDiscoverInstanceRDSReadReplica(t *testing.T) {
-	t.Parallel()
-
-	fixture := loadDiscoveryFixture(t, "rds_read_replica.json")
-	client := fakeClientFromFixture(fixture)
-	got, err := DiscoverInstance(context.Background(), client, fixture.TargetIdentifier)
-	if err != nil {
-		t.Fatalf("DiscoverInstance(%q) unexpected error: %v", fixture.TargetIdentifier, err)
-	}
-
-	if got.ReadReplicaSourceDBInstanceIdentifier != "orders-primary" || !got.HasReadReplicaSource {
-		t.Errorf("DiscoverInstance(%q) source = %q present:%t, want orders-primary/true", fixture.TargetIdentifier, got.ReadReplicaSourceDBInstanceIdentifier, got.HasReadReplicaSource)
-	}
-	wantSource := RelatedDBInstance{
-		DBInstanceIdentifier: "orders-primary",
-		DBInstanceARN:        "arn:aws:rds:us-east-1:123456789012:db:orders-primary",
-		DBInstanceResourceID: "db-primary-resource",
-		Endpoint:             "orders-primary.internal",
-		EndpointPort:         3306,
-		Engine:               "mysql",
-		InstanceStatus:       "available",
-		Partition:            "aws",
-		Region:               "us-east-1",
-		MultiAZ:              true,
-	}
-	if got.ReadReplicaSource != wantSource {
-		t.Errorf("DiscoverInstance(%q) ReadReplicaSource = %#v, want %#v", fixture.TargetIdentifier, got.ReadReplicaSource, wantSource)
-	}
-	wantReplicas := []RelatedDBInstance{{
-		DBInstanceIdentifier: "orders-replica-2",
-		DBInstanceARN:        "arn:aws:rds:us-east-1:123456789012:db:orders-replica-2",
-		DBInstanceResourceID: "db-replica-2-resource",
-		Endpoint:             "orders-replica-2.internal",
-		EndpointPort:         3306,
-		Engine:               "mysql",
-		InstanceStatus:       "available",
-		Partition:            "aws",
-		Region:               "us-east-1",
-	}}
-	if !reflect.DeepEqual(got.ReadReplicas, wantReplicas) {
-		t.Errorf("DiscoverInstance(%q) ReadReplicas = %#v, want %#v", fixture.TargetIdentifier, got.ReadReplicas, wantReplicas)
-	}
-	if !equalStrings(got.ReadReplicaDBInstanceIdentifiers, []string{"orders-replica-2"}) {
-		t.Errorf("DiscoverInstance(%q) ReadReplicaDBInstanceIdentifiers = %v, want [orders-replica-2]", fixture.TargetIdentifier, got.ReadReplicaDBInstanceIdentifiers)
-	}
-	if !equalStrings(client.describeInstanceIDs, []string{fixture.TargetIdentifier, "orders-primary", "orders-replica-2"}) {
-		t.Errorf("DiscoverInstance(%q) DescribeDBInstances calls = %v, want target/source/child", fixture.TargetIdentifier, client.describeInstanceIDs)
-	}
-	if len(client.describeClusterIDs) != 0 {
-		t.Errorf("DiscoverInstance(%q) DescribeDBClusters calls = %v, want none for ordinary RDS", fixture.TargetIdentifier, client.describeClusterIDs)
-	}
-}
-
 func TestDiscoverInstanceRDSMultiAZ(t *testing.T) {
 	t.Parallel()
 
@@ -1156,49 +736,6 @@ func fakeClientFromFixture(fixture discoveryFixture) *fakeClient {
 		client.globalPages[describePageKey{identifier: identifier}] = &rds.DescribeGlobalClustersOutput{GlobalClusters: []types.GlobalCluster{cluster}}
 	}
 	return client
-}
-
-func assertGlobalMetadata(t *testing.T, identifier string, got Metadata, wantRegion, wantPrimaryARN string, wantLocalWriter bool) {
-	t.Helper()
-	if got.Region != wantRegion {
-		t.Errorf("DiscoverInstance(%q) Region = %q, want %q", identifier, got.Region, wantRegion)
-	}
-	if got.GlobalClusterIdentifier != "orders-global" || got.GlobalClusterARN != "arn:aws:rds::123456789012:global-cluster:orders-global" || got.GlobalClusterResourceID != "cluster-global-resource" {
-		t.Errorf("DiscoverInstance(%q) global identity = %q/%q/%q, want fixture identifier/ARN/resource ID", identifier, got.GlobalClusterIdentifier, got.GlobalClusterARN, got.GlobalClusterResourceID)
-	}
-	if got.GlobalClusterPrimaryDBClusterARN != wantPrimaryARN || got.GlobalClusterPrimaryRegion != "us-east-1" {
-		t.Errorf("DiscoverInstance(%q) global primary = %q/%q, want %q/us-east-1", identifier, got.GlobalClusterPrimaryDBClusterARN, got.GlobalClusterPrimaryRegion, wantPrimaryARN)
-	}
-	wantMembers := []GlobalClusterMember{
-		{
-			DBClusterIdentifier:         "global-primary",
-			DBClusterARN:                "arn:aws:rds:us-east-1:123456789012:cluster:global-primary",
-			Region:                      "us-east-1",
-			IsWriter:                    true,
-			SynchronizationStatus:       "connected",
-			GlobalWriteForwardingStatus: "enabled",
-		},
-		{
-			DBClusterIdentifier:         "global-secondary",
-			DBClusterARN:                "arn:aws:rds:us-west-2:123456789012:cluster:global-secondary",
-			Region:                      "us-west-2",
-			IsWriter:                    false,
-			SynchronizationStatus:       "connected",
-			GlobalWriteForwardingStatus: "disabled",
-		},
-	}
-	if !reflect.DeepEqual(got.GlobalClusterMembers, wantMembers) {
-		t.Errorf("DiscoverInstance(%q) GlobalClusterMembers = %#v, want %#v", identifier, got.GlobalClusterMembers, wantMembers)
-	}
-	localWriter := false
-	for _, member := range got.GlobalClusterMembers {
-		if member.DBClusterARN == got.DBClusterARN {
-			localWriter = member.IsWriter
-		}
-	}
-	if localWriter != wantLocalWriter {
-		t.Errorf("DiscoverInstance(%q) local global writer = %t, want %t", identifier, localWriter, wantLocalWriter)
-	}
 }
 
 func TestMetadataHelpers(t *testing.T) {

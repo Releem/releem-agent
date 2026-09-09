@@ -206,7 +206,7 @@ func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, cwlogsclient *cloud
 		discoverMetadata:         discoverMetadata,
 		metadataDiscoveryTimeout: awsRDSMetadataDiscoveryTimeout,
 		metadata:                 initialMetadata.Clone(),
-		metadataComplete:         true,
+		metadataComplete:         !initialMetadata.TopologyIncomplete,
 	}
 }
 
@@ -218,6 +218,12 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ct
 	if err != nil {
 		awsrdsenhancedmetrics.metadataMu.Lock()
 		cached := awsrdsenhancedmetrics.metadata.Clone()
+		if cached.TopologyFacts != nil {
+			for source := range cached.TopologyFacts.Sources {
+				cached.TopologyFacts.Sources[source] = "error"
+			}
+		}
+		cached.TopologyIncomplete = true
 		awsrdsenhancedmetrics.metadataComplete = false
 		awsrdsenhancedmetrics.metadataMu.Unlock()
 		logAWSRDSDiscoveryFallback(awsrdsenhancedmetrics.logger, cached, err)
@@ -227,14 +233,14 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ct
 	stored := metadata.Clone()
 	awsrdsenhancedmetrics.metadataMu.Lock()
 	awsrdsenhancedmetrics.metadata = stored
-	awsrdsenhancedmetrics.metadataComplete = true
+	awsrdsenhancedmetrics.metadataComplete = !stored.TopologyIncomplete
 	awsrdsenhancedmetrics.metadataMu.Unlock()
 	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", stored)
 	return stored.Clone(), true
 }
 
 // MetadataSnapshot returns an immutable copy of the latest metadata and whether
-// the current report refreshed it successfully.
+// current snapshot has no failed source. Report freshness is tracked separately.
 func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) MetadataSnapshot() (awsrds.Metadata, bool) {
 	awsrdsenhancedmetrics.metadataMu.RLock()
 	defer awsrdsenhancedmetrics.metadataMu.RUnlock()
@@ -285,8 +291,8 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 	defer utils.HandlePanic(awsrdsenhancedmetrics.configuration, awsrdsenhancedmetrics.logger)
 
 	ctx := context.Background()
-	metadata, metadataComplete := awsrdsenhancedmetrics.metadataForReport(ctx)
-	awsrds.AttachReportMetadata(metrics, metadata, metadataComplete)
+	metadata, metadataFresh := awsrdsenhancedmetrics.metadataForReport(ctx)
+	awsrds.AttachReportMetadata(metrics, metadata, metadataFresh)
 
 	info := make(models.MetricGroupValue)
 	metricsMap := make(models.MetricGroupValue)

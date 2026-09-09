@@ -884,7 +884,8 @@ assert_transition_state() {
         (map(select(.relation_type=="aurora_cluster")) as $aurora |
           ($aurora|length)==10 and ($aurora|map(.group_key)|unique|length)==4 and
           ($aurora|group_by(.group_key)|map(length)|sort)==[2,2,3,3] and
-          ($aurora|group_by(.group_key)|all((map(select(.is_writer==1))|length)==1))) and
+          ($aurora|group_by(.group_key)|all((map(select(.role=="primary"))|length)==1)) and
+          ($aurora|map(select(.is_writer==1))|length)==3) and
         (map(select(.relation_type=="aurora_global_database")) as $global |
           ($global|length)==4 and ($global|map(.group_key)|unique|length)==1 and
           ($global|map(select(.role=="primary_cluster_member"))|length)==2 and
@@ -2364,7 +2365,9 @@ capture_aws_identity_map() {
               [{relation_type:"aurora_cluster",group_key:("aurora:"+$cluster.DbClusterResourceId),
                 parent_group_key:(if $global==null then null else "aurora-global:"+$global.GlobalClusterResourceId end),
                 member_key:member($db),primary_member_key:member($writer),
-                role:(if $local_writer then "primary" else "replica" end),is_writer:(available($db) and $local_writer),
+                role:(if $local_writer then "primary" else "replica" end),
+                is_writer:(available($db) and $local_writer and
+                  ($global==null or any($global.GlobalClusterMembers[];.DBClusterArn==$cluster.DBClusterArn and .IsWriter==true and global_state(.)=="healthy"))),
                 is_reader:available($db),replication_state:(if available($db) then "healthy" else "unknown" end)}] +
               (if $global != null then
                 ($global.GlobalClusterMembers|map(select(.IsWriter==true))[0].DBClusterArn) as $primary_cluster |

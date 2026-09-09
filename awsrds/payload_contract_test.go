@@ -20,7 +20,6 @@ import (
 	"github.com/Releem/mysqlconfigurer/awsrds"
 	"github.com/Releem/mysqlconfigurer/config"
 	metricspkg "github.com/Releem/mysqlconfigurer/metrics"
-	mysqlmetrics "github.com/Releem/mysqlconfigurer/metrics/mysql"
 	"github.com/Releem/mysqlconfigurer/metrics/system"
 	"github.com/Releem/mysqlconfigurer/models"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -128,109 +127,6 @@ func TestAuroraPayloadContract(t *testing.T) {
 	}
 }
 
-func TestAuroraGlobalServerlessV2GoldenContract(t *testing.T) {
-	metrics := &models.Metrics{}
-	metrics.DB.Topology = mysqlmetrics.BuildTopologyFromFacts(mysqlmetrics.TopologyFacts{
-		Variables: map[string]interface{}{
-			"server_uuid":     "aurora-secondary-writer-engine-uuid",
-			"hostname":        "aurora-secondary-writer.db.example",
-			"port":            "3306",
-			"read_only":       "OFF",
-			"super_read_only": "OFF",
-		},
-	})
-	metadata := awsrds.Metadata{
-		Partition:                     "aws",
-		Region:                        "us-west-2",
-		DBInstanceIdentifier:          "inventory-secondary-writer",
-		DBInstanceResourceID:          "db-inventory-secondary-writer",
-		DBInstanceClass:               "db.serverless",
-		Endpoint:                      "aurora-secondary-writer.db.example",
-		EndpointPort:                  3306,
-		Engine:                        "aurora-mysql",
-		EngineMode:                    "provisioned",
-		DBClusterIdentifier:           "inventory-secondary",
-		DBClusterARN:                  "arn:aws:rds:us-west-2:fixture:cluster:inventory-secondary",
-		DBClusterResourceID:           "cluster-inventory-secondary",
-		DBClusterParameterGroup:       "inventory-secondary-cluster-pg",
-		DBClusterParameterGroupStatus: "in-sync",
-		ClusterEndpoint:               "aurora-secondary.cluster.example",
-		ClusterReaderEndpoint:         "aurora-secondary-ro.cluster.example",
-		ClusterMembers: []awsrds.ClusterMember{
-			{
-				DBInstanceIdentifier:          "inventory-secondary-writer",
-				DBInstanceResourceID:          "db-inventory-secondary-writer",
-				DBInstanceClass:               "db.serverless",
-				Endpoint:                      "aurora-secondary-writer.db.example",
-				EndpointPort:                  3306,
-				InstanceStatus:                "available",
-				IsClusterWriter:               true,
-				IsServerlessV2:                true,
-				PromotionTier:                 0,
-				DBClusterParameterGroupStatus: "in-sync",
-			},
-			{
-				DBInstanceIdentifier:          "inventory-secondary-reader",
-				DBInstanceResourceID:          "db-inventory-secondary-reader",
-				DBInstanceClass:               "db.serverless",
-				Endpoint:                      "aurora-secondary-reader.db.example",
-				EndpointPort:                  3306,
-				InstanceStatus:                "available",
-				IsServerlessV2:                true,
-				PromotionTier:                 1,
-				DBClusterParameterGroupStatus: "in-sync",
-			},
-		},
-		IsClusterWriter:                     true,
-		IsServerlessV2:                      true,
-		HasServerlessV2ScalingConfiguration: true,
-		ServerlessV2ScalingConfiguration: awsrds.ServerlessV2ScalingConfiguration{
-			MinCapacity:           0.5,
-			MaxCapacity:           16,
-			SecondsUntilAutoPause: 900,
-		},
-		PromotionTier:                    0,
-		InstanceStatus:                   "available",
-		GlobalClusterIdentifier:          "inventory-global",
-		GlobalClusterARN:                 "arn:aws:rds::fixture:global-cluster:inventory-global",
-		GlobalClusterResourceID:          "global-inventory",
-		GlobalClusterPrimaryDBClusterARN: "arn:aws:rds:us-east-1:fixture:cluster:inventory-primary",
-		GlobalClusterPrimaryRegion:       "us-east-1",
-		GlobalClusterMembers: []awsrds.GlobalClusterMember{
-			{
-				DBClusterIdentifier:         "inventory-primary",
-				DBClusterARN:                "arn:aws:rds:us-east-1:fixture:cluster:inventory-primary",
-				Region:                      "us-east-1",
-				IsWriter:                    true,
-				SynchronizationStatus:       "connected",
-				GlobalWriteForwardingStatus: "enabled",
-			},
-			{
-				DBClusterIdentifier:         "inventory-secondary",
-				DBClusterARN:                "arn:aws:rds:us-west-2:fixture:cluster:inventory-secondary",
-				Region:                      "us-west-2",
-				SynchronizationStatus:       "connected",
-				GlobalWriteForwardingStatus: "enabled",
-			},
-		},
-	}
-	awsrds.AttachReportMetadata(metrics, metadata, true)
-	logger := *logging.Init("aurora-global-golden-contract-test", false, false, io.Discard)
-	if err := awsrds.NewTopologyRelationsGatherer(logger).GetMetrics(metrics); err != nil {
-		t.Fatalf("build Aurora topology contract: %v", err)
-	}
-	assertGoldenRelationContract(t, metrics.DB.Topology, []goldenRelationIdentity{
-		{relationType: "aurora_cluster", groupKey: "aurora:cluster-inventory-secondary", memberKey: "db-inventory-secondary-writer"},
-		{relationType: "aurora_global_database", groupKey: "aurora-global:global-inventory", memberKey: "db-inventory-secondary-writer"},
-		{relationType: "standalone", groupKey: "aurora-secondary-writer-engine-uuid", memberKey: "aurora-secondary-writer-engine-uuid"},
-	})
-	payload := map[string]interface{}{
-		"DB": map[string]interface{}{"Topology": metrics.DB.Topology},
-	}
-	assertSecretFree(t, payload)
-	assertGoldenSemanticJSON(t, filepath.Join("testdata", "contracts", "aurora_global_serverless_v2.json"), payload)
-}
-
 func TestGoldenPayloadSafetyValidation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -312,7 +208,6 @@ func TestMetadataLogFieldsOmitSensitiveTopologyData(t *testing.T) {
 	fields := metadata.LogFields()
 	assertExactKeys(t, "Metadata.LogFields", fields, []string{
 		"topology_incomplete",
-		"cluster_member_count",
 		"db_cluster_identifier",
 		"db_cluster_parameter_group",
 		"db_cluster_parameter_group_status",
@@ -323,14 +218,11 @@ func TestMetadataLogFieldsOmitSensitiveTopologyData(t *testing.T) {
 		"engine",
 		"engine_mode",
 		"global_cluster_identifier",
-		"global_cluster_member_count",
-		"has_read_replica_source",
 		"instance_status",
 		"is_cluster_writer",
 		"is_serverless_v2",
 		"multi_az",
 		"partition",
-		"read_replica_count",
 		"region",
 		"serverless_v2_max_capacity",
 		"serverless_v2_min_capacity",

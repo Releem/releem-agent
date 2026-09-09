@@ -1,0 +1,73 @@
+{
+  "Version": 1,
+  "Target": {
+    "DBInstanceIdentifier": "global-primary-writer",
+    "DBInstanceArn": "arn:aws:rds:us-east-1:123456789012:db:global-primary-writer",
+    "DbiResourceId": "db-global-primary-writer",
+    "DBInstanceClass": "db.serverless",
+    "Engine": "aurora-mysql",
+    "DBInstanceStatus": "available",
+    "DBClusterIdentifier": "global-primary",
+    "Endpoint": "global-primary-writer.internal",
+    "Port": 3306,
+    "MultiAZ": null,
+    "ReadReplicaSourceDBInstanceIdentifier": "",
+    "ReadReplicaDBInstanceIdentifiers": []
+  },
+  "Cluster": {
+    "DBClusterParameterGroup": "global-primary-pg",
+    "ServerlessV2ScalingConfiguration": {
+      "MinCapacity": 0,
+      "MaxCapacity": 16,
+      "SecondsUntilAutoPause": 900
+    },
+    "DBClusterIdentifier": "global-primary",
+    "DBClusterArn": "arn:aws:rds:us-east-1:123456789012:cluster:global-primary",
+    "DbClusterResourceId": "cluster-global-primary-resource",
+    "Engine": "aurora-mysql",
+    "EngineMode": "provisioned",
+    "Endpoint": "global-primary.cluster.internal",
+    "ReaderEndpoint": "global-primary-ro.cluster.internal",
+    "GlobalClusterIdentifier": "",
+    "GlobalWriteForwardingStatus": "",
+    "DBClusterMembers": [
+      {
+        "DBInstanceIdentifier": "global-primary-writer",
+        "IsClusterWriter": true,
+        "PromotionTier": 0,
+        "DBClusterParameterGroupStatus": "in-sync"
+      },
+      {
+        "DBInstanceIdentifier": "global-primary-reader",
+        "IsClusterWriter": false,
+        "PromotionTier": 1,
+        "DBClusterParameterGroupStatus": "in-sync"
+      }
+    ]
+  },
+  "GlobalCluster": null,
+  "Instances": [
+    {
+      "DBInstanceIdentifier": "global-primary-reader",
+      "DBInstanceArn": "arn:aws:rds:us-east-1:123456789012:db:global-primary-reader",
+      "DbiResourceId": "db-global-primary-reader",
+      "DBInstanceClass": "db.r7g.large",
+      "Engine": "aurora-mysql",
+      "DBInstanceStatus": "available",
+      "DBClusterIdentifier": "global-primary",
+      "Endpoint": "global-primary-reader.internal",
+      "Port": 3306,
+      "MultiAZ": null,
+      "ReadReplicaSourceDBInstanceIdentifier": "",
+      "ReadReplicaDBInstanceIdentifiers": []
+    }
+  ],
+  "Sources": {
+    "Children": "unsupported",
+    "Cluster": "ok",
+    "GlobalCluster": "unsupported",
+    "Peers": "ok",
+    "Source": "unsupported",
+    "Target": "ok"
+  }
+}

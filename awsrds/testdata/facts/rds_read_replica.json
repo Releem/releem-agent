@@ -1,0 +1,61 @@
+{
+  "Version": 1,
+  "Target": {
+    "DBInstanceIdentifier": "orders-replica-1",
+    "DBInstanceArn": "arn:aws:rds:us-east-1:123456789012:db:orders-replica-1",
+    "DbiResourceId": "db-replica-1-resource",
+    "DBInstanceClass": "db.m7g.large",
+    "Engine": "mysql",
+    "DBInstanceStatus": "available",
+    "DBClusterIdentifier": "",
+    "Endpoint": "orders-replica-1.internal",
+    "Port": 3306,
+    "MultiAZ": null,
+    "ReadReplicaSourceDBInstanceIdentifier": "orders-primary",
+    "ReadReplicaDBInstanceIdentifiers": [
+      "orders-replica-2"
+    ]
+  },
+  "Cluster": null,
+  "GlobalCluster": null,
+  "Instances": [
+    {
+      "DBInstanceIdentifier": "orders-primary",
+      "DBInstanceArn": "arn:aws:rds:us-east-1:123456789012:db:orders-primary",
+      "DbiResourceId": "db-primary-resource",
+      "DBInstanceClass": "db.m7g.large",
+      "Engine": "mysql",
+      "DBInstanceStatus": "available",
+      "DBClusterIdentifier": "",
+      "Endpoint": "orders-primary.internal",
+      "Port": 3306,
+      "MultiAZ": true,
+      "ReadReplicaSourceDBInstanceIdentifier": "",
+      "ReadReplicaDBInstanceIdentifiers": [
+        "orders-replica-1"
+      ]
+    },
+    {
+      "DBInstanceIdentifier": "orders-replica-2",
+      "DBInstanceArn": "arn:aws:rds:us-east-1:123456789012:db:orders-replica-2",
+      "DbiResourceId": "db-replica-2-resource",
+      "DBInstanceClass": "db.m7g.large",
+      "Engine": "mysql",
+      "DBInstanceStatus": "available",
+      "DBClusterIdentifier": "",
+      "Endpoint": "orders-replica-2.internal",
+      "Port": 3306,
+      "MultiAZ": null,
+      "ReadReplicaSourceDBInstanceIdentifier": "orders-replica-1",
+      "ReadReplicaDBInstanceIdentifiers": []
+    }
+  ],
+  "Sources": {
+    "Children": "ok",
+    "Cluster": "unsupported",
+    "GlobalCluster": "unsupported",
+    "Peers": "unsupported",
+    "Source": "ok",
+    "Target": "ok"
+  }
+}
