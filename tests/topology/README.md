@@ -225,6 +225,12 @@ disabled, using the same `TOPOLOGY_MYSQL_*`, `TOPOLOGY_CLICKHOUSE_*`, and exact
 positive `TOPOLOGY_UID` contract documented above. Do not put credentials in
 arguments, checked-in files, retained logs, or shell history. The harness
 generates the database password in a mode-`0600` file under `/tmp`.
+Use the same AWS CLI executable for `aws login` and every harness command.
+Login credentials rotate every 15 minutes, and mixing CLI installations can
+leave the process unable to use the cached refresh grant. The harness
+serializes local AWS CLI calls, bounds regular calls with
+`AWS_TOPOLOGY_API_TIMEOUT_SECONDS` (180 seconds by default), and uses short
+`describe-*` polling calls so credential rotation can occur between polls.
 
 `run` creates this exact matrix and always invokes dependency-ordered cleanup
 on success, assertion failure, `EXIT`, `INT`, `TERM`, or `HUP` after mutation
@@ -245,6 +251,11 @@ default maximum is therefore five hours:
 | RDS MySQL Multi-AZ | `us-east-1`, one addressable instance and managed standby |
 
 Every database is storage-encrypted and has `PubliclyAccessible=false`.
+The encrypted cross-region Global Database secondary explicitly selects the
+regional AWS-managed RDS KMS key (`alias/aws/rds`), as required by RDS.
+Preflight records both the smallest common provisioned Aurora class and the
+smallest class that reports `SupportsGlobalDatabases=true` in both regions;
+only the latter is used for Global Database members.
 Every addressable DB instance uses a temporary RDS Enhanced Monitoring role at
 a one-second interval. Before Agent startup, the harness requires at least one
 event in the exact `RDSOSMetrics/<DBInstanceResourceID>` stream. The runner
@@ -277,7 +288,9 @@ may remain until cleanup. Generated credentials otherwise remain in local and
 runner-local mode-`0600` files and are deleted during cleanup. SSM commands
 contain only fixed object paths and resource names;
 API keys and database passwords are never command parameters or command
-output. SSM CloudWatch and S3 command output are disabled. Agent processes run
+output. Each runner first performs the same `agent -f` server registration as
+the production installers, then starts detached agents and verifies every PID
+is alive before bootstrap succeeds. SSM CloudWatch and S3 command output are disabled. Agent processes run
 inside their regional VPC while remaining external to the database hosts.
 
 ```bash
@@ -314,8 +327,11 @@ groups, snapshots, SSM local artifacts, and secret files. It polls both regions
 until the combined run inventory is empty. AWS retains completed SSM command
 history as an account audit record; the API has no delete operation for that
 record, but no command output or credentials are stored in it.
-AWS API calls during cleanup have short per-call timeouts and waiters consume
-only the remaining shared wait budget. Explicit absence classification accepts
+AWS API calls use 180-second per-call timeouts by default. Cleanup calls use a
+separate 120-second default, and deletion is
+polled with individual `describe-*` calls that consume only the remaining
+shared wait budget. Signal cleanup reuses an AWS CLI lock already held by the
+same shell, while separate shell processes remain serialized. Explicit absence classification accepts
 only standard operation-specific AWS CLI service-error envelopes and rejects
 ambiguous wrapper, proxy, timeout, or authorization text. S3 object deletion
 retries and their sleeps also stop at the shared cleanup deadline.

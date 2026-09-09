@@ -11,6 +11,9 @@ setup() {
     else
         export AWS_TOPOLOGY_POLL_SECONDS=0
     fi
+    if [[ "$BATS_TEST_DESCRIPTION" == "regular AWS API calls have a bounded timeout" ]]; then
+        export AWS_TOPOLOGY_API_TIMEOUT_SECONDS=1
+    fi
     source "$SCRIPT" help >/dev/null
 }
 
@@ -51,6 +54,75 @@ setup() {
     set +e
 
     [ "$(<"$marker")" = $'cleaned\ncontinued' ]
+}
+
+@test "AWS CLI calls are serialized across shell processes" {
+    fakebin="$TEST_TMPDIR/bin"
+    mkdir -p "$fakebin"
+    cat >"$fakebin/aws" <<'EOF'
+#!/usr/bin/env bash
+if ! mkdir "$AWS_FAKE_GUARD" 2>/dev/null; then
+    printf 'overlap\n' >>"$AWS_FAKE_OVERLAP"
+    exit 99
+fi
+sleep 0.2
+rmdir "$AWS_FAKE_GUARD"
+printf '{}\n'
+EOF
+    chmod +x "$fakebin/aws"
+    export PATH="$fakebin:$PATH"
+    export AWS_FAKE_GUARD="$TEST_TMPDIR/aws-active"
+    export AWS_FAKE_OVERLAP="$TEST_TMPDIR/aws-overlap"
+
+    first_status=0
+    second_status=0
+    aws_region us-east-1 sts get-caller-identity >/dev/null &
+    first_pid=$!
+    aws_region us-west-2 sts get-caller-identity >/dev/null &
+    second_pid=$!
+    wait "$first_pid" || first_status=$?
+    wait "$second_pid" || second_status=$?
+
+    [ "$first_status" -eq 0 ]
+    [ "$second_status" -eq 0 ]
+    [ ! -e "$AWS_FAKE_OVERLAP" ]
+}
+
+@test "AWS CLI lock is reentrant within the cleanup shell" {
+    inner_aws_call() { printf 'inner\n'; }
+    outer_aws_call() { with_aws_lock inner_aws_call; }
+
+    run timeout 2s bash -c '
+        export AWS_TOPOLOGY_RUN_ID="$1"
+        export AWS_TOPOLOGY_STATE_DIR="$2"
+        source "$3" help >/dev/null
+        inner_aws_call() { printf "inner\\n"; }
+        outer_aws_call() { with_aws_lock inner_aws_call; }
+        with_aws_lock outer_aws_call
+    ' _ "$AWS_TOPOLOGY_RUN_ID" "$AWS_TOPOLOGY_STATE_DIR" "$SCRIPT"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = inner ]
+}
+
+@test "regular AWS API calls have a bounded timeout" {
+    fakebin="$TEST_TMPDIR/bin"
+    mkdir -p "$fakebin"
+    cat >"$fakebin/aws" <<'EOF'
+#!/usr/bin/env bash
+sleep 5
+EOF
+    chmod +x "$fakebin/aws"
+    export PATH="$fakebin:$PATH"
+
+    run aws_region us-east-1 sts get-caller-identity
+
+    [ "$status" -eq 124 ]
+}
+
+@test "AWS API timeout defaults allow cold AssumeRole refresh" {
+    [ "$API_TIMEOUT_SECONDS" -eq 180 ]
+    [ "$CLEANUP_API_TIMEOUT_SECONDS" -eq 120 ]
 }
 
 @test "stop agents skips terminated runners during retry cleanup" {
@@ -325,6 +397,55 @@ EOF
     run select_smallest_common_orderable_class "$east_classes" "$west_classes"
     [ "$status" -eq 0 ]
     [ "$output" = 'db.t4g.medium' ]
+}
+
+@test "Global Database class selection requires support in both regions" {
+    east_classes="$TEST_TMPDIR/east-global-classes.json"
+    west_classes="$TEST_TMPDIR/west-global-classes.json"
+    printf '%s\n' '{"OrderableDBInstanceOptions":[{"DBInstanceClass":"db.t3.medium","SupportsGlobalDatabases":false},{"DBInstanceClass":"db.r6g.large","SupportsGlobalDatabases":true},{"DBInstanceClass":"db.r7g.large","SupportsGlobalDatabases":true}]}' >"$east_classes"
+    printf '%s\n' '{"OrderableDBInstanceOptions":[{"DBInstanceClass":"db.t3.medium","SupportsGlobalDatabases":false},{"DBInstanceClass":"db.r6g.large","SupportsGlobalDatabases":true},{"DBInstanceClass":"db.r7g.large","SupportsGlobalDatabases":false}]}' >"$west_classes"
+
+    run select_smallest_common_global_orderable_class "$east_classes" "$west_classes"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = 'db.r6g.large' ]
+}
+
+@test "encrypted cross-region Global Database secondary uses an explicit regional KMS key" {
+    captured="$TEST_TMPDIR/create-global-secondary.json"
+    ENGINE_VERSION=8.0.mysql_aurora.3.10.0
+    DB_USER=releem
+    DB_PASSWORD=test-password
+    MIN_ACU=0.5
+    cluster_exists() { return 1; }
+    wait_cluster_available() { :; }
+    arm_cleanup() { :; }
+    aws_region() {
+        local region="$1"
+        shift
+        if [[ "$*" == *"rds create-db-cluster"* ]]; then
+            local argument previous=""
+            for argument in "$@"; do
+                if [[ "$previous" == "--cli-input-json" ]]; then
+                    cp "${argument#file://}" "$captured"
+                    return
+                fi
+                previous="$argument"
+            done
+        fi
+    }
+
+    run ensure_cluster us-west-2 global-west subnet-group sg-one cluster-pg false global-one
+
+    [ "$status" -eq 0 ]
+    run jq -e '
+      .StorageEncrypted == true and .KmsKeyId == "alias/aws/rds" and
+      .GlobalClusterIdentifier == "global-one" and
+      (has("MasterUsername") | not) and
+      (has("MasterUserPassword") | not) and
+      (has("DatabaseName") | not)
+    ' "$captured"
+    [ "$status" -eq 0 ]
 }
 
 @test "ownership assertion rejects a matching name with foreign tags" {
@@ -861,6 +982,101 @@ EOF
     [ "$CLEANUP_DEADLINE_EPOCH" -eq "$expired_epoch" ]
 }
 
+@test "cleanup deletion polling uses short describe calls instead of service waiters" {
+    calls="$TEST_TMPDIR/cleanup-describe-calls"
+    attempts="$TEST_TMPDIR/cleanup-describe-attempts"
+    printf '0\n' >"$attempts"
+    CLEANUP_DEADLINE_EPOCH=$(( $(date +%s) + CLEANUP_DELETE_RESERVE_SECONDS + 60 ))
+    cleanup_aws_region() {
+        printf '%s\n' "$*" >>"$calls"
+        count="$(cat "$attempts")"
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$attempts"
+        if [ "$count" -eq 1 ]; then
+            printf '%s\n' '{"DBInstances":[{"DBInstanceStatus":"deleting"}]}'
+            return 0
+        fi
+        printf '%s\n' 'aws: [ERROR]: An error occurred (DBInstanceNotFound) when calling the DescribeDBInstances operation: DB instance not found' >&2
+        return 254
+    }
+
+    run cleanup_wait_until "database deletion" cleanup_db_instance_absent us-east-1 db-one
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$attempts")" -eq 2 ]
+    run grep -c 'rds describe-db-instances' "$calls"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 2 ]
+    run grep -c 'rds wait' "$calls"
+    [ "$status" -eq 1 ]
+}
+
+@test "availability polling uses short describe calls instead of service waiters" {
+    calls="$TEST_TMPDIR/availability-describe-calls"
+    attempts="$TEST_TMPDIR/availability-describe-attempts"
+    printf '0\n' >"$attempts"
+    aws_region() {
+        printf '%s\n' "$*" >>"$calls"
+        count="$(cat "$attempts")"
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$attempts"
+        if [ "$count" -eq 1 ]; then
+            printf '%s\n' '{"DBInstances":[{"DBInstanceStatus":"creating"}]}'
+        else
+            printf '%s\n' '{"DBInstances":[{"DBInstanceStatus":"available"}]}'
+        fi
+    }
+
+    run wait_instance_available us-east-1 db-one
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$attempts")" -eq 2 ]
+    run grep -c 'rds describe-db-instances' "$calls"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 2 ]
+    run grep -c 'rds wait' "$calls"
+    [ "$status" -eq 1 ]
+}
+
+@test "runner readiness uses short describe calls instead of EC2 waiters" {
+    calls="$TEST_TMPDIR/runner-readiness-calls"
+    state_attempts="$TEST_TMPDIR/runner-state-attempts"
+    status_attempts="$TEST_TMPDIR/runner-status-attempts"
+    printf '0\n' >"$state_attempts"
+    printf '0\n' >"$status_attempts"
+    RUNNER_PROFILE=runner-profile
+    ensure_runner_security_group() { printf 'sg-runner\n'; }
+    runner_ssm_online() { return 0; }
+    aws_region() {
+        printf '%s\n' "$*" >>"$calls"
+        case "$*" in
+            *ec2\ describe-instances*--filters*)
+                printf '%s\n' '{"Reservations":[{"Instances":[{"InstanceId":"i-runner"}]}]}'
+                ;;
+            *ec2\ describe-instances*--instance-ids*)
+                count="$(cat "$state_attempts")"; count=$((count + 1)); printf '%s\n' "$count" >"$state_attempts"
+                if [ "$count" -eq 1 ]; then state=pending; else state=running; fi
+                printf '{"Reservations":[{"Instances":[{"State":{"Name":"%s"}}]}]}\n' "$state"
+                ;;
+            *ec2\ describe-instance-status*)
+                count="$(cat "$status_attempts")"; count=$((count + 1)); printf '%s\n' "$count" >"$status_attempts"
+                if [ "$count" -eq 1 ]; then instance=initializing; system=initializing; else instance=ok; system=ok; fi
+                printf '{"InstanceStatuses":[{"InstanceStatus":{"Status":"%s"},"SystemStatus":{"Status":"%s"}}]}\n' "$instance" "$system"
+                ;;
+            *) return 1 ;;
+        esac
+    }
+
+    run ensure_runner us-east-1 vpc-one subnet-one,subnet-two east ami-one
+
+    [ "$status" -eq 0 ]
+    [ "$output" = 'i-runner|sg-runner' ]
+    [ "$(cat "$state_attempts")" -eq 2 ]
+    [ "$(cat "$status_attempts")" -eq 2 ]
+    run grep -c 'ec2 wait' "$calls"
+    [ "$status" -eq 1 ]
+}
+
 @test "cleanup deadline must leave bounded deletion reserve" {
     run validate_cleanup_deadline 10
     [ "$status" -ne 0 ]
@@ -941,6 +1157,21 @@ EOF
     [ "$status" -ne 0 ]
 }
 
+@test "inventory capture fails atomically when support inventory is unavailable" {
+    target="$TEST_TMPDIR/inventory.json"
+    printf '%s\n' '{"sentinel":true}' >"$target"
+    inventory_region() { printf '%s\n' '{"instances":[],"clusters":[],"global_clusters":[],"parameter_groups":[],"security_groups":[],"subnet_groups":[],"snapshots":[]}' >"$2"; }
+    inventory_global_clusters() { printf '%s\n' '[]' >"$1"; }
+    inventory_support_resources() { return 1; }
+
+    run capture_inventory "$target"
+
+    [ "$status" -ne 0 ]
+    [ "$output" = '' ]
+    run jq -e '.sentinel == true' "$target"
+    [ "$status" -eq 0 ]
+}
+
 @test "terminal absence fails closed when AWS inventory reads fail" {
     mkdir -p "$(state_dir)"
     printf '%s\t%s\n' us-east-1 db-RESOURCE >"$(state_dir)/monitoring-streams.tsv"
@@ -1009,6 +1240,16 @@ EOF
     [[ "$output" != *'RELEEM_API_KEY'* ]]
     [[ "$output" != *'mysql_password'* ]]
     [[ "$output" != *'DB_PASSWORD'* ]]
+}
+
+@test "SSM bootstrap registers servers before starting detached monitored agents" {
+    run runner_ssm_commands us-east-1 bucket prefix/east
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'agent -f -config "$config"'* ]]
+    [[ "$output" == *'nohup /tmp/releem-topology/agent -config "$config" </dev/null'* ]]
+    [[ "$output" == *'agent-pids'* ]]
+    [[ "$output" == *'kill -0 "$pid"'* ]]
 }
 
 @test "all DB instance create arguments enable Enhanced Monitoring" {
@@ -1248,9 +1489,10 @@ EOF
 
 @test "preflight cost shape records selected compute storage monitoring and runtime ceilings" {
     summary="$TEST_TMPDIR/summary.json"
-    write_preflight_summary "$summary" 8.0.mysql_aurora.3.10.0 db.t4g.medium 0.5 8.0.43 db.t3.micro
+    write_preflight_summary "$summary" 8.0.mysql_aurora.3.10.0 db.t4g.medium db.r6g.large 0.5 8.0.43 db.t3.micro
 
     run jq -e '
+      .provisioned_instance_class=="db.t4g.medium" and .global_instance_class=="db.r6g.large" and
       .serverless_v2=={instances:3,min_acu:0.5,configured_max_acu:1.5,transition_max_acu:2.5,load_attempts_max:3} and
       .ordinary_mysql.instances==3 and .ordinary_mysql.engine_version=="8.0.43" and
       .ordinary_mysql.instance_class=="db.t3.micro" and .ordinary_mysql.allocated_storage_gib_each==20 and

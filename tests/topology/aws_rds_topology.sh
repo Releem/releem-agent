@@ -14,7 +14,8 @@ readonly PERSISTENCE_TIMEOUT_SECONDS="${TOPOLOGY_PERSISTENCE_TIMEOUT_SECONDS:-60
 readonly CLICKHOUSE_MARKER_WINDOW_SECONDS="${TOPOLOGY_CLICKHOUSE_MARKER_WINDOW_SECONDS:-900}"
 readonly RUNTIME_DEADLINE_SECONDS="${AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS:-14400}"
 readonly CLEANUP_DEADLINE_SECONDS="${AWS_TOPOLOGY_CLEANUP_DEADLINE_SECONDS:-3600}"
-readonly CLEANUP_API_TIMEOUT_SECONDS="${AWS_TOPOLOGY_CLEANUP_API_TIMEOUT_SECONDS:-5}"
+readonly API_TIMEOUT_SECONDS="${AWS_TOPOLOGY_API_TIMEOUT_SECONDS:-180}"
+readonly CLEANUP_API_TIMEOUT_SECONDS="${AWS_TOPOLOGY_CLEANUP_API_TIMEOUT_SECONDS:-120}"
 readonly CLEANUP_DELETE_RESERVE_SECONDS="${AWS_TOPOLOGY_CLEANUP_DELETE_RESERVE_SECONDS:-600}"
 
 CLEANUP_ARMED=false
@@ -27,6 +28,7 @@ PENDING_SIGNAL_STATUS=0
 RUN_DEADLINE_EPOCH=0
 CLEANUP_DEADLINE_EPOCH=0
 CLEANUP_BUDGET_EXHAUSTED=false
+AWS_LOCK_HELD=false
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
@@ -81,6 +83,36 @@ state_dir() { printf '%s/%s\n' "$STATE_ROOT" "$(run_id)"; }
 evidence_dir() { printf '%s/%s\n' "$EVIDENCE_ROOT" "$(run_id)"; }
 selection_file() { printf '%s/selection.env\n' "$(state_dir)"; }
 secret_file() { printf '%s/runtime-secret.env\n' "$(state_dir)"; }
+aws_lock_file() { printf '%s/aws-cli.lock\n' "$(state_dir)"; }
+
+with_aws_lock() {
+    local lock_file lock_fd status=0
+    if "$AWS_LOCK_HELD"; then
+        "$@"
+        return
+    fi
+    lock_file="$(aws_lock_file)"
+    mkdir -p "$(dirname "$lock_file")"
+    chmod 700 "$(dirname "$lock_file")"
+    exec {lock_fd}>"$lock_file"
+    flock "$lock_fd"
+    AWS_LOCK_HELD=true
+    "$@" || status=$?
+    AWS_LOCK_HELD=false
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    return "$status"
+}
+
+run_aws_api() {
+    local timeout_seconds="$1"
+    shift
+    if declare -F aws >/dev/null; then
+        aws "$@"
+        return
+    fi
+    timeout --foreground --kill-after=5s "${timeout_seconds}s" aws "$@"
+}
 
 aws_region() {
     local region="$1"
@@ -89,7 +121,7 @@ aws_region() {
         cleanup_aws_region "$region" "$@"
         return
     fi
-    aws --no-cli-pager --region "$region" "$@"
+    with_aws_lock run_aws_api "$API_TIMEOUT_SECONDS" --no-cli-pager --region "$region" "$@"
 }
 
 aws_global() {
@@ -97,7 +129,7 @@ aws_global() {
         cleanup_aws "$@"
         return
     fi
-    aws "$@"
+    with_aws_lock run_aws_api "$API_TIMEOUT_SECONDS" "$@"
 }
 
 classify_s3_head_result() {
@@ -199,6 +231,20 @@ select_smallest_common_orderable_class() {
     ' "$1" "$2"
 }
 
+select_smallest_common_global_orderable_class() {
+    jq -ser '
+      def size_rank:
+        if . == "micro" then 0 elif . == "small" then 1 elif . == "medium" then 2
+        elif . == "large" then 3 elif . == "xlarge" then 4
+        elif test("^[0-9]+xlarge$") then (capture("^(?<n>[0-9]+)xlarge$").n|tonumber)+4
+        else 1000 end;
+      ([.[0].OrderableDBInstanceOptions[]|select(.SupportsGlobalDatabases == true)|.DBInstanceClass]|unique) as $east |
+      ([.[1].OrderableDBInstanceOptions[]|select(.SupportsGlobalDatabases == true)|.DBInstanceClass]|unique) as $west |
+      [$east[]|select(. as $c|($west|index($c)) != null)|. as $class|
+       {class:$class,size:($class|split(".")[-1]|size_rank)}] | sort_by(.size,.class)|first|.class
+    ' "$1" "$2"
+}
+
 select_min_serverless_acu() {
     local file="$1" version="$2"
     jq -er --arg version "$version" '
@@ -283,21 +329,50 @@ cleanup_aws_region() {
     shift
     remaining="$(cleanup_remaining_seconds)" || return 124
     timeout_seconds="$CLEANUP_API_TIMEOUT_SECONDS"; ((timeout_seconds <= remaining)) || timeout_seconds="$remaining"
-    timeout --foreground --kill-after=5s "${timeout_seconds}s" aws --no-cli-pager --region "$region" "$@"
-}
-
-cleanup_aws_wait_region() {
-    local region="$1" remaining
-    shift
-    remaining="$(cleanup_wait_remaining_seconds)" || return 1
-    timeout --foreground --kill-after=5s "${remaining}s" aws --no-cli-pager --region "$region" "$@"
+    with_aws_lock timeout --foreground --kill-after=5s "${timeout_seconds}s" aws --no-cli-pager --region "$region" "$@"
 }
 
 cleanup_aws() {
     local remaining timeout_seconds
     remaining="$(cleanup_remaining_seconds)" || return 124
     timeout_seconds="$CLEANUP_API_TIMEOUT_SECONDS"; ((timeout_seconds <= remaining)) || timeout_seconds="$remaining"
-    timeout --foreground --kill-after=5s "${timeout_seconds}s" aws --no-cli-pager "$@"
+    with_aws_lock timeout --foreground --kill-after=5s "${timeout_seconds}s" aws --no-cli-pager "$@"
+}
+
+cleanup_db_instance_absent() {
+    local region="$1" identifier="$2" response status=0
+    response="$(cleanup_aws_region "$region" rds describe-db-instances \
+        --db-instance-identifier "$identifier" --output json 2>&1)" || status=$?
+    if ((status == 0)); then return 1; fi
+    if ((status == 254)) && grep -Eq '^(aws: \[ERROR\]: )?An error occurred \(DBInstanceNotFound(Fault)?\) when calling the DescribeDBInstances operation: [^[:space:]].*$' <<<"$response"; then
+        return 0
+    fi
+    return 2
+}
+
+cleanup_db_cluster_absent() {
+    local region="$1" identifier="$2" response status=0
+    response="$(cleanup_aws_region "$region" rds describe-db-clusters \
+        --db-cluster-identifier "$identifier" --output json 2>&1)" || status=$?
+    if ((status == 0)); then return 1; fi
+    if ((status == 254)) && grep -Eq '^(aws: \[ERROR\]: )?An error occurred \(DBClusterNotFound(Fault)?\) when calling the DescribeDBClusters operation: [^[:space:]].*$' <<<"$response"; then
+        return 0
+    fi
+    return 2
+}
+
+cleanup_runner_absent() {
+    local region="$1" identifier="$2" response status=0 state
+    response="$(cleanup_aws_region "$region" ec2 describe-instances --instance-ids "$identifier" --output json 2>&1)" || status=$?
+    if ((status == 0)); then
+        state="$(jq -r '.Reservations[0].Instances[0].State.Name // "absent"' <<<"$response")" || return 2
+        [[ "$state" == terminated || "$state" == absent ]] && return 0
+        return 1
+    fi
+    if ((status == 254)) && grep -Eq '^(aws: \[ERROR\]: )?An error occurred \(InvalidInstanceID[.]NotFound\) when calling the DescribeInstances operation: [^[:space:]].*$' <<<"$response"; then
+        return 0
+    fi
+    return 2
 }
 
 run_cleanup_steps() {
@@ -514,7 +589,17 @@ chmod 0700 /tmp/releem-topology/agent
 tar -xf /tmp/releem-topology/configs.tar -C /tmp/releem-topology
 find /tmp/releem-topology -name '*.conf' -exec chmod 0600 {} \;
 chmod 0600 /tmp/releem-topology/mysql.cnf
-for config in /tmp/releem-topology/configs/*.conf; do /tmp/releem-topology/agent -config \"\$config\" >>/tmp/releem-topology/agent.log 2>&1 & done
+for config in /tmp/releem-topology/configs/*.conf; do
+    /tmp/releem-topology/agent -f -config "\$config" >>/tmp/releem-topology/agent.log 2>&1
+done
+sleep 30
+: >/tmp/releem-topology/agent-pids
+for config in /tmp/releem-topology/configs/*.conf; do
+    nohup /tmp/releem-topology/agent -config "\$config" </dev/null >>/tmp/releem-topology/agent.log 2>&1 &
+    printf '%s\n' "\$!" >>/tmp/releem-topology/agent-pids
+done
+sleep 5
+while IFS= read -r pid; do kill -0 "\$pid"; done </tmp/releem-topology/agent-pids
 EOF
 }
 
@@ -1115,40 +1200,44 @@ verify_destroy_ownership() {
 }
 
 capture_inventory() {
-    local target="$1" dir east west globals support base
+    local target="$1" dir east west globals support base temporary
     dir="$(dirname "$target")/inventory-work"
     mkdir -p "$dir"
     east="$dir/east.json"; west="$dir/west.json"; globals="$dir/global.json"
-    inventory_region "$PRIMARY_REGION" "$east"
-    inventory_region "$SECONDARY_REGION" "$west"
-    inventory_global_clusters "$globals"
+    inventory_region "$PRIMARY_REGION" "$east" || return 1
+    inventory_region "$SECONDARY_REGION" "$west" || return 1
+    inventory_global_clusters "$globals" || return 1
     base="$dir/base.json"; support="$dir/support.json"
-    combine_inventory "$east" "$west" "$globals" "$base"
-    inventory_support_resources "$support"
-    jq -s '.[0] * .[1]' "$base" "$support" >"$target"
-    chmod 600 "$target"
+    combine_inventory "$east" "$west" "$globals" "$base" || return 1
+    inventory_support_resources "$support" || return 1
+    temporary="${target}.new"
+    rm -f "$temporary"
+    jq -s '.[0] * .[1]' "$base" "$support" >"$temporary" || { rm -f "$temporary"; return 1; }
+    chmod 600 "$temporary"
+    mv "$temporary" "$target"
 }
 
 write_selection_state() {
-    local engine="$1" class="$2" acu="$3" family="$4" mysql_version="$5" mysql_class="$6" mysql_family="$7" east_ami="$8" west_ami="$9" file
+    local engine="$1" class="$2" global_class="$3" acu="$4" family="$5" mysql_version="$6" mysql_class="$7" mysql_family="$8" east_ami="$9" west_ami="${10}" file
     file="$(selection_file)"
     mkdir -p "$(dirname "$file")"
-    printf 'ENGINE_VERSION=%q\nINSTANCE_CLASS=%q\nMIN_ACU=%q\nENGINE_FAMILY=%q\nMYSQL_ENGINE_VERSION=%q\nMYSQL_INSTANCE_CLASS=%q\nMYSQL_ENGINE_FAMILY=%q\nEAST_RUNNER_AMI=%q\nWEST_RUNNER_AMI=%q\n' \
-        "$engine" "$class" "$acu" "$family" "$mysql_version" "$mysql_class" "$mysql_family" "$east_ami" "$west_ami" >"$file"
+    printf 'ENGINE_VERSION=%q\nINSTANCE_CLASS=%q\nGLOBAL_INSTANCE_CLASS=%q\nMIN_ACU=%q\nENGINE_FAMILY=%q\nMYSQL_ENGINE_VERSION=%q\nMYSQL_INSTANCE_CLASS=%q\nMYSQL_ENGINE_FAMILY=%q\nEAST_RUNNER_AMI=%q\nWEST_RUNNER_AMI=%q\n' \
+        "$engine" "$class" "$global_class" "$acu" "$family" "$mysql_version" "$mysql_class" "$mysql_family" "$east_ami" "$west_ami" >"$file"
     chmod 600 "$file"
 }
 
 write_preflight_summary() {
-    local out="$1" engine="$2" class="$3" acu="$4" mysql_version="$5" mysql_class="$6" initial_max transition_max
+    local out="$1" engine="$2" class="$3" global_class="$4" acu="$5" mysql_version="$6" mysql_class="$7" initial_max transition_max
     initial_max="$(awk -v a="$acu" 'BEGIN{print a+1}')"
     transition_max="$(awk -v a="$acu" 'BEGIN{print a+2}')"
-    jq -n --arg captured_at "$(date -u +%FT%TZ)" --arg engine "$engine" --arg class "$class" \
+    jq -n --arg captured_at "$(date -u +%FT%TZ)" --arg engine "$engine" --arg class "$class" --arg global_class "$global_class" \
         --arg mysql_version "$mysql_version" --arg mysql_class "$mysql_class" --argjson min_acu "$acu" \
         --argjson initial_max "$initial_max" --argjson transition_max "$transition_max" \
         --argjson runtime_deadline_seconds "$RUNTIME_DEADLINE_SECONDS" --argjson cleanup_deadline_seconds "$CLEANUP_DEADLINE_SECONDS" \
         --argjson cleanup_delete_reserve_seconds "$CLEANUP_DELETE_RESERVE_SECONDS" '
       {captured_at:$captured_at,regions:["us-east-1","us-west-2"],aurora_engine_version:$engine,
-       provisioned_instance_class:$class,serverless_v2:{instances:3,min_acu:$min_acu,
+       provisioned_instance_class:$class,global_instance_class:$global_class,
+       serverless_v2:{instances:3,min_acu:$min_acu,
          configured_max_acu:$initial_max,transition_max_acu:$transition_max,load_attempts_max:3},
        ordinary_mysql:{instances:3,engine_version:$mysql_version,instance_class:$mysql_class,
          allocated_storage_gib_each:20,allocated_storage_gib_total:60,storage_type:"gp3"},
@@ -1172,6 +1261,7 @@ load_selection_state() {
     source "$file"
     [[ "$ENGINE_VERSION" =~ ^8[.]0[.]mysql_aurora[.]3[.][0-9]+[.][0-9]+$ ]] || die "invalid stored engine version"
     [[ "$INSTANCE_CLASS" =~ ^db[.][a-z0-9]+[.][a-z0-9]+$ ]] || die "invalid stored instance class"
+    [[ "$GLOBAL_INSTANCE_CLASS" =~ ^db[.][a-z0-9]+[.][a-z0-9]+$ ]] || die "invalid stored Global Database instance class"
     [[ "$MIN_ACU" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid stored minimum ACU"
     [[ "$ENGINE_FAMILY" =~ ^aurora-mysql[0-9]+[.][0-9]+$ ]] || die "invalid stored engine family"
     [[ "$MYSQL_ENGINE_VERSION" =~ ^8[.][0-9]+[.][0-9]+$ ]] || die "invalid stored MySQL engine version"
@@ -1185,9 +1275,10 @@ preflight() {
     validate_runtime_deadline "$RUNTIME_DEADLINE_SECONDS"
     validate_cleanup_deadline "$CLEANUP_DEADLINE_SECONDS"
     require_command aws
+    require_command flock
     require_command jq
     require_command sha256sum
-    local out versions versions_west classes classes_west mysql_versions mysql_classes engine class acu family mysql_version mysql_class mysql_family east_ami west_ami pre east_network west_network collisions quota_headroom
+    local out versions versions_west classes classes_west mysql_versions mysql_classes engine class global_class acu family mysql_version mysql_class mysql_family east_ami west_ami pre east_network west_network collisions quota_headroom
     out="$(evidence_dir)/preflight"
     mkdir -p "$(state_dir)" "$out"
     chmod 700 "$(state_dir)" "$out"
@@ -1205,6 +1296,7 @@ preflight() {
     aws_region "$SECONDARY_REGION" rds describe-orderable-db-instance-options \
         --engine aurora-mysql --engine-version "$engine" --output json >"$classes_west"
     class="$(select_smallest_common_orderable_class "$classes" "$classes_west")"
+    global_class="$(select_smallest_common_global_orderable_class "$classes" "$classes_west")"
     acu="$(jq -ser --arg version "$engine" '[.[]|.DBEngineVersions[]|select(.EngineVersion==$version)|.ServerlessV2FeaturesSupport.MinCapacity]|max' "$versions" "$versions_west")"
     family="$(jq -er --arg version "$engine" '.DBEngineVersions[]|select(.EngineVersion==$version)|.DBParameterGroupFamily' "$versions")"
     mysql_versions="$out/mysql-engine-versions.json"
@@ -1216,7 +1308,7 @@ preflight() {
     mysql_class="$(select_smallest_orderable_class "$mysql_classes")"
     east_ami="$(aws_region "$PRIMARY_REGION" ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)"
     west_ami="$(aws_region "$SECONDARY_REGION" ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)"
-    write_selection_state "$engine" "$class" "$acu" "$family" "$mysql_version" "$mysql_class" "$mysql_family" "$east_ami" "$west_ami"
+    write_selection_state "$engine" "$class" "$global_class" "$acu" "$family" "$mysql_version" "$mysql_class" "$mysql_family" "$east_ami" "$west_ami"
 
     aws_region "$PRIMARY_REGION" service-quotas list-service-quotas --service-code rds --output json >"$out/quotas-east.json"
     aws_region "$SECONDARY_REGION" service-quotas list-service-quotas --service-code rds --output json >"$out/quotas-west.json"
@@ -1240,7 +1332,7 @@ preflight() {
     pre="$out/inventory-before.json"
     capture_inventory "$pre"
     assert_inventory_empty "$pre"
-    write_preflight_summary "$out/summary.json" "$engine" "$class" "$acu" "$mysql_version" "$mysql_class"
+    write_preflight_summary "$out/summary.json" "$engine" "$class" "$global_class" "$acu" "$mysql_version" "$mysql_class"
     chmod 600 "$out"/*.json
     log "preflight evidence: $out/summary.json"
 }
@@ -1281,7 +1373,7 @@ iam_tags() {
 
 role_owned() {
     local role="$1"
-    aws iam list-role-tags --role-name "$role" --output json |
+    aws_global iam list-role-tags --role-name "$role" --output json |
         jq -e --arg run "$(run_id)" --arg run_key "$TAG_RUN_KEY" --arg managed_key "$TAG_MANAGED_KEY" '
           (.Tags|map({key:.Key,value:.Value})|from_entries) as $t |
           $t[$run_key]==$run and $t[$managed_key]=="true"' >/dev/null
@@ -1295,7 +1387,7 @@ ensure_iam_role() {
     if [[ "$state" == present ]]; then
         role_owned "$role" || die "IAM role name collision without exact ownership"
     else
-        aws iam create-role --role-name "$role" --path /releem-topology/ \
+        aws_global iam create-role --role-name "$role" --path /releem-topology/ \
             --assume-role-policy-document "file://${trust_file}" \
             --tags "$(iam_tags | head -n1)" "$(iam_tags | tail -n1)" >/dev/null
         arm_cleanup
@@ -1313,8 +1405,8 @@ ensure_support_resources() {
     trust_file="$(state_dir)/trust.json"
     ensure_iam_role "$runner_role" ec2.amazonaws.com "$trust_file"
     ensure_iam_role "$monitor_role" monitoring.rds.amazonaws.com "$trust_file"
-    aws iam attach-role-policy --role-name "$runner_role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null
-    aws iam attach-role-policy --role-name "$monitor_role" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole >/dev/null
+    aws_global iam attach-role-policy --role-name "$runner_role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null
+    aws_global iam attach-role-policy --role-name "$monitor_role" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole >/dev/null
     sleep 10
 
     bucket_state="$(s3_bucket_presence "$bucket")"
@@ -1343,18 +1435,18 @@ ensure_support_resources() {
     runner_policy="$(state_dir)/runner-policy.json"
     runner_policy_document "arn:aws:s3:::${bucket}/$(run_id)/*" >"$runner_policy"
     assert_runner_policy "$runner_policy"
-    aws iam put-role-policy --role-name "$runner_role" --policy-name ReleemTopologyRunnerRead \
+    aws_global iam put-role-policy --role-name "$runner_role" --policy-name ReleemTopologyRunnerRead \
         --policy-document "file://${runner_policy}" >/dev/null
     local profile_state
     profile_state="$(iam_entity_presence profile "$runner_profile")" || die "IAM instance profile presence is ambiguous"
     if [[ "$profile_state" == absent ]]; then
-        aws iam create-instance-profile --instance-profile-name "$runner_profile" \
+        aws_global iam create-instance-profile --instance-profile-name "$runner_profile" \
             --tags "$(iam_tags | head -n1)" "$(iam_tags | tail -n1)" >/dev/null
         arm_cleanup
-        aws iam add-role-to-instance-profile --instance-profile-name "$runner_profile" --role-name "$runner_role"
+        aws_global iam add-role-to-instance-profile --instance-profile-name "$runner_profile" --role-name "$runner_role"
         sleep 10
     fi
-    MONITORING_ROLE_ARN="$(aws iam get-role --role-name "$monitor_role" --query Role.Arn --output text)"
+    MONITORING_ROLE_ARN="$(aws_global iam get-role --role-name "$monitor_role" --query Role.Arn --output text)"
     {
         printf 'ACCOUNT_ID=%q\nS3_BUCKET=%q\nRUNNER_ROLE=%q\nRUNNER_PROFILE=%q\nMONITORING_ROLE=%q\nMONITORING_ROLE_ARN=%q\n' \
             "$account" "$bucket" "$runner_role" "$runner_profile" "$monitor_role" "$MONITORING_ROLE_ARN"
@@ -1450,10 +1542,30 @@ ensure_runner() {
         instance="$(aws_region "$region" ec2 run-instances --cli-input-json "file://${spec}" --query 'Instances[0].InstanceId' --output text)"
         arm_cleanup
     fi
-    aws_region "$region" ec2 wait instance-running --instance-ids "$instance"
-    aws_region "$region" ec2 wait instance-status-ok --instance-ids "$instance"
+    wait_until "runner instance running" runner_instance_running "$region" "$instance"
+    wait_until "runner instance status ok" runner_instance_status_ok "$region" "$instance"
     wait_until "runner SSM registration" runner_ssm_online "$region" "$instance"
     printf '%s|%s\n' "$instance" "$sg"
+}
+
+runner_instance_running() {
+    local response state
+    response="$(aws_region "$1" ec2 describe-instances --instance-ids "$2" --output json 2>/dev/null)" || return 2
+    state="$(jq -er '.Reservations[0].Instances[0].State.Name' <<<"$response")" || return 2
+    [[ "$state" == running ]] && return 0
+    [[ "$state" == terminated || "$state" == shutting-down ]] && return 2
+    return 1
+}
+
+runner_instance_status_ok() {
+    local response
+    response="$(aws_region "$1" ec2 describe-instance-status --instance-ids "$2" \
+        --include-all-instances --output json 2>/dev/null)" || return 2
+    jq -e '
+      .InstanceStatuses | length == 1 and
+      .[0].InstanceStatus.Status == "ok" and
+      .[0].SystemStatus.Status == "ok"
+    ' <<<"$response" >/dev/null
 }
 
 runner_ssm_online() {
@@ -1491,12 +1603,30 @@ instance_exists() { aws_region "$1" rds describe-db-instances --db-instance-iden
 cluster_exists() { aws_region "$1" rds describe-db-clusters --db-cluster-identifier "$2" >/dev/null 2>&1; }
 global_exists() { aws_region "$PRIMARY_REGION" rds describe-global-clusters --global-cluster-identifier "$1" >/dev/null 2>&1; }
 
+db_instance_available() {
+    local response state
+    response="$(aws_region "$1" rds describe-db-instances --db-instance-identifier "$2" --output json 2>/dev/null)" || return 2
+    state="$(jq -er '.DBInstances[0].DBInstanceStatus' <<<"$response")" || return 2
+    [[ "$state" == available ]] && return 0
+    [[ "$state" =~ ^(failed|incompatible-.+|inaccessible-encryption-credentials|storage-full|deleting)$ ]] && return 2
+    return 1
+}
+
+db_cluster_available() {
+    local response state
+    response="$(aws_region "$1" rds describe-db-clusters --db-cluster-identifier "$2" --output json 2>/dev/null)" || return 2
+    state="$(jq -er '.DBClusters[0].Status' <<<"$response")" || return 2
+    [[ "$state" == available ]] && return 0
+    [[ "$state" =~ ^(failed|inaccessible-encryption-credentials|deleting)$ ]] && return 2
+    return 1
+}
+
 wait_instance_available() {
-    aws_region "$1" rds wait db-instance-available --db-instance-identifier "$2"
+    wait_until "database instance availability $1/$2" db_instance_available "$1" "$2"
 }
 
 wait_cluster_available() {
-    aws_region "$1" rds wait db-cluster-available --db-cluster-identifier "$2"
+    wait_until "database cluster availability $1/$2" db_cluster_available "$1" "$2"
 }
 
 create_network_resources() {
@@ -1591,7 +1721,8 @@ ensure_cluster() {
     if ! cluster_exists "$region" "$identifier"; then
         file="$(cluster_input_file "$region" "$identifier" "$subnet_group" "$sg" "$cluster_pg" "$serverless")"
         if [[ -n "$global_id" ]]; then
-            jq 'del(.MasterUsername,.MasterUserPassword,.DatabaseName) + {GlobalClusterIdentifier:$global}' \
+            jq 'del(.MasterUsername,.MasterUserPassword,.DatabaseName) +
+                {GlobalClusterIdentifier:$global,KmsKeyId:"alias/aws/rds"}' \
                 --arg global "$global_id" "$file" >"${file}.secondary"
             mv "${file}.secondary" "$file"
         fi
@@ -1744,10 +1875,10 @@ create_matrix() {
     for i in 1 2 3; do ensure_cluster_instance "$PRIMARY_REGION" "${serverless}-${i}" "$serverless" db.serverless "$east_instance_pg"; done
 
     ensure_cluster "$PRIMARY_REGION" "$global_east" "$east_subnet" "$east_sg" "$east_cluster_pg" false
-    for i in 1 2; do ensure_cluster_instance "$PRIMARY_REGION" "${global_east}-${i}" "$global_east" "$INSTANCE_CLASS" "$east_instance_pg"; done
+    for i in 1 2; do ensure_cluster_instance "$PRIMARY_REGION" "${global_east}-${i}" "$global_east" "$GLOBAL_INSTANCE_CLASS" "$east_instance_pg"; done
     ensure_global_cluster "$global_id" "arn:aws:rds:${PRIMARY_REGION}:${ACCOUNT_ID}:cluster:${global_east}"
     ensure_cluster "$SECONDARY_REGION" "$global_west" "$west_subnet" "$west_sg" "$west_cluster_pg" false "$global_id"
-    for i in 1 2; do ensure_cluster_instance "$SECONDARY_REGION" "${global_west}-${i}" "$global_west" "$INSTANCE_CLASS" "$west_instance_pg"; done
+    for i in 1 2; do ensure_cluster_instance "$SECONDARY_REGION" "${global_west}-${i}" "$global_west" "$GLOBAL_INSTANCE_CLASS" "$west_instance_pg"; done
 
     ensure_rds_instance "$source" "$east_subnet" "$east_sg" "$rds_instance_pg" false
     ensure_read_replica "$replica" "$source" "$east_subnet" "$east_sg" "$rds_instance_pg"
@@ -1792,6 +1923,7 @@ interval_generate_config_seconds=43200
 mysql_user="${DB_USER}"
 mysql_password="${DB_PASSWORD}"
 mysql_ssl_mode=true
+releem_cnf_dir="/tmp/releem-topology"
 instance_type="aws/rds"
 aws_region="${region}"
 aws_rds_db="${identifier}"
@@ -2527,12 +2659,12 @@ cleanup_resources_impl() {
         done < <(jq -r --arg source ":$(resource_name rds-source)" '.instances[]|select(endswith($source)|not)' "$dir/${region}.json")
         while IFS=$'\t' read -r deleted_region id; do
             [[ "$deleted_region" == "$region" ]] || continue
-            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
+            if cleanup_remaining_seconds >/dev/null; then cleanup_wait_until "database deletion $region/$id" cleanup_db_instance_absent "$region" "$id" || cleanup_failed=1; fi
         done <"$deleted_instances"
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
             if delete_db_instance_if_monitoring_tracked "$region" "$id" "$deleted_instances"; then
-                if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-instance-deleted --db-instance-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
+                if cleanup_remaining_seconds >/dev/null; then cleanup_wait_until "database deletion $region/$id" cleanup_db_instance_absent "$region" "$id" || cleanup_failed=1; fi
             else
                 log "source database deletion skipped until Enhanced Monitoring resource ID is recorded: $region/$id"
                 cleanup_failed=1
@@ -2581,7 +2713,7 @@ cleanup_resources_impl() {
         done < <(jq -r '.clusters[]' "$dir/${region}.json")
         while IFS= read -r arn; do
             id="$(identifier_from_arn "$arn")"
-            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" rds wait db-cluster-deleted --db-cluster-identifier "$id" >/dev/null 2>&1 || cleanup_failed=1; fi
+            if cleanup_remaining_seconds >/dev/null; then cleanup_wait_until "cluster deletion $region/$id" cleanup_db_cluster_absent "$region" "$id" || cleanup_failed=1; fi
         done < <(jq -r '.clusters[]' "$dir/${region}.json")
     done
     while IFS= read -r arn; do
@@ -2595,7 +2727,7 @@ cleanup_resources_impl() {
         while IFS= read -r runner; do
             [[ -n "$runner" ]] || continue
             cleanup_aws_region "$region" ec2 terminate-instances --instance-ids "$runner" >/dev/null 2>&1 || cleanup_failed=1
-            if cleanup_remaining_seconds >/dev/null; then cleanup_aws_wait_region "$region" ec2 wait instance-terminated --instance-ids "$runner" >/dev/null 2>&1 || cleanup_failed=1; fi
+            if cleanup_remaining_seconds >/dev/null; then cleanup_wait_until "runner termination $region/$runner" cleanup_runner_absent "$region" "$runner" || cleanup_failed=1; fi
         done < <(cleanup_aws_region "$region" ec2 describe-instances \
             --filters "Name=tag:${TAG_RUN_KEY},Values=$(run_id)" "Name=tag:${TAG_MANAGED_KEY},Values=true" \
             "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
@@ -2804,7 +2936,7 @@ on_exit() {
 run_matrix() {
     validate_run_id
     require_runtime
-    for command in aws jq openssl mysql curl timeout tar sha256sum; do require_command "$command"; done
+    for command in aws flock jq openssl mysql curl timeout tar sha256sum; do require_command "$command"; done
     validate_runtime_deadline "$RUNTIME_DEADLINE_SECONDS"
     validate_cleanup_deadline "$CLEANUP_DEADLINE_SECONDS"
     RUN_DEADLINE_EPOCH=$(( $(date +%s) + RUNTIME_DEADLINE_SECONDS ))
@@ -2828,6 +2960,7 @@ run_matrix() {
 inventory() {
     validate_run_id
     require_command aws
+    require_command flock
     require_command jq
     local file
     file="$(evidence_dir)/inventory.json"
@@ -2840,6 +2973,7 @@ destroy() {
     [[ "${AWS_TOPOLOGY_CONFIRM_DESTROY:-}" == "$(run_id)" ]] ||
         die "AWS_TOPOLOGY_CONFIRM_DESTROY must equal the exact run ID"
     require_command aws
+    require_command flock
     require_command jq
     verify_destroy_ownership
     CLEANUP_ARMED=true
