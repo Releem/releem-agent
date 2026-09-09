@@ -35,7 +35,6 @@ type AWSRDSEnhancedMetricsGatherer struct {
 	metadataDiscoveryTimeout time.Duration
 	metadataMu               sync.RWMutex
 	metadata                 awsrds.Metadata
-	metadataComplete         bool
 }
 
 type osMetrics struct {
@@ -205,40 +204,28 @@ func NewAWSRDSEnhancedMetricsGatherer(logger logging.Logger, cwlogsclient *cloud
 		configuration:            configuration,
 		discoverMetadata:         discoverMetadata,
 		metadataDiscoveryTimeout: awsRDSMetadataDiscoveryTimeout,
-		metadata:                 initialMetadata.Clone(),
-		metadataComplete:         true,
+		metadata:                 initialMetadata,
 	}
 }
 
-func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ctx context.Context) (awsrds.Metadata, bool) {
+func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) metadataForReport(ctx context.Context) awsrds.Metadata {
 	discoveryCtx, cancel := context.WithTimeout(ctx, awsrdsenhancedmetrics.metadataDiscoveryTimeout)
 	defer cancel()
 
 	metadata, err := awsrdsenhancedmetrics.discoverMetadata(discoveryCtx)
 	if err != nil {
-		awsrdsenhancedmetrics.metadataMu.Lock()
-		cached := awsrdsenhancedmetrics.metadata.Clone()
-		awsrdsenhancedmetrics.metadataComplete = false
-		awsrdsenhancedmetrics.metadataMu.Unlock()
+		awsrdsenhancedmetrics.metadataMu.RLock()
+		cached := awsrdsenhancedmetrics.metadata
+		awsrdsenhancedmetrics.metadataMu.RUnlock()
 		logAWSRDSDiscoveryFallback(awsrdsenhancedmetrics.logger, cached, err)
-		return cached, false
+		return cached
 	}
 
-	stored := metadata.Clone()
 	awsrdsenhancedmetrics.metadataMu.Lock()
-	awsrdsenhancedmetrics.metadata = stored
-	awsrdsenhancedmetrics.metadataComplete = true
+	awsrdsenhancedmetrics.metadata = metadata
 	awsrdsenhancedmetrics.metadataMu.Unlock()
-	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", stored)
-	return stored.Clone(), true
-}
-
-// MetadataSnapshot returns an immutable copy of the latest metadata and whether
-// the current report refreshed it successfully.
-func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) MetadataSnapshot() (awsrds.Metadata, bool) {
-	awsrdsenhancedmetrics.metadataMu.RLock()
-	defer awsrdsenhancedmetrics.metadataMu.RUnlock()
-	return awsrdsenhancedmetrics.metadata.Clone(), awsrdsenhancedmetrics.metadataComplete
+	LogAWSRDSDiscovery(awsrdsenhancedmetrics.logger, "live", metadata)
+	return metadata
 }
 
 // LogAWSRDSDiscovery emits safe discovery topology without endpoint, resource
@@ -285,8 +272,7 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 	defer utils.HandlePanic(awsrdsenhancedmetrics.configuration, awsrdsenhancedmetrics.logger)
 
 	ctx := context.Background()
-	metadata, metadataComplete := awsrdsenhancedmetrics.metadataForReport(ctx)
-	awsrds.AttachReportMetadata(metrics, metadata, metadataComplete)
+	metadata := awsrdsenhancedmetrics.metadataForReport(ctx)
 
 	info := make(models.MetricGroupValue)
 	metricsMap := make(models.MetricGroupValue)

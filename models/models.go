@@ -50,7 +50,8 @@ type Metrics struct {
 			Variables MetricGroupValue
 		}
 		Info                 MetricGroupValue
-		Topology             MetricGroupValue
+		Topology             MetricGroupValue `json:"Topology,omitempty"`
+		TopologyFacts        MetricGroupValue `json:"TopologyFacts,omitempty"`
 		Queries              []MetricGroupValue
 		DatabaseSchema       map[string][]MetricGroupValue
 		FailedDatabaseSchema []string `json:"FailedDatabaseSchema,omitempty"`

@@ -174,176 +174,18 @@ After exact ownership and semantic validation, `destroy` removes instances,
 owned detached disks, NAT, router, firewall rules, subnet, and network in
 dependency order. It does not run quota, zone, or machine-type selection.
 
-## AWS Aurora and RDS matrix
+## AWS topology
 
-`aws_rds_topology.sh` is a single-run, destructive acceptance harness. It uses
-`us-east-1` for the primary region and `us-west-2` for the secondary region. A
-mandatory lowercase run ID owns every temporary resource through both a
-deterministic `releem-<run-id>-` name and the exact
-`releem-topology-run`/`releem-topology-managed` tags.
+The Aurora, Global Database, RDS replica and Multi-AZ harness lives on
+`feature/db-topology-aws`. This branch retains existing AWS monitoring and
+parameter-group apply, but collects only native database topology facts.
 
-The read-only `preflight` command intersects both regions when selecting the
-latest available Aurora MySQL 3 version and smallest common orderable class.
-It also selects the current Serverless v2 minimum ACU, a current MySQL 8.0
-version/class, and the regional Amazon Linux 2023 runner images. Its summary
-records initial and transition Serverless maximum ACU, the selected ordinary
-MySQL version/class, three 20 GiB ordinary database volumes, two 8 GiB runner
-roots, the one-second monitoring interval, all resource counts, and the global
-runtime ceiling. Exact regional
-RDS instance/cluster and standard EC2 vCPU use is checked against the matrix's
-required headroom. Quotas, private subnet routes, deterministic-name collisions
-independent of tags, and the bounded hourly configuration shape are
-written under `/tmp/releem-db-topology-evidence/aws/<run-id>/preflight/`.
-Review `summary.json`, both quota files, and `inventory-before.json` before
-authorizing a live run. The cost shape is 7 provisioned Aurora instances, 3
-Serverless v2 instances, 3 ordinary RDS instances, and 2 `t3.micro` runners,
-plus storage, I/O, Enhanced Monitoring logs, S3, and network egress. AWS prices
-are not stable, so preflight records selected billable units instead of a
-hard-coded currency estimate.
+## Platform-owned interpretation
 
-The operator supplies two existing VPCs and at least two private subnets in
-different availability zones per region. Subnets must not auto-assign public
-addresses. Every selected runner subnet must have an active NAT default route,
-because the runner needs outbound access to the public Releem endpoint in
-addition to SSM, S3, and AWS APIs. The harness creates one no-ingress SSM runner security
-group and one runner-only MySQL security group in each VPC. Both EC2 runners
-have no public address, encrypted `gp3` root volumes, IMDSv2 enforcement, and
-no inbound rules.
-
-```bash
-export AWS_TOPOLOGY_RUN_ID=task13-20260908
-export AWS_TOPOLOGY_EAST_VPC_ID=vpc-...
-export AWS_TOPOLOGY_EAST_SUBNET_IDS=subnet-...,subnet-...
-export AWS_TOPOLOGY_WEST_VPC_ID=vpc-...
-export AWS_TOPOLOGY_WEST_SUBNET_IDS=subnet-...,subnet-...
-
-tests/topology/aws_rds_topology.sh preflight
-```
-
-Load the Releem and Platform credentials into the invoking shell with tracing
-disabled, using the same `TOPOLOGY_MYSQL_*`, `TOPOLOGY_CLICKHOUSE_*`, and exact
-positive `TOPOLOGY_UID` contract documented above. Do not put credentials in
-arguments, checked-in files, retained logs, or shell history. The harness
-generates the database password in a mode-`0600` file under `/tmp`.
-Use the same AWS CLI executable for `aws login` and every harness command.
-Login credentials rotate every 15 minutes, and mixing CLI installations can
-leave the process unable to use the cached refresh grant. The harness
-serializes local AWS CLI calls, bounds regular calls with
-`AWS_TOPOLOGY_API_TIMEOUT_SECONDS` (180 seconds by default), and uses short
-`describe-*` polling calls so credential rotation can occur between polls.
-
-`run` creates this exact matrix and always invokes dependency-ordered cleanup
-on success, assertion failure, `EXIT`, `INT`, `TERM`, or `HUP` after mutation
-begins. `AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS` defaults to four hours and must
-remain between 10 minutes and six hours; expiry sends `TERM`, cleans once, and
-exits with status 143. Cleanup has a separate one-hour shared deadline, with
-the final ten minutes reserved for bounded dependency deletion attempts. All
-automatic cleanup attempts reuse that same deadline; after exhaustion the
-harness returns nonzero and requires exact-confirmed `destroy`. The advertised
-default maximum is therefore five hours:
-
-| Topology | Region and members |
-| --- | --- |
-| Aurora provisioned | `us-east-1`, one writer and two readers |
-| Aurora Serverless v2 | `us-east-1`, one writer and two readers |
-| Aurora Global Database | two members in each region |
-| RDS MySQL replication | `us-east-1`, one source and one read replica |
-| RDS MySQL Multi-AZ | `us-east-1`, one addressable instance and managed standby |
-
-Every database is storage-encrypted and has `PubliclyAccessible=false`.
-The encrypted cross-region Global Database secondary explicitly selects the
-regional AWS-managed RDS KMS key (`alias/aws/rds`), as required by RDS.
-Preflight records both the smallest common provisioned Aurora class and the
-smallest class that reports `SupportsGlobalDatabases=true` in both regions;
-only the latter is used for Global Database members.
-Every addressable DB instance uses a temporary RDS Enhanced Monitoring role at
-a one-second interval. Before Agent startup, the harness requires at least one
-event in the exact `RDSOSMetrics/<DBInstanceResourceID>` stream. The runner
-role permits only SSM management, reads of its exact private S3 run prefix,
-`logs:GetLogEvents` for `RDSOSMetrics`, and `rds:Describe*`.
-The harness initializes an exact 13-instance monitoring manifest before cloud
-mutation. Every deterministic instance starts as `planned`; immediately before
-an AWS create request it becomes `create_attempted`, and a successful response
-or describe stores `created_with_resource_id` plus the resource ID atomically.
-Untouched `planned` entries need no monitoring stream. Cleanup retries IDs for
-attempted entries but never deletes an instance whose ID is not durably
-recorded. Recovery reads a durable create response before probing the live
-instance. `DBInstanceNotFound` is only a point-in-time observation and never
-converts an interrupted create into terminal absence. In that case cleanup
-removes independent runners and private delivery resources, returns nonzero, and preserves DB
-clusters, database network/parameter dependencies, and the monitoring role so
-an exact-confirmed later `destroy` can recover safely. IDs remain in the
-manifest after database deletion for exact log-stream deletion and absence
-proof. Terminal success requires empty AWS inventory, no unresolved attempts,
-unique IDs for every created instance with its stream absent, and only
-unattempted entries otherwise. Legacy blank manifests are
-migrated fail-closed as attempted rather than assumed never created.
-
-The reviewed `/tmp/releem-agent-db-topology-x86_64` binary and mode-`0600`
-Agent/MySQL configuration archives are transported as server-side-encrypted
-private S3 objects. A one-day lifecycle is installed before upload, and each
-secret-bearing `configs.tar` object is independently retried to confirmed
-absence immediately after its runner bootstraps; only the non-secret binary
-may remain until cleanup. Generated credentials otherwise remain in local and
-runner-local mode-`0600` files and are deleted during cleanup. SSM commands
-contain only fixed object paths and resource names;
-API keys and database passwords are never command parameters or command
-output. Each runner first performs the same `agent -f` server registration as
-the production installers, then starts detached agents and verifies every PID
-is alive before bootstrap succeeds. SSM CloudWatch and S3 command output are disabled. Agent processes run
-inside their regional VPC while remaining external to the database hosts.
-
-```bash
-tests/topology/aws_rds_topology.sh run
-```
-
-The harness verifies provisioned failover, a Serverless v2 capacity change and
-bounded load event using before/during/after `ServerlessDatabaseCapacity` and
-`ACUUtilization` CloudWatch evidence, a managed Global Database switchover, read-replica SQL stop/start,
-and Multi-AZ failover. Persistence queries first resolve the exact test SIDs,
-then use only tenant UID, SID, current RID, and millisecond transition markers.
-Assertions map each exact SID back to AWS instance/cluster/global resource IDs,
-ARNs, endpoints, writers, and sources. Every provider row is matched exactly,
-including parent, primary, role, writer/reader flags, and replication state;
-unlisted provider or native rows are rejected. A validated baseline identity
-map generates one exact native relation for every one of the 13 SIDs and
-transition-specific writer/reader/state expectations. The complete upstream
-set contains the ordinary replica channel/source/state plus one deterministic
-Platform-synthesized relation channel for every Aurora Global Database instance
-in the secondary regional cluster. Those channels use the exact relation/group
-digest and primary regional cluster ARN; their direction reverses after the
-managed switchover. Missing or extra channels fail. ClickHouse snapshots
-parse primary/source edges only from the persisted ClickHouse relations JSON,
-label that evidence as ClickHouse-sourced, and compare it with current MySQL
-state without hostname inference or `LIMIT 1 BY`.
-
-Cleanup first stops and disarms the watchdog, masks/defer signals, and disables
-errexit internally. It remains best-effort after individual failures and is
-retryable unless terminal absence succeeds. It stops Agent processes, deletes DB instances and Enhanced Monitoring
-streams, detaches Global Database members, then removes regional clusters,
-global cluster, parameter groups, runners/ENIs, S3 objects/bucket, instance
-profile, inline/managed IAM policies, IAM roles, security groups, subnet
-groups, snapshots, SSM local artifacts, and secret files. It polls both regions
-until the combined run inventory is empty. AWS retains completed SSM command
-history as an account audit record; the API has no delete operation for that
-record, but no command output or credentials are stored in it.
-AWS API calls use 180-second per-call timeouts by default. Cleanup calls use a
-separate 120-second default, and deletion is
-polled with individual `describe-*` calls that consume only the remaining
-shared wait budget. Signal cleanup reuses an AWS CLI lock already held by the
-same shell, while separate shell processes remain serialized. Explicit absence classification accepts
-only standard operation-specific AWS CLI service-error envelopes and rejects
-ambiguous wrapper, proxy, timeout, or authorization text. S3 object deletion
-retries and their sleeps also stop at the shared cleanup deadline.
-
-Only an untrappable termination such as `SIGKILL` can bypass the EXIT trap.
-Recover by confirming the exact run ID. `destroy` is only for the same single
-run, inventories deterministic names independently of tags, and verifies exact
-resource tags plus S3/IAM policy, role, and instance-profile relationships
-before its first deletion. Missing or foreign ownership fails closed; recovery
-never adopts a same-named resource:
-
-```bash
-export AWS_TOPOLOGY_CONFIRM_DESTROY="$AWS_TOPOLOGY_RUN_ID"
-tests/topology/aws_rds_topology.sh destroy
-```
+The agent emits `DB.TopologyFacts` version 1 with raw `ReplicaStatus`,
+`GroupMembers`, and `InnoDBMetadata` (`SchemaVersion` and `Tables`). `Sources`
+records `ok`, `unsupported` (known absence), or `error` for each source.
+Variables and status remain in `DB.Conf.Variables` and `DB.Metrics.Status`.
+Roles, relation keys, replication states and writer availability are computed
+on Platform. Deploy the matching Platform branch before deploying this agent.
+Permission errors and incomplete scans must not be interpreted as empty topology.

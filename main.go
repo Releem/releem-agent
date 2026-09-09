@@ -283,9 +283,6 @@ func (programm *Programm) Run() {
 			mysql.NewDBInfoGatherer(logger, configuration),
 			mysql.NewDBMetricsBaseGatherer(logger, configuration),
 			mysql.NewDBTopologyGatherer(logger, configuration))
-		if configuration.InstanceType == "aws/rds" {
-			gatherers["default"] = append(gatherers["default"], awsrds.NewTopologyRelationsGatherer(logger))
-		}
 		gatherers["default"] = append(gatherers["default"], metrics.NewAgentMetricsGatherer(logger, configuration))
 
 		gatherers["metrics"] = append(gatherers["metrics"], mysql.NewDBMetricsGatherer(logger, configuration))
