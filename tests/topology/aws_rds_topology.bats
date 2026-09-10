@@ -396,6 +396,23 @@ teardown() {
     [ "${#output}" -le 63 ]
 }
 
+@test "Global Database cluster and instance names use the aurora-global prefix" {
+    run resource_name aurora-global-east
+    [ "$status" -eq 0 ]
+    [ "$output" = 'releem-task13-20260908-aurora-global-east' ]
+
+    run resource_name aurora-global-west
+    [ "$status" -eq 0 ]
+    [ "$output" = 'releem-task13-20260908-aurora-global-west' ]
+
+    run addressable_instances
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'releem-task13-20260908-aurora-global-east-1'* ]]
+    [[ "$output" == *'releem-task13-20260908-aurora-global-west-1'* ]]
+    [[ "$output" != *'releem-task13-20260908-global-east-1'* ]]
+    [[ "$output" != *'releem-task13-20260908-global-west-1'* ]]
+}
+
 @test "latest Aurora MySQL 3 selection uses semantic version ordering" {
     fixture="$TEST_TMPDIR/versions.json"
     cat >"$fixture" <<'EOF'

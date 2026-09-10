@@ -1976,8 +1976,8 @@ create_matrix() {
     provisioned="$(resource_name aurora-provisioned)"
     serverless="$(resource_name aurora-serverless)"
     global_id="$(resource_name aurora-global)"
-    global_east="$(resource_name global-east)"
-    global_west="$(resource_name global-west)"
+    global_east="$(resource_name aurora-global-east)"
+    global_west="$(resource_name aurora-global-west)"
     source="$(resource_name rds-source)"; replica="$(resource_name rds-replica)"; multi="$(resource_name rds-multi-az)"
 
     ensure_cluster "$PRIMARY_REGION" "$provisioned" "$east_subnet" "$east_sg" "$east_cluster_pg" false
@@ -2048,7 +2048,7 @@ EOF
 addressable_instances() {
     local provisioned serverless global_east global_west source replica multi i
     provisioned="$(resource_name aurora-provisioned)"; serverless="$(resource_name aurora-serverless)"
-    global_east="$(resource_name global-east)"; global_west="$(resource_name global-west)"
+    global_east="$(resource_name aurora-global-east)"; global_west="$(resource_name aurora-global-west)"
     source="$(resource_name rds-source)"; replica="$(resource_name rds-replica)"; multi="$(resource_name rds-multi-az)"
     for i in 1 2 3; do printf '%s|%s\n' "$PRIMARY_REGION" "${provisioned}-${i}"; done
     for i in 1 2 3; do printf '%s|%s\n' "$PRIMARY_REGION" "${serverless}-${i}"; done
@@ -2706,7 +2706,7 @@ exercise_matrix() {
     aws_map="$(evidence_dir)/aws-identity-map.jsonl"
     capture_aws_identity_map "$aws_map"
     provisioned="$(resource_name aurora-provisioned)"; serverless="$(resource_name aurora-serverless)"
-    global_id="$(resource_name aurora-global)"; global_east="$(resource_name global-east)"; global_west="$(resource_name global-west)"
+    global_id="$(resource_name aurora-global)"; global_east="$(resource_name aurora-global-east)"; global_west="$(resource_name aurora-global-west)"
     replica="$(resource_name rds-replica)"; multi="$(resource_name rds-multi-az)"
 
     expectation="$(evidence_dir)/transitions/${marker}-aws-baseline-expectation.json"
