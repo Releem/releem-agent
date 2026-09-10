@@ -232,11 +232,16 @@ serializes local AWS CLI calls, bounds regular calls with
 `AWS_TOPOLOGY_API_TIMEOUT_SECONDS` (180 seconds by default), and uses short
 `describe-*` polling calls so credential rotation can occur between polls.
 
-`run` creates this exact matrix and always invokes dependency-ordered cleanup
-on success, assertion failure, `EXIT`, `INT`, `TERM`, or `HUP` after mutation
-begins. `AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS` defaults to four hours and must
+`run` creates this exact matrix. After all 13 DB instances pass the safety and
+Enhanced Monitoring gates, it writes a mode-`0600` provisioning marker. A
+later bootstrap, registration, Agent, or topology-validation failure stops the
+Agent processes and confirms deletion of both secret-bearing `configs.tar`
+objects, but preserves the DB matrix, runners, support resources, and local
+mode-`0600` resume state. Failures before that marker and a fully successful
+`run` retain dependency-ordered cleanup. `AWS_TOPOLOGY_RUNTIME_DEADLINE_SECONDS` defaults to four hours and must
 remain between 10 minutes and six hours; expiry sends `TERM`, cleans once, and
-exits with status 143. Cleanup has a separate one-hour shared deadline, with
+exits with status 143 before provisioning completes, or preserves the matrix
+afterward. Cleanup has a separate one-hour shared deadline, with
 the final ten minutes reserved for bounded dependency deletion attempts. All
 automatic cleanup attempts reuse that same deadline; after exhaustion the
 harness returns nonzero and requires exact-confirmed `destroy`. The advertised
@@ -296,6 +301,20 @@ inside their regional VPC while remaining external to the database hosts.
 ```bash
 tests/topology/aws_rds_topology.sh run
 ```
+
+Retry only bootstrap, registration, and topology validation for an existing
+matrix with the same run ID and credentials:
+
+```bash
+tests/topology/aws_rds_topology.sh resume
+```
+
+`resume` never invokes preflight, provisioning, or automatic cleanup. It first
+verifies exact resource ownership, the complete 13-instance/4-cluster matrix,
+stored runtime state, DB safety, and Enhanced Monitoring. An incomplete or
+partially deleted matrix fails closed without creating replacement DB
+instances. On success, the existing matrix remains running until the
+exact-confirmed `destroy` command is invoked.
 
 The harness verifies provisioned failover, a Serverless v2 capacity change and
 bounded load event using before/during/after `ServerlessDatabaseCapacity` and

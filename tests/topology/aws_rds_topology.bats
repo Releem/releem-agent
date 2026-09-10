@@ -272,6 +272,24 @@ EOF
     [ "$status" -ne 0 ]
 }
 
+@test "evidence query output replaces the destination atomically" {
+    output_file="$TEST_TMPDIR/query-output.jsonl"
+    printf '%s\n' old >"$output_file"
+
+    emit_query_output() { printf '%s\n' new; }
+    run capture_command_output "$output_file" emit_query_output
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$output_file")" = new ]
+    [ ! -e "${output_file}.new" ]
+
+    fail_after_partial_output() { printf '%s\n' partial; return 1; }
+    run capture_command_output "$output_file" fail_after_partial_output
+    [ "$status" -ne 0 ]
+    [ "$(cat "$output_file")" = new ]
+    [ ! -e "${output_file}.new" ]
+}
+
 @test "native contract rejects an unlisted extra relation for a scoped SID" {
     current="$TEST_TMPDIR/native-current.jsonl"
     upstreams="$TEST_TMPDIR/native-upstreams.jsonl"
@@ -326,6 +344,40 @@ EOF
 
 teardown() {
     rm -rf "$TEST_TMPDIR"
+}
+
+@test "Global switchover target is the region opposite the current primary" {
+    east_arn='arn:aws:rds:us-east-1:111111111111:cluster:global-east'
+    west_arn='arn:aws:rds:us-west-2:111111111111:cluster:global-west'
+
+    run select_global_switchover_target "$east_arn" "$east_arn" "$west_arn"
+    [ "$status" -eq 0 ]
+    [ "$output" = "us-west-2|$west_arn" ]
+
+    run select_global_switchover_target "$west_arn" "$east_arn" "$west_arn"
+    [ "$status" -eq 0 ]
+    [ "$output" = "us-east-1|$east_arn" ]
+
+    run select_global_switchover_target arn:unknown "$east_arn" "$west_arn"
+    [ "$status" -ne 0 ]
+}
+
+@test "Aurora failover waits until the requested instance is the only writer" {
+    calls="$TEST_TMPDIR/writer-calls"
+    printf '0\n' >"$calls"
+    aws_region() {
+        count="$(cat "$calls")"; count=$((count + 1)); printf '%s\n' "$count" >"$calls"
+        if [ "$count" -eq 1 ]; then
+            printf '%s\n' '{"DBClusters":[{"DBClusterMembers":[{"DBInstanceIdentifier":"old","IsClusterWriter":true},{"DBInstanceIdentifier":"target","IsClusterWriter":false}]}]}'
+        else
+            printf '%s\n' '{"DBClusters":[{"DBClusterMembers":[{"DBInstanceIdentifier":"old","IsClusterWriter":false},{"DBInstanceIdentifier":"target","IsClusterWriter":true}]}]}'
+        fi
+    }
+
+    run wait_cluster_writer us-east-1 cluster-one target
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$calls")" -eq 2 ]
 }
 
 @test "run ID rejects values that could escape deterministic names" {
@@ -485,6 +537,75 @@ EOF
     [ ! -e "$(secret_file)" ]
 }
 
+@test "agent-stage failure preserves a successfully provisioned matrix" {
+    marker="$TEST_TMPDIR/post-provisioning-exit"
+    CLEANUP_ARMED=true
+    provisioning_complete() { return 0; }
+    cleanup_resources() { printf 'cleanup\n' >>"$marker"; }
+    preserve_after_agent_failure() { printf 'preserved\n' >>"$marker"; }
+
+    run on_exit 1
+
+    [ "$status" -eq 1 ]
+    [ "$(<"$marker")" = preserved ]
+}
+
+@test "resume runs only validation and agent stages against the existing matrix" {
+    marker="$TEST_TMPDIR/resume-stages"
+    assert_resumable_matrix() { printf 'validate-existing\n' >>"$marker"; }
+    mark_provisioning_complete() { printf 'mark-provisioned\n' >>"$marker"; }
+    stop_agents() { printf 'stop-old-agents:%s\n' "${1:-cleanup}" >>"$marker"; }
+    start_agents() { printf 'start-agents\n' >>"$marker"; }
+    exercise_matrix() { printf 'validate-topology\n' >>"$marker"; }
+    preflight() { printf 'preflight\n' >>"$marker"; }
+    create_matrix() { printf 'create-matrix\n' >>"$marker"; }
+
+    run resume_existing_matrix
+
+    [ "$status" -eq 0 ]
+    [ "$(<"$marker")" = $'validate-existing\nmark-provisioned\nstop-old-agents:regular\nstart-agents\nvalidate-topology' ]
+}
+
+@test "resume rejects a partial database matrix" {
+    fixture="$TEST_TMPDIR/partial-inventory.json"
+    jq -n '{
+      instances:[range(0;12)],clusters:[range(0;4)],global_clusters:[0],
+      parameter_groups:[range(0;5)],security_groups:[range(0;4)],
+      subnet_groups:[range(0;2)],runners:[range(0;2)],
+      iam_roles:[range(0;2)],instance_profiles:[0],s3_buckets:[0]
+    }' >"$fixture"
+
+    run assert_resumable_inventory_shape "$fixture"
+
+    [ "$status" -ne 0 ]
+    [ "$status" -ne 127 ]
+    [[ "$output" == *'existing matrix is incomplete'* ]]
+}
+
+@test "resume accepts the exact database and support resource shape" {
+    fixture="$TEST_TMPDIR/complete-inventory.json"
+    jq -n '{
+      instances:[range(0;13)],clusters:[range(0;4)],global_clusters:[0],
+      parameter_groups:[range(0;5)],security_groups:[range(0;4)],
+      subnet_groups:[range(0;2)],runners:[range(0;2)],
+      iam_roles:[range(0;2)],instance_profiles:[0],s3_buckets:[0]
+    }' >"$fixture"
+
+    run assert_resumable_inventory_shape "$fixture"
+
+    [ "$status" -eq 0 ]
+}
+
+@test "a new run clears a stale provisioning marker" {
+    mark_provisioning_complete
+    provisioning_complete
+
+    clear_provisioning_marker
+
+    run provisioning_complete
+    [ "$status" -ne 0 ]
+}
+
 @test "cleanup steps continue after an SSM stop failure" {
     marker="$TEST_TMPDIR/cleanup-steps"
     failed_stop() { printf 'stop\n' >>"$marker"; return 1; }
@@ -579,7 +700,8 @@ EOF
             printf '{"sid":%d,"relation_type":"async_replication","group_key":"uuid-source","parent_group_key":null,"member_key":"uuid-%d","primary_member_key":"uuid-source","role":"replica","is_writer":0,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}\n' "$sid" "$sid" >>"$current"
         else
             member="uuid-$sid"; [[ "$identifier" == *-rds-source ]] && member=uuid-source
-            printf '{"sid":%d,"relation_type":"standalone","group_key":"%s","parent_group_key":null,"member_key":"%s","primary_member_key":null,"role":"primary","is_writer":1,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}\n' "$sid" "$member" "$member" >>"$current"
+            native_writer=1; [[ "$identifier" == *-rds-source ]] && native_writer=0
+            printf '{"sid":%d,"relation_type":"standalone","group_key":"%s","parent_group_key":null,"member_key":"%s","primary_member_key":null,"role":"primary","is_writer":%d,"is_reader":1,"replication_state":"healthy","last_seen_epoch_ms":1710000004000}\n' "$sid" "$member" "$member" "$native_writer" >>"$current"
         fi
     done < <(addressable_instances)
     jq -s '
@@ -616,6 +738,7 @@ EOF
     global_channel="__releem_relation_edge__:$(printf 'aurora_global_database\0aurora-global:global-resource' | sha256sum | awk '{print $1}')"
     run jq -e --arg channel "$global_channel" '
       ([.relations[]|select(.relation_type=="standalone" or .relation_type=="async_replication")]|length)==13 and
+      ([.relations[]|select(.relation_type=="standalone" and .member_key=="uuid-source" and .is_writer==0)]|length)==1 and
       (.upstreams|length)==3 and
       ([.upstreams[]|select(.channel_key=="default" and .upstream_member_key=="uuid-source")]|length)==1 and
       ([.upstreams[]|select(.channel_key==$channel and
@@ -1246,10 +1369,30 @@ EOF
     run runner_ssm_commands us-east-1 bucket prefix/east
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *'agent -f -config "$config"'* ]]
+    [[ "$output" == *'timeout 300 /tmp/releem-topology/agent -f -config "$config"'* ]]
+    [[ "$output" == *'while [ "$attempt" -le 3 ]'* ]]
+    [[ "$output" == *'registration failed after 3 attempts'* ]]
+    [[ "$output" == *'registration_diagnostic database_connection'* ]]
+    [[ "$output" == *'registration_diagnostic unknown'* ]]
+    [[ "$output" != *'tail -'* ]]
     [[ "$output" == *'nohup /tmp/releem-topology/agent -config "$config" </dev/null'* ]]
     [[ "$output" == *'agent-pids'* ]]
     [[ "$output" == *'kill -0 "$pid"'* ]]
+}
+
+@test "RDS replication control passes the endpoint without literal quotes" {
+    captured="$TEST_TMPDIR/rds-control.sh"
+    mkdir -p "$(state_dir)"
+    load_support_state() { EAST_RUNNER_ID=i-east; }
+    send_ssm_commands() { cp "$3" "$captured"; }
+
+    run mysql_rds_call releem-task13-20260908-rds-replica rds_stop_replication
+
+    [ "$status" -eq 0 ]
+    run grep -F -- '--host="$endpoint"' "$captured"
+    [ "$status" -eq 0 ]
+    run grep -F -- '--host=\"$endpoint\"' "$captured"
+    [ "$status" -ne 0 ]
 }
 
 @test "all DB instance create arguments enable Enhanced Monitoring" {
@@ -1317,7 +1460,7 @@ EOF
     addressable_instances() { printf '%s\n' 'us-east-1|global-east-1'; }
     aws_region() {
         case "$*" in
-            *'describe-db-instances'*) printf '%s\n' '{"DBInstanceIdentifier":"global-east-1","DBInstanceArn":"arn:aws:rds:us-east-1:111111111111:db:global-east-1","DbiResourceId":"db-INSTANCE1","DBClusterIdentifier":"global-east","Endpoint":{"Address":"global-east-1.example","Port":3306},"ReadReplicaDBInstanceIdentifiers":[],"MultiAZ":false}' ;;
+            *'describe-db-instances'*) printf '%s\n' '{"DBInstanceIdentifier":"global-east-1","DBInstanceArn":"arn:aws:rds:us-east-1:111111111111:db:global-east-1","DbiResourceId":"db-INSTANCE1","DBInstanceStatus":"available","DBClusterIdentifier":"global-east","Endpoint":{"Address":"global-east-1.example","Port":3306},"ReadReplicaDBInstanceIdentifiers":[],"MultiAZ":false}' ;;
             *'describe-db-clusters'*) printf '%s\n' '{"DBClusterIdentifier":"global-east","DBClusterArn":"arn:aws:rds:us-east-1:111111111111:cluster:global-east","DbClusterResourceId":"cluster-REGIONAL1","GlobalClusterIdentifier":"global-one","DBClusterMembers":[{"DBInstanceIdentifier":"global-east-1","IsClusterWriter":true}]}' ;;
             *'describe-global-clusters'*) printf '%s\n' '{"GlobalClusterIdentifier":"global-one","GlobalClusterResourceId":"cluster-GLOBAL1","GlobalClusterMembers":[{"DBClusterArn":"arn:aws:rds:us-east-1:111111111111:cluster:global-east","IsWriter":true}]}' ;;
             *) return 1 ;;
@@ -1328,7 +1471,32 @@ EOF
     run capture_aws_identity_map "$fixture"
 
     [ "$status" -eq 0 ]
-    run jq -e '.endpoint=="global-east-1.example" and (.relations|length)==2 and .relations[0].group_key=="aurora:cluster-REGIONAL1" and .relations[0].primary_member_key=="arn:aws:rds:us-east-1:111111111111:db:global-east-1" and .relations[1].group_key=="aurora-global:cluster-GLOBAL1" and .relations[1].parent_group_key==null' "$fixture"
+    run jq -e '.endpoint=="global-east-1.example" and (.relations|length)==2 and .relations[0].group_key=="aurora:cluster-REGIONAL1" and .relations[0].primary_member_key=="arn:aws:rds:us-east-1:111111111111:db:global-east-1" and .relations[0].is_writer==1 and .relations[0].is_reader==1 and .relations[1].group_key=="aurora-global:cluster-GLOBAL1" and .relations[1].parent_group_key==null and .relations[1].is_writer==1 and .relations[1].is_reader==1' "$fixture"
+    [ "$status" -eq 0 ]
+}
+
+@test "AWS identity mapping preserves a writerless Global secondary without an empty writer lookup" {
+    calls="$TEST_TMPDIR/instance-calls"
+    : >"$calls"
+    addressable_instances() { printf '%s\n' 'us-west-2|global-west-1'; }
+    aws_region() {
+        case "$*" in
+            *'describe-db-instances'*)
+                printf 'call\n' >>"$calls"
+                printf '%s\n' '{"DBInstanceIdentifier":"global-west-1","DBInstanceArn":"arn:aws:rds:us-west-2:111111111111:db:global-west-1","DbiResourceId":"db-WEST1","DBInstanceStatus":"available","DBClusterIdentifier":"global-west","Endpoint":{"Address":"global-west-1.example","Port":3306},"ReadReplicaDBInstanceIdentifiers":[],"MultiAZ":false}'
+                ;;
+            *'describe-db-clusters'*) printf '%s\n' '{"DBClusterIdentifier":"global-west","DBClusterArn":"arn:aws:rds:us-west-2:111111111111:cluster:global-west","DbClusterResourceId":"cluster-WEST","GlobalClusterIdentifier":"global-one","DBClusterMembers":[{"DBInstanceIdentifier":"global-west-1","IsClusterWriter":false}]}' ;;
+            *'describe-global-clusters'*) printf '%s\n' '{"GlobalClusterIdentifier":"global-one","GlobalClusterResourceId":"cluster-GLOBAL1","GlobalClusterMembers":[{"DBClusterArn":"arn:aws:rds:us-east-1:111111111111:cluster:global-east","IsWriter":true},{"DBClusterArn":"arn:aws:rds:us-west-2:111111111111:cluster:global-west","IsWriter":false,"SynchronizationStatus":"connected"}]}' ;;
+            *) return 1 ;;
+        esac
+    }
+    fixture="$TEST_TMPDIR/aws-secondary-identity.jsonl"
+
+    run capture_aws_identity_map "$fixture"
+
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$calls")" -eq 1 ]
+    run jq -e '(.relations|length)==2 and .relations[0].role=="replica" and .relations[0].primary_member_key==null and .relations[0].is_writer==0 and .relations[0].is_reader==1 and .relations[1].role=="replica_cluster_member" and .relations[1].is_writer==0 and .relations[1].is_reader==1' "$fixture"
     [ "$status" -eq 0 ]
 }
 
@@ -1341,23 +1509,6 @@ EOF
     run assert_selected_observations "$observations" "$current" '101:rid-a' 1710000003123 1
 
     [ "$status" -ne 0 ]
-}
-
-@test "AWS Global secondary regional primary is not an autonomous writer" {
-    addressable_instances() { printf '%s\n' 'us-west-2|global-secondary-writer'; }
-    aws_region() {
-        case "$*" in
-            *'describe-db-instances'*) jq '.DBInstances[0]' "$BATS_TEST_DIRNAME/../../awsrds/testdata/aurora_global_secondary.json" ;;
-            *'describe-db-clusters'*) jq '.DBClusters[0]' "$BATS_TEST_DIRNAME/../../awsrds/testdata/aurora_global_secondary.json" ;;
-            *'describe-global-clusters'*) jq '.GlobalClusters[0]' "$BATS_TEST_DIRNAME/../../awsrds/testdata/aurora_global_secondary.json" ;;
-            *) return 1 ;;
-        esac
-    }
-    fixture="$TEST_TMPDIR/global-secondary-identity.jsonl"
-    run capture_aws_identity_map "$fixture"
-    [ "$status" -eq 0 ]
-    run jq -e '.relations[0].role=="primary" and .relations[0].is_writer==false and .relations[1].role=="replica_cluster_member" and .relations[1].is_writer==false' "$fixture"
-    [ "$status" -eq 0 ]
 }
 
 @test "credential transport has one-day expiry and immediate bootstrap deletion" {
@@ -1381,6 +1532,38 @@ EOF
     run assert_serverless_scale_evidence "$good" 3
     [ "$status" -eq 0 ]
     run assert_serverless_scale_evidence "$bad" 3
+    [ "$status" -ne 0 ]
+}
+
+@test "Serverless load retries nonfatally and passes an endpoint without literal quotes" {
+    mkdir -p "$(state_dir)"
+    captured="$TEST_TMPDIR/serverless-load.sh"
+    metric_calls="$TEST_TMPDIR/metric-calls"
+    send_calls="$TEST_TMPDIR/send-calls"
+    printf '0\n' >"$metric_calls"
+    printf '0\n' >"$send_calls"
+    load_support_state() { EAST_RUNNER_ID=i-east; }
+    sleep() { :; }
+    send_ssm_commands() {
+        count="$(cat "$send_calls")"; printf '%s\n' "$((count + 1))" >"$send_calls"
+        cp "$3" "$captured"
+    }
+    serverless_metric_value() {
+        count="$(cat "$metric_calls")"; count=$((count + 1)); printf '%s\n' "$count" >"$metric_calls"
+        case "$count" in
+            1) printf '0.5\n' ;; 2) printf '25\n' ;;
+            3) printf '0.5\n' ;; 4) printf '25\n' ;; 5) printf '0.5\n' ;; 6) printf '25\n' ;;
+            7) printf '1.5\n' ;; 8) printf '80\n' ;; 9) printf '1.0\n' ;; 10) printf '40\n' ;;
+        esac
+    }
+
+    run force_serverless_scale releem-task13-20260908-aurora-serverless
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$send_calls")" -eq 2 ]
+    run grep -F -- '--host="$endpoint"' "$captured"
+    [ "$status" -eq 0 ]
+    run grep -F -- '--host=\"$endpoint\"' "$captured"
     [ "$status" -ne 0 ]
 }
 
@@ -1532,6 +1715,28 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "Enhanced Monitoring polling retries an empty event page" {
+    attempts="$TEST_TMPDIR/monitoring-attempts"
+    mkdir -p "$(state_dir)"
+    printf '0\n' >"$attempts"
+    tracked_monitoring_resource_id() { printf '%s\n' db-ABCDEFGHIJKLMNOP; }
+    aws_region() {
+        count="$(<"$attempts")"
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$attempts"
+        if ((count == 1)); then
+            printf '%s\n' '{"events":[]}'
+        else
+            printf '%s\n' '{"events":[{"timestamp":1710000003000,"message":"ready"}]}'
+        fi
+    }
+
+    run wait_monitoring_events us-west-2 test-instance
+
+    [ "$status" -eq 0 ]
+    [ "$(<"$attempts")" -eq 2 ]
+}
+
 @test "DB safety assertion requires private encrypted monitored instances" {
     good="$TEST_TMPDIR/db-instances-good.json"
     bad="$TEST_TMPDIR/db-instances-bad.json"
@@ -1559,7 +1764,7 @@ EOF
     [[ "$output" != *'hostname'* ]]
 }
 
-@test "ClickHouse query correlates exact SID RID pairs at millisecond marker precision" {
+@test "ClickHouse query correlates exact SID RID pairs against a DateTime timestamp" {
     export TOPOLOGY_UID=42
 
     run build_clickhouse_observation_query 1710000003123 '101:rid-a,202:rid-b'
@@ -1567,7 +1772,9 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *'uid = 42'* ]]
     [[ "$output" == *"(sid = 101 AND rid = 'rid-a')"* ]]
-    [[ "$output" == *'toDateTime64(1710000003123 / 1000.0, 3)'* ]]
+    [[ "$output" == *'toUnixTimestamp(timestamp) * 1000 AS observed_epoch_ms'* ]]
+    [[ "$output" == *'timestamp >= toDateTime(intDiv(1710000003123 + 999, 1000))'* ]]
+    [[ "$output" != *'toUnixTimestamp64Milli'* ]]
     [[ "$output" != *'LIMIT 1 BY'* ]]
 }
 

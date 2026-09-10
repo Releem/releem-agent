@@ -29,6 +29,7 @@ RUN_DEADLINE_EPOCH=0
 CLEANUP_DEADLINE_EPOCH=0
 CLEANUP_BUDGET_EXHAUSTED=false
 AWS_LOCK_HELD=false
+RESUME_MODE=false
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
@@ -40,7 +41,8 @@ Usage: tests/topology/aws_rds_topology.sh COMMAND
 
 Commands:
   preflight  Read-only selection, quota, network, collision, and cost-shape inventory
-  run        Preflight, create, validate transitions, and always clean up
+  run        Preflight, create, and validate transitions; preserve a completed matrix on agent-stage failure
+  resume     Retry bootstrap, registration, and validation against an existing complete matrix
   inventory  Print sanitized run-owned inventory from both regions
   destroy    Recover from an untrappable termination; exact confirmation required
   help       Show this help
@@ -83,7 +85,31 @@ state_dir() { printf '%s/%s\n' "$STATE_ROOT" "$(run_id)"; }
 evidence_dir() { printf '%s/%s\n' "$EVIDENCE_ROOT" "$(run_id)"; }
 selection_file() { printf '%s/selection.env\n' "$(state_dir)"; }
 secret_file() { printf '%s/runtime-secret.env\n' "$(state_dir)"; }
+provisioning_marker_file() { printf '%s/provisioning-complete\n' "$(state_dir)"; }
 aws_lock_file() { printf '%s/aws-cli.lock\n' "$(state_dir)"; }
+
+mark_provisioning_complete() {
+    local file temporary
+    file="$(provisioning_marker_file)"
+    temporary="${file}.new"
+    mkdir -p "$(dirname "$file")"
+    umask 077
+    printf '%s\n' "$(run_id)" >"$temporary"
+    chmod 600 "$temporary"
+    mv "$temporary" "$file"
+}
+
+provisioning_complete() {
+    local file value
+    file="$(provisioning_marker_file)"
+    [[ -f "$file" && "$(stat -c '%a' "$file")" == 600 ]] || return 1
+    IFS= read -r value <"$file" || return 1
+    [[ "$value" == "$(run_id)" ]]
+}
+
+clear_provisioning_marker() {
+    rm -f "$(provisioning_marker_file)"
+}
 
 with_aws_lock() {
     local lock_file lock_fd status=0
@@ -590,7 +616,43 @@ tar -xf /tmp/releem-topology/configs.tar -C /tmp/releem-topology
 find /tmp/releem-topology -name '*.conf' -exec chmod 0600 {} \;
 chmod 0600 /tmp/releem-topology/mysql.cnf
 for config in /tmp/releem-topology/configs/*.conf; do
-    /tmp/releem-topology/agent -f -config "\$config" >>/tmp/releem-topology/agent.log 2>&1
+    attempt=1
+    while [ "\$attempt" -le 3 ]; do
+        if timeout 300 /tmp/releem-topology/agent -f -config "\$config" >>/tmp/releem-topology/agent.log 2>&1; then
+            break
+        fi
+        if [ "\$attempt" -eq 3 ]; then
+            diagnostic_found=0
+            if grep -qF 'The agent configuration failed to load' /tmp/releem-topology/agent.log; then
+                printf 'registration_diagnostic configuration_load\n' >&2
+                diagnostic_found=1
+            fi
+            if grep -qF 'Load AWS configuration FAILED' /tmp/releem-topology/agent.log; then
+                printf 'registration_diagnostic aws_configuration\n' >&2
+                diagnostic_found=1
+            fi
+            if grep -qF 'Failed to connect to the configured database' /tmp/releem-topology/agent.log ||
+                grep -qF 'Connection failed to DB' /tmp/releem-topology/agent.log; then
+                printf 'registration_diagnostic database_connection\n' >&2
+                diagnostic_found=1
+            fi
+            if grep -qF 'CloudWatchLogs.GetLogEvents No data' /tmp/releem-topology/agent.log; then
+                printf 'registration_diagnostic enhanced_monitoring_no_data\n' >&2
+                diagnostic_found=1
+            fi
+            if grep -qF 'Problem getting metrics from gatherer' /tmp/releem-topology/agent.log; then
+                printf 'registration_diagnostic metrics_gatherer\n' >&2
+                diagnostic_found=1
+            fi
+            if [ "\$diagnostic_found" -eq 0 ]; then
+                printf 'registration_diagnostic unknown\n' >&2
+            fi
+            printf 'registration failed after 3 attempts for %s\n' "\$(basename "\$config")" >&2
+            exit 1
+        fi
+        attempt=\$((attempt + 1))
+        sleep 30
+    done
 done
 sleep 30
 : >/tmp/releem-topology/agent-pids
@@ -609,11 +671,15 @@ monitoring_arguments() {
     printf '%s\n' --monitoring-interval 1 --monitoring-role-arn "$role_arn"
 }
 
-assert_monitoring_events() {
+monitoring_events_present() {
     local file="$1" resource_id="$2"
-    [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || die "invalid DB instance resource ID"
+    [[ "$resource_id" =~ ^db-[A-Za-z0-9]+$ ]] || return 1
     jq -e '.events|length>0 and all(.[]; (.timestamp|type)=="number" and (.message|type)=="string" and (.message|length)>0)' \
-        "$file" >/dev/null || die "Enhanced Monitoring stream has no events"
+        "$file" >/dev/null
+}
+
+assert_monitoring_events() {
+    monitoring_events_present "$1" "$2" || die "Enhanced Monitoring stream has no events"
 }
 
 assert_db_instance_safety() {
@@ -636,14 +702,18 @@ assert_read_replica_parameter_group() {
     ' "$file" >/dev/null || die "read replica did not inherit the expected parameter group"
 }
 
-assert_serverless_scale_evidence() {
+serverless_scale_evidence_present() {
     local file="$1" max_attempts="$2"
     jq -e --argjson max_attempts "$max_attempts" '
       .attempts>=1 and .attempts<=$max_attempts and
       ([.before.capacity,.during.capacity,.after.capacity]|all(type=="number")) and
       ([.before.acu_utilization,.during.acu_utilization,.after.acu_utilization]|all(type=="number")) and
       .during.capacity > .before.capacity
-    ' "$file" >/dev/null || die "Serverless v2 capacity did not increase under bounded load"
+    ' "$file" >/dev/null
+}
+
+assert_serverless_scale_evidence() {
+    serverless_scale_evidence_present "$1" "$2" || die "Serverless v2 capacity did not increase under bounded load"
 }
 
 assert_global_switchover_converged() {
@@ -670,9 +740,30 @@ wait_global_switchover() {
     return 1
 }
 
+select_global_switchover_target() {
+    local current="$1" east="$2" west="$3"
+    if [[ "$current" == "$east" ]]; then
+        printf '%s|%s\n' "$SECONDARY_REGION" "$west"
+    elif [[ "$current" == "$west" ]]; then
+        printf '%s|%s\n' "$PRIMARY_REGION" "$east"
+    else
+        return 1
+    fi
+}
+
 assert_inventory_empty() {
     jq -e 'to_entries | all(.value | length == 0)' "$1" >/dev/null ||
         die "run-owned AWS resources remain after cleanup"
+}
+
+assert_resumable_inventory_shape() {
+    jq -e '
+      (.instances|length)==13 and (.clusters|length)==4 and
+      (.global_clusters|length)==1 and (.parameter_groups|length)==5 and
+      (.security_groups|length)==4 and (.subnet_groups|length)==2 and
+      (.runners|length)==2 and (.iam_roles|length)==2 and
+      (.instance_profiles|length)==1 and (.s3_buckets|length)==1
+    ' "$1" >/dev/null || die "existing matrix is incomplete; resume will not create or replace DB resources"
 }
 
 assert_inventory_matches() {
@@ -722,7 +813,7 @@ build_clickhouse_observation_query() {
         first=0
     done
     ((first == 0)) || die "no SID/RID correlations supplied"
-    printf '%s\n' "SELECT sid,rid,toUnixTimestamp64Milli(timestamp) AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= toDateTime64(${marker_ms} / 1000.0, 3) AND timestamp < addSeconds(toDateTime64(${marker_ms} / 1000.0, 3), ${CLICKHOUSE_MARKER_WINDOW_SECONDS}) AND (${conditions}) ORDER BY sid,timestamp FORMAT JSONEachRow"
+    printf '%s\n' "SELECT sid,rid,toUnixTimestamp(timestamp) * 1000 AS observed_epoch_ms,relations FROM db_topology_observations WHERE uid = ${TOPOLOGY_UID} AND timestamp >= toDateTime(intDiv(${marker_ms} + 999, 1000)) AND timestamp < addSeconds(toDateTime(intDiv(${marker_ms} + 999, 1000)), ${CLICKHOUSE_MARKER_WINDOW_SECONDS}) AND (${conditions}) ORDER BY sid,timestamp FORMAT JSONEachRow"
 }
 
 assert_selected_observations() {
@@ -794,7 +885,8 @@ capture_native_identity_map() {
           end)) and
         ($native|map(select(.sid==$replica_sid))[0].primary_member_key)==$source_member)
       then [$sidmap[] as $mapping | ($native|map(select(.sid==$mapping.sid))[0]) as $row |
-        {sid:$mapping.sid,provider_id:$mapping.provider_id,member_key:$row.member_key}]
+        {sid:$mapping.sid,provider_id:$mapping.provider_id,member_key:$row.member_key,
+         is_writer:$row.is_writer,is_reader:$row.is_reader,replication_state:$row.replication_state}]
       else error("native identity contract mismatch") end
     ' "$current" >"$out" || return 1
     chmod 600 "$out"
@@ -832,8 +924,8 @@ add_exact_native_expectations() {
           ([$expected.relations[]|select(.sid==$identity.sid and (.relation_type|IN("aurora_cluster","rds_read_replica","rds_multi_az")))]|first) as $provider |
           if $provider==null then error("provider expectation missing") else
             {sid:$identity.sid,relation_type:"standalone",group_key:$identity.member_key,parent_group_key:null,
-             member_key:$identity.member_key,primary_member_key:null,role:"primary",is_writer:$provider.is_writer,
-             is_reader:1,replication_state:"healthy"}
+             member_key:$identity.member_key,primary_member_key:null,role:"primary",is_writer:$identity.is_writer,
+             is_reader:$identity.is_reader,replication_state:$identity.replication_state}
           end
         end] as $native |
       $expected + {relations:($expected.relations+$native),upstreams:([{
@@ -884,8 +976,7 @@ assert_transition_state() {
         (map(select(.relation_type=="aurora_cluster")) as $aurora |
           ($aurora|length)==10 and ($aurora|map(.group_key)|unique|length)==4 and
           ($aurora|group_by(.group_key)|map(length)|sort)==[2,2,3,3] and
-          ($aurora|group_by(.group_key)|all((map(select(.role=="primary"))|length)==1)) and
-          ($aurora|map(select(.is_writer==1))|length)==3) and
+          ($aurora|group_by(.group_key)|map(map(select(.is_writer==1))|length)|sort)==[0,1,1,1]) and
         (map(select(.relation_type=="aurora_global_database")) as $global |
           ($global|length)==4 and ($global|map(.group_key)|unique|length)==1 and
           ($global|map(select(.role=="primary_cluster_member"))|length)==2 and
@@ -936,17 +1027,24 @@ assert_transition_state() {
     ' "$upstreams" >/dev/null || die "upstream assertion failed for $label"
 }
 
-require_runtime() {
+require_agent_runtime() {
     local name
-    for name in AWS_TOPOLOGY_EAST_VPC_ID AWS_TOPOLOGY_EAST_SUBNET_IDS \
-        AWS_TOPOLOGY_WEST_VPC_ID AWS_TOPOLOGY_WEST_SUBNET_IDS \
-        RELEEM_API_KEY TOPOLOGY_MYSQL_HOST TOPOLOGY_MYSQL_USER \
+    for name in RELEEM_API_KEY TOPOLOGY_MYSQL_HOST TOPOLOGY_MYSQL_USER \
         TOPOLOGY_MYSQL_PASSWORD TOPOLOGY_CLICKHOUSE_HOST TOPOLOGY_CLICKHOUSE_USER \
         TOPOLOGY_CLICKHOUSE_PASSWORD; do
         [[ -n "${!name:-}" ]] || die "$name must be set"
     done
     validate_persistence_identity
     [[ -x "$AGENT_BINARY" ]] || die "required Agent binary is absent or not executable: $AGENT_BINARY"
+}
+
+require_runtime() {
+    local name
+    for name in AWS_TOPOLOGY_EAST_VPC_ID AWS_TOPOLOGY_EAST_SUBNET_IDS \
+        AWS_TOPOLOGY_WEST_VPC_ID AWS_TOPOLOGY_WEST_SUBNET_IDS; do
+        [[ -n "${!name:-}" ]] || die "$name must be set"
+    done
+    require_agent_runtime
 }
 
 verify_network_inputs() {
@@ -1630,6 +1728,18 @@ wait_cluster_available() {
     wait_until "database cluster availability $1/$2" db_cluster_available "$1" "$2"
 }
 
+db_cluster_has_writer() {
+    local response writer
+    response="$(aws_region "$1" rds describe-db-clusters --db-cluster-identifier "$2" --output json 2>/dev/null)" || return 2
+    writer="$(jq -er '[.DBClusters[0].DBClusterMembers[]|select(.IsClusterWriter==true)] |
+        if length==1 then .[0].DBInstanceIdentifier else error("unique writer missing") end' <<<"$response")" || return 2
+    [[ "$writer" == "$3" ]]
+}
+
+wait_cluster_writer() {
+    wait_until "database cluster writer $1/$2/$3" db_cluster_has_writer "$1" "$2" "$3"
+}
+
 create_network_resources() {
     local region="$1" vpc="$2" subnet_csv="$3" runner_sg="$4" suffix="$5"
     local subnet_group sg_name sg_id group_exists
@@ -2165,7 +2275,7 @@ wait_monitoring_events() {
     while :; do
         aws_region "$region" logs get-log-events --log-group-name RDSOSMetrics \
             --log-stream-name "$resource_id" --limit 1 --no-start-from-head --output json >"$file" 2>/dev/null || true
-        if [[ -s "$file" ]] && assert_monitoring_events "$file" "$resource_id" 2>/dev/null; then
+        if [[ -s "$file" ]] && monitoring_events_present "$file" "$resource_id" 2>/dev/null; then
             rm -f "$file"
             return 0
         fi
@@ -2286,25 +2396,61 @@ runner_accepts_ssm_for_cleanup() {
     esac
 }
 
+runner_accepts_ssm() {
+    local region="$1" runner="$2" state
+    state="$(aws_region "$region" ec2 describe-instances \
+        --filters "Name=instance-id,Values=${runner}" \
+        --query 'Reservations[].Instances[].State.Name' --output text 2>/dev/null)" || return 2
+    case "$state" in
+        running) return 0 ;;
+        ''|None|pending|stopping|stopped|shutting-down|terminated) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
 stop_agents() {
-    local commands region runner label state_status failed=0
+    local mode="${1:-cleanup}" commands region runner label state_status failed=0
+    [[ "$mode" == cleanup || "$mode" == regular ]] || return 1
     [[ -f "$(support_state_file)" ]] || return 0
     load_support_state_nonfatal || return 1
     commands="$(state_dir)/ssm-stop.sh"
-    printf '%s\n' 'pkill -TERM -f /tmp/releem-topology/agent || true' \
+    printf '%s\n' "pkill -TERM -f '^/tmp/releem-topology/agent( |$)' || true" \
         'rm -rf /tmp/releem-topology' >"$commands"
     chmod 600 "$commands"
     for label in east west; do
         if [[ "$label" == east ]]; then region="$PRIMARY_REGION"; runner="${EAST_RUNNER_ID:-}"; else region="$SECONDARY_REGION"; runner="${WEST_RUNNER_ID:-}"; fi
         if [[ -n "$runner" ]]; then
-            if runner_accepts_ssm_for_cleanup "$region" "$runner"; then
-                send_ssm_commands "$region" "$runner" "$commands" "stop-${label}" cleanup || failed=1
+            state_status=0
+            if [[ "$mode" == cleanup ]]; then
+                runner_accepts_ssm_for_cleanup "$region" "$runner" || state_status=$?
             else
-                state_status=$?
-                [[ "$state_status" -eq 1 ]] || failed=1
+                runner_accepts_ssm "$region" "$runner" || state_status=$?
+            fi
+            if ((state_status == 0)); then
+                send_ssm_commands "$region" "$runner" "$commands" "stop-${label}" "$mode" || failed=1
+            elif ((state_status != 1)); then
+                failed=1
             fi
         fi
     done
+    return "$failed"
+}
+
+delete_bootstrap_secret_objects() {
+    local key failed=0
+    load_support_state_nonfatal || return 1
+    while IFS= read -r key; do
+        delete_s3_object_until_absent "$S3_BUCKET" "$key" || failed=1
+    done < <(bootstrap_secret_object_keys)
+    return "$failed"
+}
+
+preserve_after_agent_failure() {
+    local failed=0
+    stop_agents || failed=1
+    delete_bootstrap_secret_objects || failed=1
+    rm -rf "$(state_dir)/packages"
+    log "existing DB matrix preserved; retry with the resume command for run $(run_id)"
     return "$failed"
 }
 
@@ -2340,7 +2486,9 @@ capture_aws_identity_map() {
         if [[ "$(jq -r '.DBClusterIdentifier//empty' <<<"$db")" != "" ]]; then
             cluster="$(aws_region "$region" rds describe-db-clusters --db-cluster-identifier "$(jq -r .DBClusterIdentifier <<<"$db")" --query 'DBClusters[0]' --output json)"
             writer_id="$(jq -r '.DBClusterMembers[]|select(.IsClusterWriter==true)|.DBInstanceIdentifier' <<<"$cluster")"
-            writer="$(aws_region "$region" rds describe-db-instances --db-instance-identifier "$writer_id" --query 'DBInstances[0]' --output json)"
+            if [[ -n "$writer_id" ]]; then
+                writer="$(aws_region "$region" rds describe-db-instances --db-instance-identifier "$writer_id" --query 'DBInstances[0]' --output json)"
+            fi
             if [[ "$(jq -r '.GlobalClusterIdentifier//empty' <<<"$cluster")" != "" ]]; then
                 global="$(aws_region "$PRIMARY_REGION" rds describe-global-clusters --global-cluster-identifier "$(jq -r .GlobalClusterIdentifier <<<"$cluster")" --query 'GlobalClusters[0]' --output json)"
             fi
@@ -2354,6 +2502,7 @@ capture_aws_identity_map() {
           --argjson global "$global" --argjson source "$source" --argjson writer "$writer" '
           def member($x): $x.DBInstanceArn;
           def available($x): $x.DBInstanceStatus=="available";
+          def bit($value): if $value then 1 else 0 end;
           def global_state($member):
             if $member.SynchronizationStatus=="connected" then "healthy"
             elif $member.SynchronizationStatus=="pending-resync" then "lagging"
@@ -2365,10 +2514,8 @@ capture_aws_identity_map() {
               [{relation_type:"aurora_cluster",group_key:("aurora:"+$cluster.DbClusterResourceId),
                 parent_group_key:(if $global==null then null else "aurora-global:"+$global.GlobalClusterResourceId end),
                 member_key:member($db),primary_member_key:member($writer),
-                role:(if $local_writer then "primary" else "replica" end),
-                is_writer:(available($db) and $local_writer and
-                  ($global==null or any($global.GlobalClusterMembers[];.DBClusterArn==$cluster.DBClusterArn and .IsWriter==true and global_state(.)=="healthy"))),
-                is_reader:available($db),replication_state:(if available($db) then "healthy" else "unknown" end)}] +
+                role:(if $local_writer then "primary" else "replica" end),is_writer:bit(available($db) and $local_writer),
+                is_reader:bit(available($db)),replication_state:(if available($db) then "healthy" else "unknown" end)}] +
               (if $global != null then
                 ($global.GlobalClusterMembers|map(select(.IsWriter==true))[0].DBClusterArn) as $primary_cluster |
                 ($global.GlobalClusterMembers|map(select(.DBClusterArn==$cluster.DBClusterArn))[0]) as $global_member |
@@ -2377,21 +2524,21 @@ capture_aws_identity_map() {
                   parent_group_key:(if $cluster.DBClusterArn==$primary_cluster then null else $primary_cluster end),
                   member_key:member($db),primary_member_key:null,
                   role:(if $cluster.DBClusterArn==$primary_cluster then "primary_cluster_member" else "replica_cluster_member" end),
-                  is_writer:(available($db) and $state=="healthy" and $cluster.DBClusterArn==$primary_cluster and $local_writer),
-                  is_reader:(available($db) and ($state=="healthy" or $state=="lagging")),replication_state:$state}]
+                  is_writer:bit(available($db) and $state=="healthy" and $cluster.DBClusterArn==$primary_cluster and $local_writer),
+                  is_reader:bit(available($db) and ($state=="healthy" or $state=="lagging")),replication_state:$state}]
                else [] end)
              else [] end) +
             (if $source != null then
               [{relation_type:"rds_read_replica",group_key:("rds-replica:"+$source.DbiResourceId),parent_group_key:null,
                 member_key:member($db),primary_member_key:member($source),
                 role:(if $db.DBInstanceIdentifier==$source.DBInstanceIdentifier then "primary" else "replica" end),
-                is_writer:(available($db) and $db.DBInstanceIdentifier==$source.DBInstanceIdentifier),
-                is_reader:available($db),replication_state:"unknown"}]
+                is_writer:bit(available($db) and $db.DBInstanceIdentifier==$source.DBInstanceIdentifier),
+                is_reader:bit(available($db)),replication_state:"unknown"}]
              else [] end) +
             (if $db.MultiAZ==true then
               [{relation_type:"rds_multi_az",group_key:("rds-multi-az:"+$db.DbiResourceId),parent_group_key:null,
-                member_key:member($db),primary_member_key:member($db),role:"primary",is_writer:available($db),
-                is_reader:available($db),replication_state:"unknown"}]
+                member_key:member($db),primary_member_key:member($db),role:"primary",is_writer:bit(available($db)),
+                is_reader:bit(available($db)),replication_state:"unknown"}]
              else [] end);
           {provider_id:$identifier,region:$region,endpoint:$db.Endpoint.Address,resource_id:$db.DbiResourceId,relations:provider_relations}
         ' >>"$out"
@@ -2423,6 +2570,16 @@ add_exact_provider_expectations() {
 
 marker_ms() { date -u +%s%3N; }
 
+capture_command_output() {
+    local output="$1"
+    shift
+    if ! "$@" >"${output}.new"; then
+        rm -f "${output}.new"
+        return 1
+    fi
+    mv "${output}.new" "$output"
+}
+
 relation_value_for_provider() {
     local current="$1" map_file="$2" provider="$3" relation_type="$4" field="$5" sid
     [[ "$field" == group_key || "$field" == member_key ]] || die "invalid relation identity field"
@@ -2445,16 +2602,20 @@ collect_transition() {
     mkdir -p "$(dirname "$current")"
     deadline=$(( $(date +%s) + PERSISTENCE_TIMEOUT_SECONDS ))
     while :; do
-        platform_mysql "$(current_state_query "$sids" "$marker")" >"$current"
-        platform_mysql "$(upstream_state_query "$sids" "$marker")" >"$upstream"
+        if ! capture_command_output "$current" platform_mysql "$(current_state_query "$sids" "$marker")" ||
+            ! capture_command_output "$upstream" platform_mysql "$(upstream_state_query "$sids" "$marker")"; then
+            (($(date +%s) < deadline)) || die "Platform persistence query timeout for $label"
+            sleep 10
+            continue
+        fi
         native_count="$(jq '[.relations[]?|select(.relation_type=="standalone" or .relation_type=="async_replication")]|length' "$expectation")"
         if [[ "$(jq -sr 'map(.sid)|unique|length' "$current")" == 13 && "$native_count" == 0 ]]; then
             if [[ ! -s "$identities" ]]; then capture_native_identity_map "$current" "$map_file" "$identities" 2>/dev/null || true; fi
             if [[ -s "$identities" ]]; then add_exact_native_expectations "$expectation" "$map_file" "$identities" "$label" 2>/dev/null || true; fi
         fi
         if [[ -s "$current" ]] && [[ "$(jq -sr 'map(.sid)|unique|length' "$current")" == 13 ]] && \
-            assert_transition_state "$label" "$current" "$upstream" "$expectation" "$marker" 2>/dev/null && \
-            { [[ "$(jq '.relations//[]|length' "$expectation")" == 0 ]] || assert_exact_sid_contract "$current" "$upstream" "$expectation" 2>/dev/null; }; then break; fi
+            (assert_transition_state "$label" "$current" "$upstream" "$expectation" "$marker") 2>/dev/null && \
+            { [[ "$(jq '.relations//[]|length' "$expectation")" == 0 ]] || (assert_exact_sid_contract "$current" "$upstream" "$expectation") 2>/dev/null; }; then break; fi
         (($(date +%s) < deadline)) || die "Platform persistence timeout for $label"
         sleep 10
     done
@@ -2466,8 +2627,9 @@ collect_transition() {
     ' "$current")"
     deadline=$(( $(date +%s) + PERSISTENCE_TIMEOUT_SECONDS ))
     while :; do
-        platform_clickhouse "$(build_clickhouse_observation_query "$marker" "$pairs")" >"$observations_raw"
-        if [[ -s "$observations_raw" ]] && assert_selected_observations "$observations_raw" "$current" "$pairs" "$marker" 13 2>/dev/null; then break; fi
+        if capture_command_output "$observations_raw" platform_clickhouse "$(build_clickhouse_observation_query "$marker" "$pairs")" &&
+            [[ -s "$observations_raw" ]] &&
+            (assert_selected_observations "$observations_raw" "$current" "$pairs" "$marker" 13) 2>/dev/null; then break; fi
         (($(date +%s) < deadline)) || die "ClickHouse exact SID/RID history timeout for $label"
         sleep 10
     done
@@ -2484,7 +2646,7 @@ mysql_rds_call() {
     cat >"$commands" <<EOF
 set -eu
 endpoint=\$(aws rds describe-db-instances --region ${PRIMARY_REGION} --db-instance-identifier ${identifier} --query 'DBInstances[0].Endpoint.Address' --output text)
-mysql --defaults-extra-file=/tmp/releem-topology/mysql.cnf --connect-timeout=10 --host=\"\$endpoint\" --execute 'CALL mysql.${procedure};'
+mysql --defaults-extra-file=/tmp/releem-topology/mysql.cnf --connect-timeout=10 --host="\$endpoint" --execute 'CALL mysql.${procedure};'
 EOF
     chmod 600 "$commands"
     send_ssm_commands "$PRIMARY_REGION" "$EAST_RUNNER_ID" "$commands" "$procedure"
@@ -2497,7 +2659,7 @@ force_serverless_scale() {
     cat >"$commands" <<EOF
 set -eu
 endpoint=\$(aws rds describe-db-instances --region ${PRIMARY_REGION} --db-instance-identifier ${identifier}-1 --query 'DBInstances[0].Endpoint.Address' --output text)
-for n in 1 2 3 4 5 6 7 8; do mysql --defaults-extra-file=/tmp/releem-topology/mysql.cnf --connect-timeout=10 --host=\"\$endpoint\" --execute 'SELECT BENCHMARK(20000000,SHA2(UUID(),512));' >/dev/null & done
+for n in 1 2 3 4 5 6 7 8; do mysql --defaults-extra-file=/tmp/releem-topology/mysql.cnf --connect-timeout=10 --host="\$endpoint" --execute 'SELECT BENCHMARK(20000000,SHA2(UUID(),512));' >/dev/null & done
 wait
 EOF
     chmod 600 "$commands"
@@ -2521,7 +2683,7 @@ EOF
           --argjson after_capacity "$after_capacity" --argjson after_util "$after_util" \
           '{before:{capacity:$before_capacity,acu_utilization:$before_util},during:{capacity:$during_capacity,acu_utilization:$during_util},after:{capacity:$after_capacity,acu_utilization:$after_util},attempts:$attempts}' >"$evidence"
         chmod 600 "$evidence"
-        assert_serverless_scale_evidence "$evidence" 3 2>/dev/null && return 0
+        serverless_scale_evidence_present "$evidence" 3 2>/dev/null && return 0
     done
     assert_serverless_scale_evidence "$evidence" 3
 }
@@ -2536,14 +2698,15 @@ serverless_metric_value() {
 }
 
 exercise_matrix() {
-    local map_file aws_map provisioned serverless global_id global_west replica multi before marker expectation target_writer sids group_key member_key max_acu replica_sid old_writer old_primary_members
+    local map_file aws_map provisioned serverless global_id global_east global_west replica multi before marker expectation target_writer sids group_key member_key max_acu replica_sid old_writer old_primary_members
     map_file="$(evidence_dir)/sid-map.jsonl"
     marker="$(marker_ms)"
     wait_sid_map "$map_file"
+    rm -f "$(state_dir)/native-identities.json"
     aws_map="$(evidence_dir)/aws-identity-map.jsonl"
     capture_aws_identity_map "$aws_map"
     provisioned="$(resource_name aurora-provisioned)"; serverless="$(resource_name aurora-serverless)"
-    global_id="$(resource_name aurora-global)"; global_west="$(resource_name global-west)"
+    global_id="$(resource_name aurora-global)"; global_east="$(resource_name global-east)"; global_west="$(resource_name global-west)"
     replica="$(resource_name rds-replica)"; multi="$(resource_name rds-multi-az)"
 
     expectation="$(evidence_dir)/transitions/${marker}-aws-baseline-expectation.json"
@@ -2560,6 +2723,7 @@ exercise_matrix() {
     aws_region "$PRIMARY_REGION" rds failover-db-cluster --db-cluster-identifier "$provisioned" \
         --target-db-instance-identifier "$target_writer" >/dev/null
     wait_cluster_available "$PRIMARY_REGION" "$provisioned"
+    wait_cluster_writer "$PRIMARY_REGION" "$provisioned" "$target_writer"
     expectation="$(evidence_dir)/transitions/${marker}-aurora-provisioned-failover-expectation.json"
     group_key="$(relation_value_for_provider "$before" "$map_file" "${provisioned}-1" aurora_cluster group_key)"
     old_writer="$(jq -sr --arg group "$group_key" 'map(select(.relation_type=="aurora_cluster" and .group_key==$group and .is_writer==1))|if length==1 then .[0].member_key else error("old writer missing") end' "$before")"
@@ -2581,13 +2745,19 @@ exercise_matrix() {
     add_exact_provider_expectations "$expectation" "$map_file" "$marker"
     collect_transition aurora-serverless-scaled "$marker" "$expectation" "$map_file"
 
-    marker="$(marker_ms)"
-    local target_global_arn old_global_arn
-    target_global_arn="arn:aws:rds:${SECONDARY_REGION}:$(aws sts get-caller-identity --query Account --output text):cluster:${global_west}"
+    local account east_global_arn west_global_arn target_global_arn target_global_region target_global_identifier old_global_arn target_selection
+    account="$(aws_global sts get-caller-identity --query Account --output text)"
+    east_global_arn="arn:aws:rds:${PRIMARY_REGION}:${account}:cluster:${global_east}"
+    west_global_arn="arn:aws:rds:${SECONDARY_REGION}:${account}:cluster:${global_west}"
     old_global_arn="$(aws_region "$PRIMARY_REGION" rds describe-global-clusters --global-cluster-identifier "$global_id" --query 'GlobalClusters[0].GlobalClusterMembers[?IsWriter==`true`]|[0].DBClusterArn' --output text)"
+    target_selection="$(select_global_switchover_target "$old_global_arn" "$east_global_arn" "$west_global_arn")" || die "Global Database primary is outside the expected regional pair"
+    target_global_region="${target_selection%%|*}"
+    target_global_arn="${target_selection#*|}"
+    if [[ "$target_global_region" == "$PRIMARY_REGION" ]]; then target_global_identifier="$global_east"; else target_global_identifier="$global_west"; fi
+    marker="$(marker_ms)"
     aws_region "$PRIMARY_REGION" rds switchover-global-cluster --global-cluster-identifier "$global_id" \
         --target-db-cluster-identifier "$target_global_arn" >/dev/null
-    wait_cluster_available "$SECONDARY_REGION" "$global_west"
+    wait_cluster_available "$target_global_region" "$target_global_identifier"
     wait_global_switchover "$PRIMARY_REGION" "$global_id" "$target_global_arn" "$old_global_arn" || die "global switchover did not converge before runtime deadline"
     expectation="$(evidence_dir)/transitions/${marker}-aurora-global-transition-expectation.json"
     group_key="$(relation_value_for_provider "$before" "$map_file" "${global_west}-1" aurora_global_database group_key)"
@@ -2907,6 +3077,28 @@ assert_terminal_cleanup_state() {
     assert_inventory_empty "$inventory" && monitoring_streams_absent
 }
 
+assert_resumable_matrix() {
+    local inventory
+    load_selection_state
+    load_secret
+    load_support_state
+    verify_destroy_ownership
+    inventory="$(state_dir)/resume-inventory.json"
+    capture_inventory "$inventory"
+    assert_resumable_inventory_shape "$inventory"
+    assert_all_db_instances_safe
+    monitoring_all_instances_created || die "existing matrix monitoring manifest is incomplete"
+    wait_all_monitoring_events
+}
+
+resume_existing_matrix() {
+    assert_resumable_matrix
+    mark_provisioning_complete
+    stop_agents regular || die "unable to stop existing agents before resume"
+    start_agents
+    exercise_matrix
+}
+
 cleanup_once() {
     "$CLEANUP_DONE" && return 0
     cleanup_resources
@@ -2917,8 +3109,18 @@ on_signal() {
     trap - EXIT INT TERM HUP
     set +e
     stop_watchdog
-    if "$CLEANUP_ARMED"; then cleanup_once; else rm -f "$(secret_file)" 2>/dev/null; fi
-    log "terminated by ${signal} after cleanup"
+    if provisioning_complete; then
+        preserve_after_agent_failure || true
+        log "terminated by ${signal}; provisioned matrix was preserved"
+    elif "$RESUME_MODE"; then
+        log "terminated by ${signal}; existing matrix was left unchanged"
+    elif "$CLEANUP_ARMED"; then
+        cleanup_once
+        log "terminated by ${signal} after cleanup"
+    else
+        rm -f "$(secret_file)" 2>/dev/null
+        log "terminated by ${signal}"
+    fi
     exit "$status"
 }
 
@@ -2927,7 +3129,11 @@ on_exit() {
     trap - EXIT
     set +e
     stop_watchdog
-    if "$CLEANUP_ARMED"; then
+    if ((status != 0)) && provisioning_complete; then
+        preserve_after_agent_failure || cleanup_status=$?
+    elif ((status != 0)) && "$RESUME_MODE"; then
+        log "resume validation failed before agent startup; existing matrix was left unchanged"
+    elif "$CLEANUP_ARMED"; then
         cleanup_once || cleanup_status=$?
     else
         rm -f "$(secret_file)" 2>/dev/null || cleanup_status=$?
@@ -2938,6 +3144,7 @@ on_exit() {
 
 run_matrix() {
     validate_run_id
+    clear_provisioning_marker
     require_runtime
     for command in aws flock jq openssl mysql curl timeout tar sha256sum; do require_command "$command"; done
     validate_runtime_deadline "$RUNTIME_DEADLINE_SECONDS"
@@ -2953,11 +3160,31 @@ run_matrix() {
     create_matrix
     assert_all_db_instances_safe
     wait_all_monitoring_events
+    mark_provisioning_complete
     start_agents
     exercise_matrix
     stop_watchdog
     cleanup_once
     trap - EXIT INT TERM HUP
+}
+
+resume_matrix() {
+    validate_run_id
+    RESUME_MODE=true
+    require_agent_runtime
+    for command in aws flock jq mysql curl timeout tar sha256sum; do require_command "$command"; done
+    validate_runtime_deadline "$RUNTIME_DEADLINE_SECONDS"
+    RUN_DEADLINE_EPOCH=$(( $(date +%s) + RUNTIME_DEADLINE_SECONDS ))
+    trap on_exit EXIT
+    trap 'on_signal HUP 129' HUP
+    trap 'on_signal INT 130' INT
+    trap 'on_signal TERM 143' TERM
+    (sleep "$RUNTIME_DEADLINE_SECONDS"; kill -TERM "$$") &
+    WATCHDOG_PID=$!
+    resume_existing_matrix
+    stop_watchdog
+    trap - EXIT INT TERM HUP
+    log "resume completed; existing matrix remains provisioned until exact-confirmed destroy"
 }
 
 inventory() {
@@ -2988,6 +3215,7 @@ main() {
         help|-h|--help) usage ;;
         preflight) shift; [[ $# -eq 0 ]] || die "preflight takes no arguments"; preflight ;;
         run) shift; [[ $# -eq 0 ]] || die "run takes no arguments"; run_matrix ;;
+        resume) shift; [[ $# -eq 0 ]] || die "resume takes no arguments"; resume_matrix ;;
         inventory) shift; [[ $# -eq 0 ]] || die "inventory takes no arguments"; inventory ;;
         destroy) shift; [[ $# -eq 0 ]] || die "destroy takes no arguments"; destroy ;;
         *) usage >&2; die "unknown command: $1" ;;

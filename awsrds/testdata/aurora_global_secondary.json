@@ -37,7 +37,7 @@
         {
           "DBInstanceIdentifier": "global-secondary-writer",
           "DBClusterParameterGroupStatus": "in-sync",
-          "IsClusterWriter": true,
+          "IsClusterWriter": false,
           "PromotionTier": 0
         },
         {
