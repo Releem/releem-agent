@@ -16,6 +16,11 @@ import (
 
 var Ready bool
 
+func oneShotMode(mode models.ModeType) bool {
+	return (mode.Name == "Configurations" && mode.Type != "Default") ||
+		mode.Name == "Event" || mode.Name == "TaskByName"
+}
+
 // Set up channel on which to send signal notifications.
 // We must use a buffered channel or risk missing the signal
 // if we're not ready to receive when the signal is sent.
@@ -34,8 +39,9 @@ func RunWorker(gatherers map[string][]models.MetricsGatherer, repeaters models.M
 	models.SampleQueries = make(map[string]string)
 	models.SampleQueriesMutex = sync.RWMutex{}
 	terminator := makeTerminateChannel()
+	oneShot := oneShotMode(Mode)
 
-	if (Mode.Name == "Configurations" && Mode.Type != "Default") || Mode.Name == "Event" || Mode.Name == "TaskByName" {
+	if oneShot {
 		GenerateTimer = time.NewTimer(1 * time.Second)
 		timer = time.NewTimer(24 * time.Hour)
 		QueryOptimizationTimer = time.NewTimer(24 * time.Hour)
@@ -100,7 +106,7 @@ loop:
 					logger.Info("* The recommended Database configuration has been downloaded to: ", configuration.GetReleemConfDir())
 				}
 
-				if (Mode.Name == "Configurations" && Mode.Type != "Default") || Mode.Name == "Event" || Mode.Name == "TaskByName" {
+				if oneShot {
 					logger.Info("Exiting")
 					os.Exit(0)
 				}
