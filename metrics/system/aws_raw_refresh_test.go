@@ -35,7 +35,7 @@ func TestRawSourceRefreshCompleteness(t *testing.T) {
 		report := &models.Metrics{}
 		awsrds.AttachReportMetadata(report, reportMetadata, fresh)
 		_ = collector.GetMetrics(report)
-		sources := report.DB.TopologyFacts["AWS"].(*awsrds.AWSFacts).Sources
+		sources := report.DB.Topology["AWS"].(*awsrds.AWSFacts).Sources
 		expected := "ok"
 		if failed {
 			expected = "error"

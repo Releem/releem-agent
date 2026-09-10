@@ -18,13 +18,19 @@ import (
 )
 
 func TestAWSRawSharedFixtures(t *testing.T) {
-	for _, name := range []string{"aurora_global_primary.json", "aurora_global_secondary.json", "aurora_serverless_v2.json", "rds_read_replica.json", "rds_multi_az.json"} {
+	for _, name := range []string{"aurora_global_primary.json", "aurora_global_secondary.json", "aurora_global_secondary_no_writer.json", "aurora_serverless_v2.json", "rds_read_replica.json", "rds_multi_az.json"} {
 		t.Run(name, func(t *testing.T) {
 			source := name
 			if name == "aurora_serverless_v2.json" {
 				source = "aurora_global_primary.json"
 			}
+			if name == "aurora_global_secondary_no_writer.json" {
+				source = "aurora_global_secondary.json"
+			}
 			fixture := loadDiscoveryFixture(t, source)
+			if name == "aurora_global_secondary.json" {
+				fixture.DBClusters[0].DBClusterMembers[0].IsClusterWriter = aws.Bool(true)
+			}
 			if name == "aurora_serverless_v2.json" {
 				fixture.DBInstances[0].DBInstanceClass = aws.String("db.serverless")
 				fixture.DBClusters[0].GlobalClusterIdentifier = nil
@@ -110,7 +116,7 @@ func TestAWSReportFactsAreImmutableAndPreserveNative(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, second := &models.Metrics{}, &models.Metrics{}
-	first.DB.TopologyFacts = models.MetricGroupValue{"Version": 1, "ReplicaStatus": "sentinel"}
+	first.DB.Topology = models.MetricGroupValue{"Version": 1, "ReplicaStatus": "sentinel"}
 	AttachReportMetadata(first, metadata, true)
 	metadata.TopologyFacts.GlobalCluster.GlobalClusterMembers[0].Readers[0] = "changed"
 	metadata.TopologyFacts.Sources["GlobalCluster"] = "error"
@@ -118,13 +124,13 @@ func TestAWSReportFactsAreImmutableAndPreserveNative(t *testing.T) {
 	gatherer := NewTopologyRelationsGatherer(*logging.Init("facts-test", false, false, io.Discard))
 	_ = gatherer.GetMetrics(second)
 	_ = gatherer.GetMetrics(first)
-	if first.DB.TopologyFacts["ReplicaStatus"] != "sentinel" {
+	if first.DB.Topology["ReplicaStatus"] != "sentinel" {
 		t.Fatal("overwrote native facts")
 	}
-	if first.DB.TopologyFacts["AWS"].(*AWSFacts).Sources["GlobalCluster"] != "ok" || second.DB.TopologyFacts["AWS"].(*AWSFacts).Sources["GlobalCluster"] != "error" {
+	if first.DB.Topology["AWS"].(*AWSFacts).Sources["GlobalCluster"] != "ok" || second.DB.Topology["AWS"].(*AWSFacts).Sources["GlobalCluster"] != "error" {
 		t.Fatal("cross-report contamination")
 	}
-	if first.DB.Topology != nil || second.DB.Topology != nil {
+	if first.DB.Topology["Relations"] != nil || second.DB.Topology["Relations"] != nil {
 		t.Fatal("Agent constructed semantic topology")
 	}
 }

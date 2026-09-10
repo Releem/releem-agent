@@ -44,10 +44,10 @@ func (g *topologyRelationsGatherer) GetMetrics(metrics *models.Metrics) error {
 		}
 	}
 
-	if metrics.DB.TopologyFacts == nil {
-		metrics.DB.TopologyFacts = models.MetricGroupValue{"Version": 1}
+	if metrics.DB.Topology == nil {
+		metrics.DB.Topology = models.MetricGroupValue{"Version": 1}
 	}
-	metrics.DB.TopologyFacts["AWS"] = facts
+	metrics.DB.Topology["AWS"] = facts
 	return nil
 }
 

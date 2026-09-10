@@ -35,10 +35,10 @@ func (g *DBTopologyGatherer) GetMetrics(metrics *models.Metrics) error {
 		variables[strings.ToLower(key)] = fmt.Sprint(value)
 	}
 	facts := collectTopologyFacts(variables, queryTopologyStringRows)
-	if provider, ok := metrics.DB.TopologyFacts["AWS"]; ok {
+	if provider, ok := metrics.DB.Topology["AWS"]; ok {
 		facts["AWS"] = provider
 	}
-	metrics.DB.TopologyFacts = facts
+	metrics.DB.Topology = facts
 	return nil
 }
 

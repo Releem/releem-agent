@@ -1,6 +1,6 @@
 # AWS topology facts, version 1
 
-The AWS feature branches extend DB.TopologyFacts.Version=1 with AWS.Version=1.
+The AWS feature branches extend DB.Topology.Version=1 with AWS.Version=1.
 Agent collects allowlisted API observations. Platform interprets them in
 src/v2/topology_aws_facts.py, called by topology_facts.build_db_topology before
 PersistDbTopology, SQL relation/upstream persistence and ClickHouse observations.
@@ -8,7 +8,7 @@ PersistDbTopology, SQL relation/upstream persistence and ClickHouse observations
 ## Wire object
 
 AWS contains Version, Target, Cluster, GlobalCluster, Instances and Sources.
-The complete typed field allowlist is awsrds/raw_facts.go in Agent. The five
+The complete typed field allowlist is awsrds/raw_facts.go in Agent. The six
 JSON fixtures in awsrds/testdata/facts are byte-identical to Platform
 tests/fixtures/aws_topology_facts and are asserted against actual Go serialization.
 
@@ -60,7 +60,9 @@ global roles and nonreciprocal ordinary RDS source/child relationships. Invalid
 optional evidence leaves valid local relations available with incomplete status.
 
 Aurora regional primary remains Role=primary on a global secondary, but IsWriter
-is false and ReadOnly true. Forwarding is a separate fact and never establishes
+is false and ReadOnly true. A verified global secondary may also have no
+regional writer: its regional role is replica and primary fields are null.
+Missing writers in other roles and multiple regional writers are rejected. Forwarding is a separate fact and never establishes
 autonomous writer availability. Unknown global role or inaccessible global API
 cannot establish a writer. The restriction also applies to the native engine
 projection. SQL status is not used to override provider write restrictions.
@@ -77,8 +79,9 @@ inconsistent/missing identities or declared peers, unknown fields needed to prov
 absence, and invalid/absent native facts emit only Facts.Relations; missing
 memberships cannot be deleted. Provider-only PostgreSQL reports are supported
 without inventing native PostgreSQL topology and remain conservatively partial.
-Legacy DB.Topology payloads remain compatible. Unknown outer/AWS versions never
-fall back to stale accompanying topology or authorize deletion.
+`DB.Topology` is the sole wire object and contains raw observations only.
+Semantic topology payloads and `DB.TopologyFacts` are not accepted. Unknown
+outer/AWS versions never fall back to another format or authorize deletion.
 
 ## Verification
 

@@ -36,7 +36,7 @@ func TestSQLAndAWSCollectionOrder(t *testing.T) {
 		if !awsFirst {
 			_ = awsCollector.GetMetrics(metrics)
 		}
-		if metrics.DB.TopologyFacts["AWS"].(*awsrds.AWSFacts).Sources["Target"] != "ok" || metrics.DB.TopologyFacts["Version"] != 1 || metrics.DB.TopologyFacts["ReplicaStatus"] == nil {
+		if metrics.DB.Topology["AWS"].(*awsrds.AWSFacts).Sources["Target"] != "ok" || metrics.DB.Topology["Version"] != 1 || metrics.DB.Topology["ReplicaStatus"] == nil {
 			t.Fatal("collection order lost facts")
 		}
 	}

@@ -1,0 +1,91 @@
+{
+  "Version": 1,
+  "Target": {
+    "DBInstanceIdentifier": "global-secondary-writer",
+    "DBInstanceArn": "arn:aws:rds:us-west-2:123456789012:db:global-secondary-writer",
+    "DbiResourceId": "db-global-secondary-writer",
+    "DBInstanceClass": "db.r7g.large",
+    "Engine": "aurora-mysql",
+    "DBInstanceStatus": "available",
+    "DBClusterIdentifier": "global-secondary",
+    "Endpoint": "global-secondary-writer.internal",
+    "Port": 3306,
+    "MultiAZ": null,
+    "ReadReplicaSourceDBInstanceIdentifier": "",
+    "ReadReplicaDBInstanceIdentifiers": []
+  },
+  "Cluster": {
+    "DBClusterParameterGroup": "global-secondary-pg",
+    "ServerlessV2ScalingConfiguration": null,
+    "DBClusterIdentifier": "global-secondary",
+    "DBClusterArn": "arn:aws:rds:us-west-2:123456789012:cluster:global-secondary",
+    "DbClusterResourceId": "cluster-global-secondary-resource",
+    "Engine": "aurora-mysql",
+    "EngineMode": "provisioned",
+    "Endpoint": "global-secondary.cluster.internal",
+    "ReaderEndpoint": "global-secondary-ro.cluster.internal",
+    "GlobalClusterIdentifier": "orders-global",
+    "GlobalWriteForwardingStatus": "",
+    "DBClusterMembers": [
+      {
+        "DBInstanceIdentifier": "global-secondary-writer",
+        "IsClusterWriter": false,
+        "PromotionTier": 0,
+        "DBClusterParameterGroupStatus": "in-sync"
+      },
+      {
+        "DBInstanceIdentifier": "global-secondary-reader",
+        "IsClusterWriter": false,
+        "PromotionTier": 1,
+        "DBClusterParameterGroupStatus": "in-sync"
+      }
+    ]
+  },
+  "GlobalCluster": {
+    "GlobalClusterIdentifier": "orders-global",
+    "GlobalClusterArn": "arn:aws:rds::123456789012:global-cluster:orders-global",
+    "GlobalClusterResourceId": "cluster-global-resource",
+    "GlobalClusterMembers": [
+      {
+        "DBClusterArn": "arn:aws:rds:us-east-1:123456789012:cluster:global-primary",
+        "IsWriter": true,
+        "Readers": [
+          "arn:aws:rds:us-west-2:123456789012:cluster:global-secondary"
+        ],
+        "SynchronizationStatus": "connected",
+        "GlobalWriteForwardingStatus": "enabled"
+      },
+      {
+        "DBClusterArn": "arn:aws:rds:us-west-2:123456789012:cluster:global-secondary",
+        "IsWriter": false,
+        "Readers": [],
+        "SynchronizationStatus": "connected",
+        "GlobalWriteForwardingStatus": "disabled"
+      }
+    ]
+  },
+  "Instances": [
+    {
+      "DBInstanceIdentifier": "global-secondary-reader",
+      "DBInstanceArn": "arn:aws:rds:us-west-2:123456789012:db:global-secondary-reader",
+      "DbiResourceId": "db-global-secondary-reader",
+      "DBInstanceClass": "db.r7g.large",
+      "Engine": "aurora-mysql",
+      "DBInstanceStatus": "available",
+      "DBClusterIdentifier": "global-secondary",
+      "Endpoint": "global-secondary-reader.internal",
+      "Port": 3306,
+      "MultiAZ": null,
+      "ReadReplicaSourceDBInstanceIdentifier": "",
+      "ReadReplicaDBInstanceIdentifiers": []
+    }
+  ],
+  "Sources": {
+    "Children": "unsupported",
+    "Cluster": "ok",
+    "GlobalCluster": "ok",
+    "Peers": "ok",
+    "Source": "unsupported",
+    "Target": "ok"
+  }
+}
