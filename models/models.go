@@ -20,16 +20,8 @@ type ModeType struct {
 	Name string
 	Type string
 }
-
-// MetricsInternal carries per-collection data between ordered gatherers. The
-// parent field is excluded from report serialization.
-type MetricsInternal struct {
-	AWSRDS any
-}
-
 type Metrics struct {
-	Internal MetricsInternal `json:"-"`
-	System   struct {
+	System struct {
 		Info    MetricGroupValue
 		Conf    MetricGroupValue
 		Metrics MetricGroupValue
