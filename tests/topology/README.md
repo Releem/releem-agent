@@ -182,7 +182,7 @@ parameter-group apply, but collects only native database topology facts.
 
 ## Platform-owned interpretation
 
-The agent emits `DB.TopologyFacts` version 1 with raw `ReplicaStatus`,
+The agent emits `DB.Topology` version 1 with raw `ReplicaStatus`,
 `GroupMembers`, and `InnoDBMetadata` (`SchemaVersion` and `Tables`). `Sources`
 records `ok`, `unsupported` (known absence), or `error` for each source.
 Variables and status remain in `DB.Conf.Variables` and `DB.Metrics.Status`.

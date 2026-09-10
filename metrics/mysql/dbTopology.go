@@ -34,7 +34,7 @@ func (g *DBTopologyGatherer) GetMetrics(metrics *models.Metrics) error {
 	for key, value := range metrics.DB.Conf.Variables {
 		variables[strings.ToLower(key)] = fmt.Sprint(value)
 	}
-	metrics.DB.TopologyFacts = collectTopologyFacts(variables, queryTopologyStringRows)
+	metrics.DB.Topology = collectTopologyFacts(variables, queryTopologyStringRows)
 	return nil
 }
 

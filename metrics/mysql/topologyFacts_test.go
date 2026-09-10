@@ -162,18 +162,27 @@ func TestCollectTopologyFactsIsRawAndVersioned(t *testing.T) {
 		t.Fatalf("sources: %v", sources)
 	}
 	metrics := models.Metrics{}
-	metrics.DB.TopologyFacts = facts
+	metrics.DB.Topology = facts
 	data, err := json.Marshal(metrics)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"private-user", "private sql", `"IsWriter"`, `"Role"`, `"Relations"`, `"Topology":`} {
+	for _, forbidden := range []string{"private-user", "private sql", `"IsWriter"`, `"Role"`, `"Relations"`, `"TopologyFacts":`} {
 		if strings.Contains(string(data), forbidden) {
 			t.Fatalf("unexpected %s in %s", forbidden, data)
 		}
 	}
 	if !strings.Contains(string(data), `"Slave_IO_Running":"No"`) {
 		t.Fatal("raw status lost")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	db := payload["DB"].(map[string]any)
+	topology, ok := db["Topology"].(map[string]any)
+	if !ok || topology["Version"] != float64(1) {
+		t.Fatalf("missing versioned DB.Topology: %s", data)
 	}
 }
 
