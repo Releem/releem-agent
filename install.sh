@@ -793,6 +793,7 @@ function create_or_update_postgresql_monitoring_role() {
     postgresql_root_exec "${pg_superuser}" -c "GRANT pg_monitor TO ${quoted_monitoring_role};" 2>/dev/null
     postgresql_root_exec "${pg_superuser}" -c "GRANT SELECT ON pg_hba_file_rules TO ${quoted_monitoring_role};" 2>/dev/null
     postgresql_root_exec "${pg_superuser}" -c "GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO ${quoted_monitoring_role};" 2>/dev/null
+    postgresql_root_exec "${pg_superuser}" -v ON_ERROR_STOP=1 -c "GRANT EXECUTE ON FUNCTION pg_catalog.pg_reload_conf() TO ${quoted_monitoring_role};"
 }
 
 function create_postgresql_user() {

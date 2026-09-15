@@ -545,7 +545,8 @@ exit 0
     for grant in \
         'GRANT pg_monitor TO "role""reader";' \
         'GRANT SELECT ON pg_hba_file_rules TO "role""reader";' \
-        'GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO "role""reader";'; do
+        'GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO "role""reader";' \
+        'GRANT EXECUTE ON FUNCTION pg_catalog.pg_reload_conf() TO "role""reader";'; do
         run grep -F -- "arg=${grant}" "${TEST_TMPDIR}/pg.args"
         [ "$status" -eq 0 ]
     done
@@ -592,7 +593,8 @@ exit 0
     for grant in \
         'GRANT pg_monitor TO "new""reader";' \
         'GRANT SELECT ON pg_hba_file_rules TO "new""reader";' \
-        'GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO "new""reader";'; do
+        'GRANT EXECUTE ON FUNCTION pg_hba_file_rules TO "new""reader";' \
+        'GRANT EXECUTE ON FUNCTION pg_catalog.pg_reload_conf() TO "new""reader";'; do
         run grep -F -- "arg=${grant}" "${TEST_TMPDIR}/pg.args"
         [ "$status" -eq 0 ]
     done
