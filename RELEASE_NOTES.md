@@ -227,3 +227,8 @@
 - Improved managed PostgreSQL collection by skipping only provider-owned maintenance databases and suppressing only expected managed-provider `pg_hba_file_rules` limitations, while preserving actionable errors for local installations
 - Expanded Go, installer, Docker, CloudFormation, and AWS payload contract coverage
 - Bumped agent, installer, configurer, and Windows script versions to 1.25.2
+
+## 1.25.3
+- Updated the build toolchain to Go 1.27.1 in `go.mod` and the GitHub Actions workflow
+- Upgraded all Go dependencies to their latest releases, including the AWS SDK for Go v2, Google API client, OpenTelemetry, gRPC, protobuf, and the `golang.org/x` modules
+- Bumped agent, installer, configurer, and Windows script versions to 1.25.3
