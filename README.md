@@ -60,6 +60,27 @@ The easiest way to get started with Releem is with [our managed service in the c
 
 To start using Releem just sign up at [https://releem.com](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#) and install Releem Agent on your server.
 
+### PostgreSQL reload permission for existing installations
+
+Local PostgreSQL configuration apply without restart requires permission to run
+`pg_catalog.pg_reload_conf()`. The Linux installer grants this when it creates or
+updates the monitoring role. Binary updates do not change database permissions;
+existing installations and manually provisioned monitoring accounts need this
+one-time grant before using dynamic apply.
+
+Connect as a PostgreSQL superuser to the Agent's configured `pg_database`
+(default: `postgres`) and run the following, replacing `releem` with the configured
+`pg_user` if different:
+
+```sql
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_reload_conf() TO "releem";
+SELECT has_function_privilege('releem', 'pg_catalog.pg_reload_conf()', 'EXECUTE');
+```
+
+The check should return `true`. Repeat the grant if the Agent switches databases,
+because function permissions belong to each database. This grant does not give
+the monitoring role superuser status.
+
 ### Aurora parameter groups
 
 Releem supports Amazon Aurora MySQL and Aurora PostgreSQL. Configure one Agent

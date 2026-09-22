@@ -54,9 +54,9 @@ func taskUpdateCommand(goos string, releemDir string) taskCommand {
 	return shellCommand(goos, releemDir+"/mysqlconfigurer.sh -u", nil)
 }
 
-func taskApplyAutomaticCommand(goos string, releemDir string, restart bool) taskCommand {
+func taskApplyAutomaticCommand(goos string, releemDir string, applyMode string, restart bool) taskCommand {
 	if goos == "windows" {
-		args := []string{"-Apply", "-NonInteractive"}
+		args := []string{"-Apply", "-NonInteractive", "-ApplyMode", applyMode}
 		if !restart {
 			args = append(args, "-NoRestart")
 		}
@@ -68,7 +68,7 @@ func taskApplyAutomaticCommand(goos string, releemDir string, restart bool) task
 		restartValue = "1"
 	}
 
-	return shellCommand(goos, releemDir+"/mysqlconfigurer.sh -s automatic", []string{"RELEEM_RESTART_SERVICE=" + restartValue})
+	return shellCommand(goos, releemDir+"/mysqlconfigurer.sh -s automatic "+applyMode, []string{"RELEEM_RESTART_SERVICE=" + restartValue})
 }
 
 func taskRollbackCommand(goos string, releemDir string) taskCommand {

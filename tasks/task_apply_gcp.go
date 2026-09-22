@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 )
 
 func ApplyConfGcpCloudSQL(repeaters models.MetricsRepeater, gatherers []models.MetricsGatherer,
-	logger logging.Logger, configuration *config.Config) (int, int, string) {
+	logger logging.Logger, configuration *config.Config, applyMode string) (int, int, string) {
 
 	var task_exit_code, task_status int = 0, 1
 	var task_output string
@@ -59,11 +60,27 @@ func ApplyConfGcpCloudSQL(repeaters models.MetricsRepeater, gatherers []models.M
 	}
 
 	recommendedVars := models.MetricGroupValue{}
-	recommend_var := utils.ProcessRepeaters(metrics, repeaters, configuration, logger, models.ModeType{Name: "Configurations", Type: "GetJson"})
+	recommend_var := utils.ProcessRepeaters(metrics, repeaters, configuration, logger, models.ModeType{Name: "Configurations", Type: "GetJson", ApplyMode: applyMode})
 	err = json.Unmarshal([]byte(recommend_var), &recommendedVars)
 	if err != nil {
 		logger.Error(err)
 		task_output = task_output + err.Error()
+	}
+	if applyMode == "dynamic" {
+		flagsResponse, flagsErr := sqlAdminService.Flags.List().DatabaseVersion(instance.DatabaseVersion).Context(ctx).Do()
+		if flagsErr != nil {
+			logger.Error("Failed to load GCP Cloud SQL flag metadata", flagsErr)
+			task_output += "Failed to load GCP Cloud SQL flag metadata: " + flagsErr.Error()
+			return 8, 4, task_output
+		}
+		var unknownFlags []string
+		recommendedVars, unknownFlags = filterGCPRecommendationsByApplyMode(recommendedVars, flagsResponse.Items, applyMode)
+		if len(unknownFlags) > 0 {
+			message := "GCP Cloud SQL flag metadata is missing recommended flags: " + strings.Join(unknownFlags, ", ")
+			logger.Error(message)
+			task_output += message
+			return 8, 4, task_output
+		}
 	}
 
 	// Merge current flags with recommended changes
@@ -140,6 +157,32 @@ func ApplyConfGcpCloudSQL(repeaters models.MetricsRepeater, gatherers []models.M
 
 	return task_exit_code, task_status, task_output
 
+}
+
+func filterGCPRecommendationsByApplyMode(recommendations models.MetricGroupValue, flags []*sqladmin.Flag, applyMode string) (models.MetricGroupValue, []string) {
+	if applyMode != "dynamic" {
+		return recommendations, nil
+	}
+	knownFlags := make(map[string]bool, len(flags))
+	for _, flag := range flags {
+		if flag != nil && flag.Name != "" {
+			knownFlags[flag.Name] = !flag.RequiresRestart
+		}
+	}
+	filtered := make(models.MetricGroupValue)
+	unknown := make([]string, 0)
+	for name, value := range recommendations {
+		dynamic, ok := knownFlags[name]
+		if !ok {
+			unknown = append(unknown, name)
+			continue
+		}
+		if dynamic {
+			filtered[name] = value
+		}
+	}
+	sort.Strings(unknown)
+	return filtered, unknown
 }
 
 // Waiting for long Cloud SQL operations to complete

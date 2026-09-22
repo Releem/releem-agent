@@ -24,6 +24,7 @@ type AWSApplyMode int
 const (
 	AWSApplyAll AWSApplyMode = iota
 	AWSApplyPendingRebootOnly
+	AWSApplyDynamicOnly
 )
 
 // These values preserve the public RDS task meanings used before routed
@@ -150,7 +151,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		repeaters,
 		configuration,
 		logger,
-		models.ModeType{Name: "Configurations", Type: "GetJson"},
+		models.ModeType{Name: "Configurations", Type: "GetJson", ApplyMode: awsApplyModeName(mode)},
 	)
 	recommendations, err := decodeAWSRecommendations(recommendationJSON)
 	if err != nil {
@@ -238,6 +239,7 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 		Recommendations:         recommendations,
 		CurrentValues:           awsCurrentParameterValues(metrics.DB.Conf.Variables),
 		PendingRebootOnly:       mode == AWSApplyPendingRebootOnly,
+		DynamicOnly:             mode == AWSApplyDynamicOnly,
 	})
 	result = plannedResult
 
@@ -278,6 +280,13 @@ func ApplyConfAwsRds(repeaters models.MetricsRepeater, gatherers []models.Metric
 	}
 
 	return finish(awsApplyExitSuccess, awsApplyTaskStatusSuccess)
+}
+
+func awsApplyModeName(mode AWSApplyMode) string {
+	if mode == AWSApplyDynamicOnly {
+		return "dynamic"
+	}
+	return "full"
 }
 
 func decodeAWSRecommendations(raw string) (map[string]interface{}, error) {

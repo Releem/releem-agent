@@ -26,7 +26,7 @@ type azureMySQLConfigurationMetadata struct {
 }
 
 func ApplyConfAzureMySQL(repeaters models.MetricsRepeater, gatherers []models.MetricsGatherer,
-	logger logging.Logger, configuration *config.Config, restart bool) (int, int, string) {
+	logger logging.Logger, configuration *config.Config, applyMode string, restart bool) (int, int, string) {
 
 	task_exit_code, task_status := 0, 1
 	var task_output string
@@ -80,7 +80,7 @@ func ApplyConfAzureMySQL(repeaters models.MetricsRepeater, gatherers []models.Me
 	}
 
 	recommendedVars := models.MetricGroupValue{}
-	recommendVar := utils.ProcessRepeaters(metrics, repeaters, configuration, logger, models.ModeType{Name: "Configurations", Type: "GetJson"})
+	recommendVar := utils.ProcessRepeaters(metrics, repeaters, configuration, logger, models.ModeType{Name: "Configurations", Type: "GetJson", ApplyMode: applyMode})
 	err = json.Unmarshal([]byte(recommendVar), &recommendedVars)
 	if err != nil {
 		logger.Error(err)
@@ -111,6 +111,10 @@ func ApplyConfAzureMySQL(repeaters models.MetricsRepeater, gatherers []models.Me
 		if configMetadata.readOnly {
 			logger.Infof("Azure MySQL configuration %s is read-only and will be skipped", key)
 			skippedReadOnly = append(skippedReadOnly, key)
+			continue
+		}
+		if !azureConfigurationEligibleForApplyMode(configMetadata, applyMode) {
+			logger.Infof("Azure MySQL configuration %s requires restart and will be skipped in dynamic mode", key)
 			continue
 		}
 
@@ -199,6 +203,10 @@ func ApplyConfAzureMySQL(repeaters models.MetricsRepeater, gatherers []models.Me
 	}
 
 	return task_exit_code, task_status, task_output
+}
+
+func azureConfigurationEligibleForApplyMode(metadata azureMySQLConfigurationMetadata, applyMode string) bool {
+	return !metadata.readOnly && (applyMode != "dynamic" || metadata.dynamic)
 }
 
 func loadAzureMySQLConfigurations(ctx context.Context, configurationsClient *armmysqlflexibleservers.ConfigurationsClient,

@@ -39,18 +39,18 @@ func TestWindowsTaskCommands(t *testing.T) {
 		},
 		{
 			name: "type 4 applies config without restart",
-			cmd:  taskApplyAutomaticCommand("windows", releemDir, false),
+			cmd:  taskApplyAutomaticCommand("windows", releemDir, "dynamic", false),
 			want: taskCommand{
 				name: "powershell.exe",
-				args: []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `C:\Program Files\ReleemAgent\mysqlconfigurer.ps1`, "-Apply", "-NonInteractive", "-NoRestart"},
+				args: []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `C:\Program Files\ReleemAgent\mysqlconfigurer.ps1`, "-Apply", "-NonInteractive", "-ApplyMode", "dynamic", "-NoRestart"},
 			},
 		},
 		{
 			name: "type 5 applies config with restart",
-			cmd:  taskApplyAutomaticCommand("windows", releemDir, true),
+			cmd:  taskApplyAutomaticCommand("windows", releemDir, "full", true),
 			want: taskCommand{
 				name: "powershell.exe",
-				args: []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `C:\Program Files\ReleemAgent\mysqlconfigurer.ps1`, "-Apply", "-NonInteractive"},
+				args: []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `C:\Program Files\ReleemAgent\mysqlconfigurer.ps1`, "-Apply", "-NonInteractive", "-ApplyMode", "full"},
 			},
 		},
 		{
@@ -108,19 +108,19 @@ func TestLinuxTaskCommandsKeepExistingBehavior(t *testing.T) {
 		},
 		{
 			name: "type 4 uses automatic apply without restart",
-			cmd:  taskApplyAutomaticCommand("linux", releemDir, false),
+			cmd:  taskApplyAutomaticCommand("linux", releemDir, "dynamic", false),
 			want: taskCommand{
 				name: "sh",
-				args: []string{"-c", "/opt/releem/mysqlconfigurer.sh -s automatic"},
+				args: []string{"-c", "/opt/releem/mysqlconfigurer.sh -s automatic dynamic"},
 				env:  []string{"RELEEM_RESTART_SERVICE=0"},
 			},
 		},
 		{
 			name: "type 5 uses automatic apply with restart",
-			cmd:  taskApplyAutomaticCommand("linux", releemDir, true),
+			cmd:  taskApplyAutomaticCommand("linux", releemDir, "full", true),
 			want: taskCommand{
 				name: "sh",
-				args: []string{"-c", "/opt/releem/mysqlconfigurer.sh -s automatic"},
+				args: []string{"-c", "/opt/releem/mysqlconfigurer.sh -s automatic full"},
 				env:  []string{"RELEEM_RESTART_SERVICE=1"},
 			},
 		},

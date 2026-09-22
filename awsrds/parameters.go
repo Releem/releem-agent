@@ -53,6 +53,7 @@ const (
 	SkipClusterNotSupported   SkipReason = "cluster-not-supported"
 	SkipUnsupportedEngineMode SkipReason = "unsupported-engine-mode"
 	SkipUnsupportedApplyType  SkipReason = "unsupported-apply-type"
+	SkipNotDynamic            SkipReason = "not-dynamic"
 	SkipUnchanged             SkipReason = "unchanged"
 	SkipInvalidValue          SkipReason = "invalid-value"
 )
@@ -108,6 +109,7 @@ type BuildApplyPlanInput struct {
 	Recommendations         map[string]interface{}
 	CurrentValues           map[string]interface{}
 	PendingRebootOnly       bool
+	DynamicOnly             bool
 }
 
 // ScopePlan contains the exact group and AWS parameters for one modify API.
@@ -297,6 +299,10 @@ func buildScopeParameter(input BuildApplyPlanInput, name string, parameter Param
 			applyMethod = types.ApplyMethodPendingReboot
 		}
 	case "static":
+		if input.DynamicOnly {
+			skipParameter(result, name, SkipNotDynamic)
+			return
+		}
 		applyMethod = types.ApplyMethodPendingReboot
 	default:
 		skipParameter(result, name, SkipUnsupportedApplyType)

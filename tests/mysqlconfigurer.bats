@@ -179,6 +179,34 @@ INNER
     [[ "$output" == *"Sending request to create a job"* ]]
 }
 
+@test "automatic apply forwards dynamic mode to agent config download" {
+    write_mysql_conf "aws/rds"
+    echo "8.0.36" > "${TEST_CONF_DIR}/db_version"
+    cat > "${TEST_CONF_DIR}/z_aiops_mysql.cnf" <<'EOF'
+[mysqld]
+max_connections=200
+EOF
+    cat > "${TEST_WORKDIR}/releem-agent" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${TEST_CALLS_LOG}"
+exit 0
+EOF
+    chmod +x "${TEST_WORKDIR}/releem-agent"
+
+    run env \
+        PATH="${MOCK_BIN}:${PATH}" \
+        RELEEM_TEST_MODE=1 \
+        RELEEM_RESTART_SERVICE=0 \
+        RELEEM_CONF_DIR="${TEST_CONF_DIR}/" \
+        RELEEM_CONF_FILE="${TEST_CONF_FILE}" \
+        mysqlcmd="${MOCK_BIN}/mariadb" \
+        bash "${CONFIGURER_SH}" -s automatic dynamic
+
+    [ "$status" -eq 0 ]
+    run grep -Fx -- "-c dynamic" "${TEST_CALLS_LOG}"
+    [ "$status" -eq 0 ]
+}
+
 @test "initial config command (-s initial) applies initial_config_mysql.cnf" {
     write_restart_scripts
     write_mysql_conf "aws/rds" "bash ${TEST_TMPDIR}/restart_ok.sh"

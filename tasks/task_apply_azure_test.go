@@ -49,3 +49,26 @@ func TestMySQLConfigValueToStringPreservesAzureFormattingPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestAzureConfigurationEligibleForApplyMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		metadata  azureMySQLConfigurationMetadata
+		applyMode string
+		want      bool
+	}{
+		{name: "dynamic mode accepts dynamic", metadata: azureMySQLConfigurationMetadata{dynamic: true}, applyMode: "dynamic", want: true},
+		{name: "dynamic mode rejects static", metadata: azureMySQLConfigurationMetadata{dynamic: false}, applyMode: "dynamic", want: false},
+		{name: "full mode accepts static", metadata: azureMySQLConfigurationMetadata{dynamic: false}, applyMode: "full", want: true},
+		{name: "read only is always rejected", metadata: azureMySQLConfigurationMetadata{dynamic: true, readOnly: true}, applyMode: "full", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := azureConfigurationEligibleForApplyMode(tt.metadata, tt.applyMode)
+			if got != tt.want {
+				t.Errorf("azureConfigurationEligibleForApplyMode(%+v, %q) = %t, want %t", tt.metadata, tt.applyMode, got, tt.want)
+			}
+		})
+	}
+}

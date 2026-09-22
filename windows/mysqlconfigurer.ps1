@@ -48,6 +48,8 @@ param(
     [Alias('Automatic')]
     [switch]$NonInteractive,
     [switch]$NoRestart,
+    [ValidateSet('dynamic', 'full')]
+    [string]$ApplyMode = 'full',
     [switch]$QueueApply,
     [Alias('r')]
     [switch]$Rollback,
@@ -309,7 +311,9 @@ function Restart-MySqlService {
 function Invoke-ApplyConfig {
     param(
         [bool]$Interactive,
-        [bool]$RestartService
+        [bool]$RestartService,
+        [ValidateSet('dynamic', 'full')]
+        [string]$ConfigurationApplyMode
     )
 
     # Check that recommended config file exists in staging area
@@ -327,9 +331,9 @@ function Invoke-ApplyConfig {
 
     Write-Log 'Getting the latest up-to-date configuration.'
     if (Test-Path $AgentBinaryPath) {
-        & $AgentBinaryPath -c
+        & $AgentBinaryPath -c $ConfigurationApplyMode
         $getConfigExitCode = $LASTEXITCODE
-        Write-Log "releem-agent.exe -c exited with code: $getConfigExitCode"
+        Write-Log "releem-agent.exe -c $ConfigurationApplyMode exited with code: $getConfigExitCode"
     } else {
         Write-Log "WARNING: Releem Agent binary not found, skipping configuration refresh: $AgentBinaryPath"
     }
@@ -543,7 +547,7 @@ try {
         } else {
             Write-Log 'Starting -Apply: applying recommended MySQL configuration...'
         }
-        Invoke-ApplyConfig -Interactive (-not $NonInteractive) -RestartService (-not $NoRestart)
+        Invoke-ApplyConfig -Interactive (-not $NonInteractive) -RestartService (-not $NoRestart) -ConfigurationApplyMode $ApplyMode
     }
 
     if ($QueueApply) {

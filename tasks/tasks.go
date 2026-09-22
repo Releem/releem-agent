@@ -77,17 +77,17 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 		switch configuration.InstanceType {
 		case "aws/rds":
 			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAwsRds(
-				repeaters, gatherers, logger, configuration, AWSApplyAll)
+				repeaters, gatherers, logger, configuration, AWSApplyDynamicOnly)
 			TaskStruct.Output = TaskStruct.Output + task_output
 		case "gcp/cloudsql":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration, "dynamic")
 			TaskStruct.Output = TaskStruct.Output + task_output
 		case "azure/mysql":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAzureMySQL(repeaters, gatherers, logger, configuration, false)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAzureMySQL(repeaters, gatherers, logger, configuration, "dynamic", false)
 			TaskStruct.Output = TaskStruct.Output + task_output
 
 		default:
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = execTaskCommand(taskApplyAutomaticCommand(runtime.GOOS, configuration.ReleemDir, false), logger)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = execTaskCommand(taskApplyAutomaticCommand(runtime.GOOS, configuration.ReleemDir, "dynamic", false), logger)
 			TaskStruct.Output = TaskStruct.Output + task_output
 			if TaskStruct.ExitCode == 7 {
 				var rollback_exit_code int
@@ -106,17 +106,17 @@ func ProcessTask(repeaters models.MetricsRepeater, gatherers []models.MetricsGat
 		switch configuration.InstanceType {
 		case "aws/rds":
 			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAwsRds(
-				repeaters, gatherers, logger, configuration, AWSApplyPendingRebootOnly)
+				repeaters, gatherers, logger, configuration, AWSApplyAll)
 			TaskStruct.Output = TaskStruct.Output + task_output
 		case "gcp/cloudsql":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfGcpCloudSQL(repeaters, gatherers, logger, configuration, "full")
 			TaskStruct.Output = TaskStruct.Output + task_output
 		case "azure/mysql":
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAzureMySQL(repeaters, gatherers, logger, configuration, true)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = ApplyConfAzureMySQL(repeaters, gatherers, logger, configuration, "full", true)
 			TaskStruct.Output = TaskStruct.Output + task_output
 
 		default:
-			TaskStruct.ExitCode, TaskStruct.Status, task_output = execTaskCommand(taskApplyAutomaticCommand(runtime.GOOS, configuration.ReleemDir, true), logger)
+			TaskStruct.ExitCode, TaskStruct.Status, task_output = execTaskCommand(taskApplyAutomaticCommand(runtime.GOOS, configuration.ReleemDir, "full", true), logger)
 			TaskStruct.Output = TaskStruct.Output + task_output
 			if TaskStruct.ExitCode == 7 {
 				var rollback_exit_code int
