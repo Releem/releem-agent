@@ -232,3 +232,8 @@
 - Updated the build toolchain to Go 1.27.1 in `go.mod` and the GitHub Actions workflow
 - Upgraded all Go dependencies to their latest releases, including the AWS SDK for Go v2, Google API client, OpenTelemetry, gRPC, protobuf, and the `golang.org/x` modules
 - Bumped agent, installer, configurer, and Windows script versions to 1.25.3
+
+
+## 1.25.4
+- Fixed dynamic(without restart) and full(with restart) configuration apply modes
+- Bumped agent, installer, configurer, and Windows script versions to 1.25.4
