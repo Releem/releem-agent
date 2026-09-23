@@ -237,3 +237,8 @@
 ## 1.25.4
 - Fixed dynamic(without restart) and full(with restart) configuration apply modes
 - Bumped agent, installer, configurer, and Windows script versions to 1.25.4
+
+## 1.25.4.1
+- Fixed agent termination on CloudWatch Logs errors while collecting AWS RDS Enhanced Monitoring metrics (#534). Errors are now logged without exiting; the affected collection cycle is skipped and collection resumes on the next scheduled cycle.
+- Added regression coverage for CloudWatch HTTP 500/503 errors and recovery on the next collection cycle.
+- Bumped agent, installer, configurer, and Windows script versions to 1.25.4.1.

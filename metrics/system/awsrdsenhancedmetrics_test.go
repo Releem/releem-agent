@@ -18,8 +18,58 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/smithy-go"
 	logging "github.com/google/logger"
 )
+
+func TestAWSRDSEnhancedMetricsGathererRecoversAfterCloudWatchError(t *testing.T) {
+	fixture, err := os.ReadFile("../../awsrds/testdata/aurora_mysql_writer.json")
+	if err != nil {
+		t.Fatalf("read enhanced-monitoring fixture: %v", err)
+	}
+	for _, status := range []int{http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			successClient, requestedStream := testCloudWatchLogsClient(t, fixture)
+			options := successClient.Options()
+			successHTTPClient := options.HTTPClient
+			calls := 0
+			options.RetryMaxAttempts = 1
+			options.HTTPClient = testHTTPClient{do: func(r *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					return &http.Response{
+						StatusCode: status,
+						Header:     http.Header{"Content-Type": []string{"application/x-amz-json-1.1"}},
+						Body:       io.NopCloser(strings.NewReader(`{"__type":"ServiceUnavailableException","message":"try again later"}`)),
+					}, nil
+				}
+				return successHTTPClient.Do(r)
+			}}
+			logger := *logging.Init("aws-rds-cloudwatch-error-test", false, false, io.Discard)
+			metadata := testRDSMetadata("orders-rds", "db-resource-rds", "db.m7g.large", "mysql", "orders-rds-pg", "", "", "", false)
+			gatherer := NewAWSRDSEnhancedMetricsGatherer(logger, cloudwatchlogs.New(options), &config.Config{}, metadata,
+				func(context.Context) (awsrds.Metadata, error) { return metadata, nil })
+			metrics := &models.Metrics{}
+			err := gatherer.GetMetrics(metrics)
+			var apiErr smithy.APIError
+			if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "ServiceUnavailableException" {
+				t.Fatalf("GetMetrics(failed cycle) error = %v, want ServiceUnavailableException", err)
+			}
+			if metrics.System.Info != nil || metrics.System.Metrics != nil {
+				t.Fatalf("GetMetrics(failed cycle) published system metrics: %#v", metrics.System)
+			}
+			if err := gatherer.GetMetrics(metrics); err != nil {
+				t.Fatalf("GetMetrics(next cycle) error = %v, want nil", err)
+			}
+			if metrics.System.Info["Host"] == nil || metrics.System.Metrics["PhysicalMemory"] == nil {
+				t.Fatalf("GetMetrics(next cycle) missing system metrics: %#v", metrics.System)
+			}
+			if got := <-requestedStream; got != metadata.DBInstanceResourceID {
+				t.Errorf("CloudWatch log stream = %q, want %q", got, metadata.DBInstanceResourceID)
+			}
+		})
+	}
+}
 
 func TestAWSRDSEnhancedMetricsGathererPublishesRDSMetadata(t *testing.T) {
 	t.Parallel()

@@ -287,7 +287,7 @@ func (awsrdsenhancedmetrics *AWSRDSEnhancedMetricsGatherer) GetMetrics(metrics *
 	result, err := awsrdsenhancedmetrics.cwlogsclient.GetLogEvents(ctx, &input)
 
 	if err != nil {
-		awsrdsenhancedmetrics.logger.Fatalf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, metadata.DBInstanceResourceID, err)
+		awsrdsenhancedmetrics.logger.Errorf("failed to read log stream %s:%s: %s", rdsMetricsLogGroupName, metadata.DBInstanceResourceID, err)
 		return err
 	}
 
