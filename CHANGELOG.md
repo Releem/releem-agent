@@ -1,6 +1,26 @@
 Releem releases
 ---
 
+Releem 1.25.4.1, 2026-08-31
+
+- Added SQL Query Optimization and Schema Checks for PostgreSQL.
+- Added support for applying Aurora MySQL and Aurora PostgreSQL configuration recommendations to instance and cluster parameter groups.
+- Added a CloudFormation deployment option without a public IP address.
+- Added configurable full-metrics collection intervals to CloudFormation deployments.
+- Replaced fixed MySQL and MariaDB join-buffer recommendations with workload-based sizing. Closes #529.
+- Capped `thread_cache_size` recommendations at the effective `max_connections` value. Closes #533.
+- Reduced collection overhead and slow-query count spikes on large MySQL and MariaDB servers by caching table-size metrics. Closes #496.
+- Improved query and schema collection reliability when individual databases, schema sections, or EXPLAIN operations fail.
+- Fixed dynamic configuration apply mode and full configuration apply mode.
+- Improved Releem agent installation for PostgreSQL with version-aware query optimization permissions and safer credential handling.
+- Improved managed PostgreSQL compatibility when provider-owned databases or security metadata are restricted.
+- Improved security check compatibility with Aurora MySQL 8.0.
+- Fixed Agent termination on CloudWatch Logs errors while collecting AWS RDS Enhanced Monitoring metrics. Closes #534.
+- Fixed unnecessary `innodb_change_buffering` recommendation switching. Closes #513.
+- Improved InnoDB buffer pool sizing. Closes #524.
+- Documented version-specific PostgreSQL permissions for enabling query optimization.
+- Updated the Agent build toolchain to Go 1.27.1 and refreshed its Go dependencies.
+
 Releem 1.24.0, 2026-06-30 ([What's New At Releem | June 2026](https://releem.com/blog/whats-new-at-releem-june-2026))
 - Added safe automation for index recommendations with guarded validation, backup, dry-run, and apply flow. (#522)
 - Improved setup with a multi-step Installation Wizard and local password entry for Linux and Windows installation flows.
