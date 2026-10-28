@@ -261,7 +261,7 @@
 
 - Added support for applying a selected configuration by `configuration_status_id` and rolling back to a selected configuration through managed rollback tasks.
 - Moved configuration downloads for local apply tasks into the Go agent. Linux and Windows management scripts apply the prepared file; initial setup downloads fresh initial configuration before applying it.
-- Improved task validation and terminal-status reporting when post-task metrics are unavailable, without presenting pre-apply configuration values as fresh observations.
+- Improved task validation and ensured tasks report their final status even when metric collection fails after execution.
 - Preserved configuration request errors and timeout causes across local and cloud apply paths. Repeater panics now return errors instead of being treated as successful empty responses. Empty configuration responses no longer overwrite the existing staging file.
 - Made one-shot configuration collection wait for completion and report failures. Docker startup and completed Linux updates tolerate a failed initial or post-update configuration request.
 - Restored query sample collection before one-shot query optimization reports.
@@ -275,3 +275,12 @@
 - Updated GitHub Actions dependencies and replaced the S3 upload action with AWS CLI publication that fails the workflow on upload errors. CI now runs release-publication, Docker, and offline PowerShell regression checks.
 - Added PostgreSQL EXPLAIN permission-hint regression tests, including SELECT row-locking and substring expressions.
 - Bumped agent, installer, management script, and related test versions to 1.26.1.
+
+## 1.26.2
+
+- Fixed PostgreSQL query statistics mixing standalone queries with executions inside functions or EXPLAIN ANALYZE when execution-level information is available.
+- Reduced duplicate PostgreSQL EXPLAIN operations by sharing plans and errors for matching statements across execution levels.
+- Added the original PostgreSQL query ID (`pg_queryid`) and execution level (`toplevel`) to query metrics. Older `pg_stat_statements` versions without execution-level information report `toplevel: null` and retain combined statistics.
+- Updated the agent, installers, and management scripts to 1.26.2.
+
+**Upgrade note:** PostgreSQL queries use new Releem IDs in this release. After upgrading, query history is recorded under the new IDs; existing history remains under the previous IDs. Statistics from different database users remain combined.

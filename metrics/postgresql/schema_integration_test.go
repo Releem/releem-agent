@@ -227,7 +227,7 @@ func TestCollectPgStatStatementsAgainstPostgres(t *testing.T) {
 				if stat.Calls != row.Calls || !pgTimingsClose(stat.TotalExecTimeUS, row.TotalExecTimeUS) || !pgTimingsClose(stat.MeanExecTimeUS, row.MeanExecTimeUS) {
 					t.Fatalf("lightweight PGSS statistics = %#v, want full profile statistics %#v", stat, row.PostgresQueryStats)
 				}
-				assertExactPostgresMetricKeys(t, stat.metricGroupValue(), "datname", "queryid", "calls", "total_exec_time_us", "mean_exec_time_us")
+				assertExactPostgresMetricKeys(t, stat.metricGroupValue(), "datname", "queryid", "pg_queryid", "toplevel", "calls", "total_exec_time_us", "mean_exec_time_us")
 				return
 			}
 			t.Fatalf("probe query %s was not found in lightweight PGSS payload: %#v", row.QueryID, stats)

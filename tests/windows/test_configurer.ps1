@@ -481,7 +481,7 @@ $global:LASTEXITCODE = 0
             $script:pointer = $case.Version
             $script:installerOverride = $override
             $InstallerScriptUrl = if ($override) { $override } else { "$DownloadBaseUrl/install.ps1" }
-            $ScriptVersion = '1.26.1'; $apikey = 'delegation-test-key'; $script:ExitCode = 99
+            $ScriptVersion = '1.26.2'; $apikey = 'delegation-test-key'; $script:ExitCode = 99
             & $dispatchBody
             Assert-Code 0 $script:ExitCode 'configurer update succeeded'
             Assert-Code 1 $script:delegated 'installer invoked once'

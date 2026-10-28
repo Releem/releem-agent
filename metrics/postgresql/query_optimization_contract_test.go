@@ -85,8 +85,8 @@ func TestCollectPostgresQueryDetailsSkipsNullQueryIDAndPreservesValidRows(t *tes
 	}
 
 	want := []PostgresQueryDetail{
-		{PostgresQueryStats: PostgresQueryStats{Datname: "app", QueryID: "42", Calls: 3, TotalExecTimeUS: 9000, MeanExecTimeUS: 3000}, Query: "SELECT 42", Rows: 12},
-		{PostgresQueryStats: PostgresQueryStats{Datname: "analytics", QueryID: "84", Calls: 2, TotalExecTimeUS: 4000, MeanExecTimeUS: 2000}, Query: "SELECT 84", Rows: 8},
+		{PostgresQueryStats: PostgresQueryStats{Datname: "app", QueryID: postgresQueryIdentity("16384", "42", sql.NullBool{}), PgQueryID: "42", TopLevel: sql.NullBool{}, Calls: 3, TotalExecTimeUS: 9000, MeanExecTimeUS: 3000}, Query: "SELECT 42", Rows: 12},
+		{PostgresQueryStats: PostgresQueryStats{Datname: "analytics", QueryID: postgresQueryIdentity("16385", "84", sql.NullBool{}), PgQueryID: "84", TopLevel: sql.NullBool{}, Calls: 2, TotalExecTimeUS: 4000, MeanExecTimeUS: 2000}, Query: "SELECT 84", Rows: 8},
 	}
 	if !reflect.DeepEqual(details, want) {
 		t.Fatalf("valid pg_stat_statements rows: got %#v want %#v", details, want)
@@ -267,14 +267,14 @@ func (pgNullQueryIDConn) Begin() (driver.Tx, error) {
 func (pgNullQueryIDConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	if !strings.Contains(query, "WHERE s.queryid IS NOT NULL") {
 		return &pgNullQueryIDRows{rows: [][]driver.Value{
-			{"app", nil, "SELECT discarded", int64(1), float64(1000), float64(1000), int64(1)},
-			{"app", "42", "SELECT 42", int64(3), float64(9000), float64(3000), int64(12)},
-			{"analytics", "84", "SELECT 84", int64(2), float64(4000), float64(2000), int64(8)},
+			{"app", "16384", nil, nil, "SELECT discarded", int64(1), float64(1000), float64(1000), int64(1)},
+			{"app", "16384", "42", nil, "SELECT 42", int64(3), float64(9000), float64(3000), int64(12)},
+			{"analytics", "16385", "84", nil, "SELECT 84", int64(2), float64(4000), float64(2000), int64(8)},
 		}}, nil
 	}
 	return &pgNullQueryIDRows{rows: [][]driver.Value{
-		{"app", "42", "SELECT 42", int64(3), float64(9000), float64(3000), int64(12)},
-		{"analytics", "84", "SELECT 84", int64(2), float64(4000), float64(2000), int64(8)},
+		{"app", "16384", "42", nil, "SELECT 42", int64(3), float64(9000), float64(3000), int64(12)},
+		{"analytics", "16385", "84", nil, "SELECT 84", int64(2), float64(4000), float64(2000), int64(8)},
 	}}, nil
 }
 
@@ -284,7 +284,7 @@ type pgNullQueryIDRows struct {
 }
 
 func (r *pgNullQueryIDRows) Columns() []string {
-	return []string{"datname", "queryid", "query", "calls", "total_exec_time_us", "mean_exec_time_us", "rows"}
+	return []string{"datname", "dbid", "pg_queryid", "toplevel", "query", "calls", "total_exec_time_us", "mean_exec_time_us", "rows"}
 }
 
 func (r *pgNullQueryIDRows) Close() error { return nil }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mysqlconfigurer.sh - Version 1.26.1
+# mysqlconfigurer.sh - Version 1.26.2
 # Compatibility entry point for existing cron jobs and agent commands.
 # Old installers download only this file, so fetch the implementation if absent.
 releem_configurer_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1

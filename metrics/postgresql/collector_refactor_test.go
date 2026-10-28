@@ -201,6 +201,7 @@ func TestDBMetricsBasePublishesLightweightQueryPayload(t *testing.T) {
 	capabilities := &PostgresCapabilities{detect: func(context.Context, *sql.DB) (PostgresCapabilitySnapshot, error) {
 		return PostgresCapabilitySnapshot{
 			ServerVersionNum:         140000,
+			PgStatStatementsColumns:  map[string]struct{}{"toplevel": {}},
 			PgStatStatementsRelation: `"public"."pg_stat_statements"`,
 			TimingColumn:             "total_exec_time",
 			HasRows:                  true,
@@ -218,7 +219,9 @@ func TestDBMetricsBasePublishesLightweightQueryPayload(t *testing.T) {
 	query := metrics.DB.Queries[0]
 	want := models.MetricGroupValue{
 		"datname":            "app",
-		"queryid":            "42",
+		"queryid":            postgresQueryIdentity("16384", "42", sql.NullBool{Bool: true, Valid: true}),
+		"pg_queryid":         "42",
+		"toplevel":           true,
 		"calls":              uint64(3),
 		"total_exec_time_us": float64(9000),
 		"mean_exec_time_us":  float64(3000),
@@ -259,7 +262,7 @@ func (pgBaseLightweightConn) QueryContext(_ context.Context, query string, _ []d
 	case strings.Contains(query, "COUNT(*) FROM"):
 		return &pgExplainRows{columns: []string{"count"}, rows: [][]driver.Value{{int64(1)}}}, nil
 	case strings.Contains(query, `FROM "public"."pg_stat_statements" s`):
-		return &pgExplainRows{columns: []string{"datname", "queryid", "calls", "total_exec_time_us", "mean_exec_time_us"}, rows: [][]driver.Value{{"app", "42", int64(3), float64(9000), float64(3000)}}}, nil
+		return &pgExplainRows{columns: []string{"datname", "dbid", "pg_queryid", "toplevel", "calls", "total_exec_time_us", "mean_exec_time_us"}, rows: [][]driver.Value{{"app", "16384", "42", true, int64(3), float64(9000), float64(3000)}}}, nil
 	case strings.Contains(query, "FROM pg_stat_activity"):
 		return &pgExplainRows{columns: []string{"pid"}}, nil
 	default:

@@ -12,7 +12,7 @@ setup() {
         script && /^    - name:/ { exit }
         script { sub(/^        /, ""); print }
     ' "$repo_root/.github/workflows/go.yml" > "$TEST_TMPDIR/publish.sh"
-    printf '1.26.1\n' > "$TEST_TMPDIR/source/current_version_agent"
+    printf '1.26.2\n' > "$TEST_TMPDIR/source/current_version_agent"
     cp "$TEST_TMPDIR/source/current_version_agent" "$TEST_TMPDIR/v2/current_version_agent"
     cp "$repo_root/install.sh" "$TEST_TMPDIR/v2/install.sh"
     local name
@@ -44,7 +44,7 @@ EOF
 reset_publication() {
     rm -rf "$PUBLIC_STORE"
     mkdir -p "$PUBLIC_STORE/v2"
-    printf '1.26.1\n' > "$PUBLIC_STORE/v2/current_version_agent"
+    printf '1.26.2\n' > "$PUBLIC_STORE/v2/current_version_agent"
     local name
     for name in "$TEST_TMPDIR/v2/"*; do
         [ "${name##*/}" != current_version_agent ] || continue
@@ -59,7 +59,7 @@ teardown() { rm -rf "$TEST_TMPDIR"; }
     cd "$TEST_TMPDIR/source"
     run env PATH="$TEST_TMPDIR/bin:$PATH" AWS_BUCKET=test-release bash -e "$TEST_TMPDIR/publish.sh"
     [ "$status" -eq 0 ]
-    [ "$(cat "$PUBLIC_STORE/v2/current_version_agent")" = 1.26.1 ]
+    [ "$(cat "$PUBLIC_STORE/v2/current_version_agent")" = 1.26.2 ]
     [ ! -d "$PUBLIC_STORE/v2/releases" ]
     local name
     for name in "$TEST_TMPDIR/v2/"*; do
@@ -101,7 +101,7 @@ teardown() { rm -rf "$TEST_TMPDIR"; }
             if [ "$failure_seen" -eq 0 ]; then
                 cmp "$TEST_TMPDIR/v2/$name" "$PUBLIC_STORE/v2/$name"
             elif [ "$name" = current_version_agent ]; then
-                [ "$(cat "$PUBLIC_STORE/v2/$name")" = 1.26.1 ]
+                [ "$(cat "$PUBLIC_STORE/v2/$name")" = 1.26.2 ]
             else
                 [ "$(cat "$PUBLIC_STORE/v2/$name")" = legacy-installer ]
             fi

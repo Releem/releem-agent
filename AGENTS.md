@@ -99,6 +99,12 @@ cd tests
 
 ## Creating a Release
 
+- Write release notes in concise, user-facing release language. Describe the
+  changed behavior and its benefit; omit implementation details unless they
+  matter for operation or compatibility.
+- Put upgrade requirements, compatibility changes, and effects on existing data
+  or history in a separate **Upgrade note:** paragraph.
+
 1. Bump the version everywhere: `config/config.go` (`ReleemAgentVersion`),
    `install.sh` (header + `install_script_version`), `releem.sh`
    (header + `VERSION`), `mysqlconfigurer.sh` (compatibility header),
