@@ -103,7 +103,7 @@ Check the [supported databases, versions and permissions](https://docs.releem.co
 - **Azure Database for MySQL.**
 - **Hosting and clusters:** MySQL/MariaDB clusters and WHM/cPanel.
 
-Choose the installation path for [MySQL](https://docs.releem.com/installation/mysql), [MariaDB](https://docs.releem.com/installation/mariadb) or [PostgreSQL](https://docs.releem.com/installation/postgresql). Environment options, features and automated actions depend on the database, version, deployment, permissions and plan. The list above does not imply that every database is available in every environment.
+Choose the installation path for [MySQL](https://docs.releem.com/installation/mysql), [MariaDB](https://docs.releem.com/installation/mariadb) or [PostgreSQL](https://docs.releem.com/installation/postgresql). Environment options, features and automated actions depend on the database, version, deployment, permissions and plan.
 
 ## 🧪 Performance tests
 
