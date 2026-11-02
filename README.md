@@ -44,13 +44,21 @@ This repository contains the open-source **Releem Agent**, which connects your d
 See the [configuration tuning process](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) and [schema execution workflow](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) for supported changes and application steps.
 
 <p align="center">
-  <strong>Apply a configuration through Releem</strong><br /><br />
+  <strong>Apply a configuration through Releem Dashboard</strong><br /><br />
   <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying-click.gif" width="80%" alt="Applying a configuration through Releem" />
 </p>
 
 <p align="center">
-  <strong>Apply a configuration with the Releem Agent</strong><br /><br />
+  <strong>Apply a configuration with the Releem Agent cli</strong><br /><br />
   <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying.gif" width="80%" alt="Applying a configuration with the Releem Agent" />
+</p>
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">
+    <img src="https://img.youtube.com/vi/Pd-DUK0so9Y/hqdefault.jpg" width="480" alt="Watch how to find and apply missing MySQL indexes with Releem" />
+  </a>
+  <br />
+  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">▶ Watch: Find and apply missing MySQL indexes with Releem</a>
 </p>
 
 ## 🧭 How it works
@@ -61,14 +69,6 @@ See the [configuration tuning process](https://docs.releem.com/recommendations/c
 4. **Recommends query, index and configuration changes.** Presents proposed improvements with explanations for your team to review.
 5. **Helps apply supported changes.** Apply supported configuration and approved schema changes through controlled automation.
 6. **Helps you measure the impact.** Compare query performance, resource use and effective settings after a change.
-
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">
-    <img src="https://img.youtube.com/vi/Pd-DUK0so9Y/hqdefault.jpg" width="480" alt="Watch how to find and apply missing MySQL indexes with Releem" />
-  </a>
-  <br />
-  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">▶ Watch: Find and apply missing MySQL indexes with Releem</a>
-</p>
 
 <a name="getting-started"></a>
 
