@@ -44,10 +44,12 @@ This repository contains the open-source **Releem Agent**, which connects your d
 See the [configuration tuning process](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) and [schema execution workflow](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) for supported changes and application steps.
 
 <p align="center">
+  <strong>Apply a configuration through Releem</strong><br /><br />
   <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying-click.gif" width="80%" alt="Applying a configuration through Releem" />
 </p>
 
 <p align="center">
+  <strong>Apply a configuration with the Releem Agent</strong><br /><br />
   <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying.gif" width="80%" alt="Applying a configuration with the Releem Agent" />
 </p>
 
