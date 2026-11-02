@@ -60,6 +60,14 @@ See the [configuration tuning process](https://docs.releem.com/recommendations/c
 5. **Helps apply supported changes.** Apply supported configuration and approved schema changes through controlled automation.
 6. **Helps you measure the impact.** Compare query performance, resource use and effective settings after a change.
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">
+    <img src="https://img.youtube.com/vi/Pd-DUK0so9Y/hqdefault.jpg" width="480" alt="Watch how to find and apply missing MySQL indexes with Releem" />
+  </a>
+  <br />
+  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">▶ Watch: Find and apply missing MySQL indexes with Releem</a>
+</p>
+
 <a name="getting-started"></a>
 
 ## 🚀 Getting started with Releem
