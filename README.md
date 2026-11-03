@@ -44,21 +44,28 @@ This repository contains the open-source **Releem Agent**, which connects your d
 See the [configuration tuning process](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) and [schema execution workflow](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) for supported changes and application steps.
 
 <p align="center">
-  <strong>Apply a configuration through Releem Dashboard</strong><br /><br />
-  <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying-click.gif" width="80%" alt="Applying a configuration through Releem" />
-</p>
-
-<p align="center">
-  <strong>Apply a configuration with the Releem Agent cli</strong><br /><br />
-  <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying.gif" width="80%" alt="Applying a configuration with the Releem Agent" />
-</p>
-
-<p align="center">
+  <strong>Find and apply missing Indexes with Releem</strong><br /><br />
   <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">
     <img src="https://img.youtube.com/vi/Pd-DUK0so9Y/hqdefault.jpg" width="480" alt="Watch how to find and apply missing MySQL indexes with Releem" />
   </a>
   <br />
   <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">▶ Watch: Find and apply missing MySQL indexes with Releem</a>
+</p>
+
+<p align="center">
+  <strong>Apply a recommended MySQL configuration</strong><br /><br />
+  <a href="https://youtu.be/XqBZPGRlrGs">
+    <img src="https://raw.githubusercontent.com/Releem/docs/main/assets/images/applying-conf-dark.gif"
+         width="80%"
+         alt="Releem dashboard showing how to review the rationale, check whether a restart is required, and apply a recommended MySQL configuration" />
+  </a>
+  <br />
+  <a href="https://youtu.be/XqBZPGRlrGs">▶ Watch the 15-second demo on YouTube</a>
+</p>
+
+<p align="center">
+  <strong>Apply a configuration with the Releem Agent cli</strong><br /><br />
+  <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying.gif" width="80%" alt="Applying a configuration with the Releem Agent" />
 </p>
 
 ## 🧭 How it works
