@@ -47,19 +47,19 @@ Repositori ini berisi **Releem Agent** sumber terbuka, yang menghubungkan basis 
 ## ⚡ Mengapa Releem?
 
 - **[Optimasi kueri dan indeks](https://releem.com/sql-query-optimization):** Tinjau rekomendasi kueri dan [indeks](https://docs.releem.com/recommendations) berdasarkan beban kerja untuk meningkatkan kinerja kueri MySQL.
-- **[Penyetelan konfigurasi MySQL](https://releem.com/mysql-configuration-tuning):** Tinjau pengaturan berdasarkan beban kerja, dengan penyetelan yang ditingkatkan melalui pembelajaran mesin, untuk meningkatkan efisiensi sumber daya.
-- **Otomatisasi terkendali:** Terapkan perubahan konfigurasi yang didukung serta perubahan skema yang telah disetujui dan memenuhi syarat melalui alur kerja yang terdokumentasi, sehingga tim Anda tetap mengendalikan apa yang diubah dan kapan perubahan dilakukan.
+- **[Penyetelan konfigurasi MySQL](https://releem.com/mysql-configuration-tuning):** Tinjau rekomendasi konfigurasi berdasarkan beban kerja. Pembelajaran mesin membantu menyetel konfigurasi agar sumber daya digunakan lebih efisien.
+- **Otomatisasi terkendali:** Terapkan perubahan konfigurasi yang direkomendasikan dan perubahan skema yang telah disetujui, dengan tim Anda tetap mengendalikan apa yang diubah dan kapan perubahan dilakukan.
 - **[Pemantauan dan pemeriksaan kesehatan](https://releem.com/health-checks):** Gunakan metrik basis data dan pemeriksaan kesehatan untuk mengidentifikasi hal yang perlu ditangani, lalu bandingkan kinerja dan penggunaan sumber daya yang teramati setelah perubahan.
 
-Lihat [proses penyetelan konfigurasi](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) dan [alur kerja eksekusi perubahan skema](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) untuk mengetahui perubahan yang didukung dan langkah penerapannya.
+Lihat [proses penyetelan konfigurasi](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) dan [alur kerja eksekusi perubahan skema](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) untuk langkah-langkah penerapan konfigurasi dan perubahan skema yang telah disetujui.
 
 <p align="center">
-  <strong>Temukan dan terapkan indeks MySQL yang belum tersedia dengan Releem</strong><br /><br />
+  <strong>Temukan dan tambahkan indeks MySQL yang belum ada dengan Releem</strong><br /><br />
   <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">
-    <img src="https://img.youtube.com/vi/Pd-DUK0so9Y/hqdefault.jpg" width="480" alt="Lihat cara menemukan dan menerapkan indeks MySQL yang belum tersedia dengan Releem" />
+    <img src="https://img.youtube.com/vi/Pd-DUK0so9Y/hqdefault.jpg" width="480" alt="Lihat cara menemukan dan menambahkan indeks MySQL yang belum ada dengan Releem" />
   </a>
   <br />
-  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">▶ Tonton: temukan dan terapkan indeks MySQL yang belum tersedia dengan Releem</a>
+  <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">▶ Tonton: temukan dan tambahkan indeks MySQL yang belum ada dengan Releem</a>
 </p>
 
 <p align="center">
@@ -84,7 +84,7 @@ Lihat [proses penyetelan konfigurasi](https://docs.releem.com/recommendations/co
 2. **Mengidentifikasi peluang optimasi kinerja.** Menampilkan kueri yang lambat atau sering dijalankan serta temuan konfigurasi yang dapat memengaruhi kinerja.
 3. **Membantu menentukan prioritas penanganan.** Menggunakan pengamatan beban kerja dan temuan untuk membantu Anda memilih hal yang perlu ditangani terlebih dahulu.
 4. **Merekomendasikan perubahan kueri, indeks, dan konfigurasi.** Menyajikan usulan perbaikan beserta penjelasan untuk ditinjau oleh tim Anda.
-5. **Membantu menerapkan perubahan yang didukung.** Terapkan perubahan konfigurasi yang didukung dan perubahan skema yang telah disetujui melalui otomatisasi terkendali.
+5. **Membantu menerapkan perubahan konfigurasi dan skema.** Terapkan konfigurasi yang direkomendasikan dan perubahan skema yang telah disetujui melalui otomatisasi terkendali.
 6. **Membantu Anda mengukur dampaknya.** Bandingkan kinerja kueri, penggunaan sumber daya, dan pengaturan yang benar-benar berlaku setelah perubahan.
 
 <a name="getting-started"></a>
@@ -94,7 +94,7 @@ Lihat [proses penyetelan konfigurasi](https://docs.releem.com/recommendations/co
 1. **Buat akun Anda.** [Daftar ke Releem](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#).
 2. **Hubungkan basis data Anda.** Instal Releem Agent menggunakan [panduan instalasi](https://docs.releem.com/installation) yang sesuai dengan lingkungan Anda.
 3. **Periksa koneksi.** Pastikan status Agent adalah Connected dan metrik terkini sudah masuk ke dasbor.
-4. **Tinjau dan terapkan rekomendasi.** Tinjau rekomendasi kueri, indeks, dan konfigurasi, lalu terapkan perubahan yang didukung saat Anda siap.
+4. **Tinjau dan terapkan rekomendasi.** Tinjau rekomendasi kueri, indeks, dan konfigurasi, lalu terapkan konfigurasi yang direkomendasikan dan perubahan skema yang telah disetujui saat Anda siap.
 
 Lihat [paket saat ini](https://releem.com/pricing) untuk layanan yang dihosting.
 
@@ -130,7 +130,7 @@ Periksa [basis data, versi, dan izin yang didukung](https://docs.releem.com/supp
 - **Azure Database for MySQL.**
 - **Hosting dan klaster:** Klaster MySQL/MariaDB dan WHM/cPanel.
 
-Pilih panduan instalasi untuk [MySQL](https://docs.releem.com/installation/mysql), [MariaDB](https://docs.releem.com/installation/mariadb) atau [PostgreSQL](https://docs.releem.com/installation/postgresql). Pilihan lingkungan, fitur, dan tindakan otomatis bergantung pada basis data, versi, cara penerapan, izin, dan paket.
+Pilih panduan instalasi untuk [MySQL](https://docs.releem.com/installation/mysql), [MariaDB](https://docs.releem.com/installation/mariadb) atau [PostgreSQL](https://docs.releem.com/installation/postgresql). Pilihan lingkungan, fitur, dan tindakan otomatis bergantung pada basis data, versi, jenis deployment, izin, dan paket.
 
 ## 🧪 Pengujian kinerja
 
@@ -145,7 +145,7 @@ Artikel historis ini menjelaskan lingkungan benchmark dan perbandingan konfigura
 Repositori ini adalah tempat publik untuk masukan, laporan masalah, dan diskusi roadmap seluruh produk Releem, termasuk dasbor, rekomendasi, integrasi, dan Agent.
 
 - **🤝 Dapatkan bantuan:** Bergabunglah dengan [Komunitas Releem di Slack](https://join.slack.com/t/releem-community/shared_invite/zt-1j3d0vosh-AJHbDiQrzVDvLat5eqQorQ) untuk bertanya, berdiskusi dengan komunitas, dan mendapatkan bantuan penyiapan.
-- **🐛 Laporkan bug:** Cari di [Issues](https://github.com/Releem/releem-agent/issues) sebelum melaporkan masalah. Sertakan komponen yang terdampak, versi basis data, cara penerapan, dan langkah untuk mereproduksi masalah.
+- **🐛 Laporkan bug:** Cari di [Issues](https://github.com/Releem/releem-agent/issues) sebelum melaporkan masalah. Sertakan komponen yang terdampak, versi basis data, jenis deployment, dan langkah untuk mereproduksi masalah.
 - **💡 Usulkan perbaikan dan diskusikan prioritas roadmap:** Gunakan [Discussions](https://github.com/Releem/releem-agent/discussions) untuk menjelaskan kasus penggunaan dan hasil yang Anda butuhkan.
 
 Hapus kredensial, informasi pribadi, dan detail sensitif tentang kueri atau skema dari laporan publik.

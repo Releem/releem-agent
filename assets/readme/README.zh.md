@@ -2,7 +2,7 @@
 
 **结合 AI 与受控自动化的 MySQL 性能调优工具**
 
-Releem 是一款结合 AI 与受控自动化的 MySQL 性能调优工具，也是从首次调优决策起持续协助您的数据库顾问。
+Releem 是一款结合 AI 与受控自动化的 MySQL 性能调优工具。从首次调优开始，它就作为数据库顾问，为您提供持续协助。
 
 适用于负责生产环境 MySQL 性能的工程师、DBA 和基础设施团队。通过基于工作负载的建议改善查询性能和资源使用效率，并随着查询、流量和数据的变化，重新评估需要关注的问题。
 
@@ -47,11 +47,11 @@ Releem 是一款结合 AI 与受控自动化的 MySQL 性能调优工具，也�
 ## ⚡ 为什么选择 Releem？
 
 - **[查询与索引优化](https://releem.com/sql-query-optimization):** 查看基于工作负载的查询建议与[索引建议](https://docs.releem.com/recommendations)，以改善 MySQL 查询性能。
-- **[MySQL 配置调优](https://releem.com/mysql-configuration-tuning):** 查看基于工作负载的设置，并通过机器学习增强调优，以改善资源使用效率。
-- **受控自动化:** 通过文档说明的工作流程，应用受支持的配置变更以及已获批准且符合条件的数据库结构变更，让团队掌控变更内容和时机。
+- **[MySQL 配置调优](https://releem.com/mysql-configuration-tuning):** 查看根据工作负载给出的配置建议，借助机器学习辅助调优，提高资源使用效率。
+- **受控自动化:** 应用建议的配置变更和已获批准的数据库结构变更，让团队掌控变更内容和时机。
 - **[监控与健康检查](https://releem.com/health-checks):** 使用数据库指标和健康检查，识别需要关注的问题，并比较变更后实际观测到的性能和资源使用情况。
 
-有关受支持的变更及应用步骤，请参阅[配置调优过程](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process)和[数据库结构变更执行流程](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes)。
+有关应用配置和已获批准的数据库结构变更的步骤，请参阅[配置调优过程](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process)和[数据库结构变更执行流程](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes)。
 
 <p align="center">
   <strong>使用 Releem 查找并创建缺失的 MySQL 索引</strong><br /><br />
@@ -84,7 +84,7 @@ Releem 是一款结合 AI 与受控自动化的 MySQL 性能调优工具，也�
 2. **识别性能调优机会。** 找出慢查询、频繁执行的查询，以及可能影响性能的配置问题。
 3. **帮助确定处理优先级。** 利用工作负载观测结果和发现的问题，帮助选择优先处理的事项。
 4. **建议查询、索引和配置变更。** 提供附带说明的改进建议，供团队审核。
-5. **帮助应用受支持的变更。** 通过受控自动化，应用受支持的配置变更和已获批准的数据库结构变更。
+5. **帮助应用配置和数据库结构变更。** 通过受控自动化，应用建议的配置和已获批准的数据库结构变更。
 6. **帮助衡量影响。** 比较变更后的查询性能、资源使用情况和实际生效的设置。
 
 <a name="getting-started"></a>
@@ -94,7 +94,7 @@ Releem 是一款结合 AI 与受控自动化的 MySQL 性能调优工具，也�
 1. **创建账户。** [注册 Releem](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#)。
 2. **连接数据库。** 按照适用于您环境的[安装指南](https://docs.releem.com/installation)安装 Releem Agent。
 3. **检查连接。** 确认 Agent 状态为 Connected，且控制台正在接收当前指标。
-4. **审核并应用建议。** 审核查询、索引和配置建议，并在准备好后应用受支持的变更。
+4. **审核并应用建议。** 审核查询、索引和配置建议，并在准备好后应用建议的配置和已获批准的数据库结构变更。
 
 有关托管服务，请查看[当前套餐](https://releem.com/pricing)。
 

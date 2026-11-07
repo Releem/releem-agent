@@ -47,11 +47,11 @@ Este repositorio contiene **Releem Agent**, de código abierto, que conecta tu b
 ## ⚡ ¿Por qué Releem?
 
 - **[Optimización de consultas e índices](https://releem.com/sql-query-optimization):** Revisa las recomendaciones sobre consultas e [índices basadas en la carga de trabajo](https://docs.releem.com/recommendations) para mejorar el rendimiento de las consultas MySQL.
-- **[Ajuste de configuración de MySQL](https://releem.com/mysql-configuration-tuning):** Revisa los ajustes basados en la carga de trabajo, con tuning MySQL apoyado en aprendizaje automático, para usar los recursos de forma más eficiente.
-- **Automatización controlada:** Aplica los cambios de configuración admitidos y los cambios de esquema compatibles y aprobados mediante los procesos documentados. Tu equipo conserva el control sobre qué se cambia y cuándo.
+- **[Ajuste de configuración de MySQL](https://releem.com/mysql-configuration-tuning):** Revisa las recomendaciones de configuración basadas en la carga de trabajo. El aprendizaje automático ayuda a afinar la configuración para usar los recursos de forma más eficiente.
+- **Automatización controlada:** Aplica los cambios de configuración recomendados y los cambios de esquema aprobados. Tu equipo conserva el control sobre qué se cambia y cuándo.
 - **[Monitorización y comprobaciones de estado](https://releem.com/health-checks):** Usa las métricas y las comprobaciones de estado de la base de datos para identificar qué necesita atención y comparar el rendimiento observado y el uso de recursos después de los cambios.
 
-Consulta el [proceso de ajuste de la configuración](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) y el [proceso de aplicación de cambios de esquema](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) para conocer los cambios admitidos y los pasos para aplicarlos.
+Consulta el [proceso de ajuste de la configuración](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) y el [proceso de aplicación de cambios de esquema](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) para aplicar configuraciones y cambios de esquema aprobados paso a paso.
 
 <p align="center">
   <strong>Encuentra y añade los índices que faltan en MySQL con Releem</strong><br /><br />
@@ -84,8 +84,8 @@ Consulta el [proceso de ajuste de la configuración](https://docs.releem.com/rec
 2. **Identifica oportunidades de optimización del rendimiento.** Destaca consultas lentas o frecuentes y hallazgos de configuración que pueden afectar al rendimiento.
 3. **Ayuda a establecer prioridades.** Usa las observaciones sobre la carga de trabajo y los hallazgos para ayudarte a decidir qué abordar primero.
 4. **Recomienda cambios en consultas, índices y configuración.** Presenta propuestas de mejora con explicaciones para que tu equipo las revise.
-5. **Ayuda a aplicar los cambios admitidos.** Aplica los cambios de configuración admitidos y los cambios de esquema aprobados mediante automatización controlada.
-6. **Ayuda a medir el efecto.** Compara el rendimiento de las consultas, el uso de recursos y los ajustes efectivos después de un cambio.
+5. **Ayuda a aplicar cambios de configuración y de esquema.** Aplica las configuraciones recomendadas y los cambios de esquema aprobados mediante automatización controlada.
+6. **Ayuda a medir el efecto.** Compara el rendimiento de las consultas, el uso de recursos y los valores de configuración en uso después de un cambio.
 
 <a name="getting-started"></a>
 
@@ -94,7 +94,7 @@ Consulta el [proceso de ajuste de la configuración](https://docs.releem.com/rec
 1. **Crea tu cuenta.** [Regístrate en Releem](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#).
 2. **Conecta tu base de datos.** Instala Releem Agent siguiendo la [guía de instalación](https://docs.releem.com/installation) correspondiente a tu entorno.
 3. **Comprueba la conexión.** Confirma que el estado del Agent sea Connected y que el panel reciba métricas actualizadas.
-4. **Revisa y aplica las recomendaciones.** Revisa las recomendaciones sobre consultas, índices y configuración, y aplica los cambios admitidos cuando estés preparado.
+4. **Revisa y aplica las recomendaciones.** Revisa las recomendaciones sobre consultas, índices y configuración, y aplica las configuraciones recomendadas y los cambios de esquema aprobados cuando estés preparado.
 
 Consulta los [planes actuales](https://releem.com/pricing) del servicio alojado.
 

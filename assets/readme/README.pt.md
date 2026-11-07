@@ -38,7 +38,7 @@ Para engenheiros, DBAs e equipes de infraestrutura responsáveis pelo desempenho
   <a href="#security">Segurança</a>
 </p>
 
-Este repositório contém o **Releem Agent** de código aberto, que conecta seu banco de dados ao serviço de assinatura hospedado do Releem. Ele também reúne feedback, Issues e discussões sobre o roadmap de todo o produto Releem.
+Este repositório contém o **Releem Agent** de código aberto, que conecta seu banco de dados ao serviço hospedado do Releem, oferecido por assinatura. O repositório também reúne feedback, Issues e discussões sobre o roadmap de todo o produto Releem.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem_dashboard.png" width="90%" alt="Painel do Releem" />
@@ -47,11 +47,11 @@ Este repositório contém o **Releem Agent** de código aberto, que conecta seu 
 ## ⚡ Por que usar o Releem?
 
 - **[Otimização de consultas e índices](https://releem.com/sql-query-optimization):** Analise recomendações de consultas e [índices](https://docs.releem.com/recommendations) baseadas na carga de trabalho para melhorar o desempenho das consultas MySQL.
-- **[Ajuste da configuração do MySQL](https://releem.com/mysql-configuration-tuning):** Analise configurações baseadas na carga de trabalho, com ajustes aprimorados por aprendizado de máquina, para melhorar a eficiência no uso de recursos.
-- **Automação controlada:** Aplique alterações de configuração compatíveis e alterações de esquema aprovadas e elegíveis pelos fluxos documentados. Sua equipe mantém o controle sobre o que muda e quando.
+- **[Ajuste da configuração do MySQL](https://releem.com/mysql-configuration-tuning):** Analise as recomendações de configuração baseadas na carga de trabalho. O aprendizado de máquina ajuda a refinar a configuração para usar os recursos de forma mais eficiente.
+- **Automação controlada:** Aplique alterações de configuração recomendadas e alterações de esquema aprovadas. Sua equipe mantém o controle sobre o que muda e quando.
 - **[Monitoramento e verificações de integridade](https://releem.com/health-checks):** Use métricas do banco de dados e verificações de integridade para identificar o que precisa de atenção e comparar o desempenho observado e o uso de recursos após as alterações.
 
-Consulte o [processo de ajuste da configuração](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) e o [fluxo de execução de alterações de esquema](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) para conhecer as alterações compatíveis e as etapas de aplicação.
+Consulte o [processo de ajuste da configuração](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) e o [fluxo de execução de alterações de esquema](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) para ver as etapas de aplicação de configurações e alterações de esquema aprovadas.
 
 <p align="center">
   <strong>Encontre e aplique os índices MySQL que faltam com o Releem</strong><br /><br />
@@ -81,10 +81,10 @@ Consulte o [processo de ajuste da configuração](https://docs.releem.com/recomm
 ## 🧭 Como funciona
 
 1. **Analisa a carga de trabalho do MySQL.** Coleta a atividade das consultas, as configurações do banco de dados e as métricas de recursos para entender como seu banco de dados funciona.
-2. **Identifica oportunidades de otimização de desempenho.** Destaca consultas lentas ou executadas com frequência e constatações de configuração que podem afetar o desempenho.
-3. **Ajuda a definir prioridades.** Usa observações da carga de trabalho e as constatações para ajudar você a escolher o que tratar primeiro.
+2. **Identifica oportunidades de otimização de desempenho.** Destaca consultas lentas ou executadas com frequência e pontos de atenção na configuração que podem afetar o desempenho.
+3. **Ajuda a definir prioridades.** Usa as observações da carga de trabalho e os pontos de atenção identificados para ajudar você a escolher o que tratar primeiro.
 4. **Recomenda alterações em consultas, índices e configurações.** Apresenta melhorias propostas com explicações para sua equipe avaliar.
-5. **Ajuda a aplicar alterações compatíveis.** Aplique alterações de configuração compatíveis e alterações de esquema aprovadas por meio de automação controlada.
+5. **Ajuda a aplicar alterações de configuração e esquema.** Aplique configurações recomendadas e alterações de esquema aprovadas por meio de automação controlada.
 6. **Ajuda a medir o impacto.** Compare o desempenho das consultas, o uso de recursos e as configurações efetivas após uma alteração.
 
 <a name="getting-started"></a>
@@ -94,7 +94,7 @@ Consulte o [processo de ajuste da configuração](https://docs.releem.com/recomm
 1. **Crie sua conta.** [Cadastre-se no Releem](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#).
 2. **Conecte seu banco de dados.** Instale o Releem Agent usando o [guia de instalação](https://docs.releem.com/installation) adequado ao seu ambiente.
 3. **Verifique a conexão.** Confirme que o status do Agent é Connected e que as métricas atuais estão chegando ao painel.
-4. **Analise e aplique as recomendações.** Analise as recomendações de consultas, índices e configurações. Depois, aplique as alterações compatíveis quando estiver pronto.
+4. **Analise e aplique as recomendações.** Analise as recomendações de consultas, índices e configurações. Depois, aplique as configurações recomendadas e as alterações de esquema aprovadas quando estiver pronto.
 
 Consulte os [planos atuais](https://releem.com/pricing) do serviço hospedado.
 
@@ -104,7 +104,7 @@ Consulte os [planos atuais](https://releem.com/pricing) do serviço hospedado.
 
 Dependendo do banco de dados e dos recursos habilitados, as informações coletadas podem incluir estatísticas de recursos do sistema, configurações e status do banco de dados, nomes de esquemas e tabelas, estrutura e índices, estatísticas de execução de consultas, exemplos de consultas e planos EXPLAIN.
 
-Antes de conectar, confira os privilégios exigidos pelo seu banco de dados e pelos recursos habilitados. Leia as [perguntas frequentes sobre segurança dos dados](https://releem.com/faq) para saber mais sobre a coleta e o transporte de dados pelo Agent, além da documentação de compatibilidade abaixo para os requisitos específicos de cada mecanismo.
+Antes de conectar, confira os privilégios exigidos pelo seu banco de dados e pelos recursos habilitados. Leia as [perguntas frequentes sobre segurança dos dados](https://releem.com/faq) para saber mais sobre a coleta e o transporte de dados pelo Agent. Consulte a documentação de compatibilidade abaixo para conhecer os requisitos específicos de cada tipo de banco de dados.
 
 ## 🗄️ Compatibilidade
 
@@ -154,4 +154,4 @@ Acompanhe as novidades do produto no [X](https://twitter.com/releemhq) e no [Lin
 
 ## 🧩 Contribua
 
-Feedback sobre o produto e relatos de bugs reproduzíveis são bem-vindos em todo o Releem. As contribuições de código neste repositório se aplicam ao Agent. Descreva o problema, a alteração proposta e como você a verificou. Consulte a [licença](../../LICENSE) do repositório para conhecer os termos do código publicado.
+Comentários sobre qualquer parte do produto Releem e relatos de bugs reproduzíveis são bem-vindos. As contribuições de código neste repositório se aplicam ao Agent. Descreva o problema, a alteração proposta e como você a verificou. Consulte a [licença](../../LICENSE) do repositório para conhecer os termos do código publicado.

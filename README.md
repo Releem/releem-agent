@@ -48,10 +48,10 @@ This repository contains the open-source **Releem Agent**, which connects your d
 
 - **[Query and index optimization](https://releem.com/sql-query-optimization):** Review workload-based query and [index recommendations](https://docs.releem.com/recommendations) to improve MySQL query performance.
 - **[MySQL configuration tuning](https://releem.com/mysql-configuration-tuning):** Review workload-based settings, with tuning enhanced by machine learning, to improve resource efficiency.
-- **Controlled automation:** Apply supported configuration changes and eligible approved schema changes through documented workflows, keeping your team in control of what changes and when.
+- **Controlled automation:** Apply recommended configuration and approved schema changes, with your team controlling what changes and when.
 - **[Monitoring and health checks](https://releem.com/health-checks):** Use database metrics and health checks to identify what needs attention and compare observed performance and resource use after changes.
 
-See the [configuration tuning process](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) and [schema execution workflow](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) for supported changes and application steps.
+See the [configuration tuning process](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) and [schema execution workflow](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) for steps to apply configurations and approved schema changes.
 
 <p align="center">
   <strong>Find and apply missing MySQL indexes with Releem</strong><br /><br />
@@ -84,7 +84,7 @@ See the [configuration tuning process](https://docs.releem.com/recommendations/c
 2. **Identifies performance tuning opportunities.** Surfaces slow or frequently executed queries and configuration findings that may affect performance.
 3. **Helps prioritize what to address.** Uses workload observations and findings to help you choose what to address first.
 4. **Recommends query, index and configuration changes.** Presents proposed improvements with explanations for your team to review.
-5. **Helps apply supported changes.** Apply supported configuration and approved schema changes through controlled automation.
+5. **Helps apply configuration and schema changes.** Apply recommended configurations and approved schema changes through controlled automation.
 6. **Helps you measure the impact.** Compare query performance, resource use and effective settings after a change.
 
 <a name="getting-started"></a>
@@ -94,7 +94,7 @@ See the [configuration tuning process](https://docs.releem.com/recommendations/c
 1. **Create your account.** [Sign up for Releem](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#).
 2. **Connect your database.** Install the Releem Agent using the [installation guide](https://docs.releem.com/installation) for your environment.
 3. **Check the connection.** Confirm the Agent status is Connected and current metrics are arriving in the dashboard.
-4. **Review and apply recommendations.** Review query, index and configuration recommendations, then apply supported changes when you are ready.
+4. **Review and apply recommendations.** Review query, index and configuration recommendations, then apply recommended configurations and approved schema changes when you are ready.
 
 See [current plans](https://releem.com/pricing) for the hosted service.
 
