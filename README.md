@@ -20,6 +20,16 @@ For engineers, DBAs and infrastructure teams responsible for production MySQL pe
 </p>
 
 <p align="center">
+  <b>English</b> •
+  <a href="assets/readme/README.ru.md">Русский</a> •
+  <a href="assets/readme/README.es.md">Español</a> •
+  <a href="assets/readme/README.pt.md">Português</a> •
+  <a href="assets/readme/README.zh.md">简体中文</a> •
+  <a href="assets/readme/README.fr.md">Français</a> •
+  <a href="assets/readme/README.id.md">Bahasa Indonesia</a>
+</p>
+
+<p align="center">
   <a href="#getting-started">Get started</a> |
   <a href="https://docs.releem.com/">Docs</a> |
   <a href="https://releem.com/mysql-configuration-tuning">MySQL configuration tuning</a> |
@@ -44,7 +54,7 @@ This repository contains the open-source **Releem Agent**, which connects your d
 See the [configuration tuning process](https://docs.releem.com/recommendations/configuration-tuning/mysql-tuning-process) and [schema execution workflow](https://docs.releem.com/recommendations/query-optimization/automatic-schema-changes) for supported changes and application steps.
 
 <p align="center">
-  <strong>Find and apply missing Indexes with Releem</strong><br /><br />
+  <strong>Find and apply missing MySQL indexes with Releem</strong><br /><br />
   <a href="https://www.youtube.com/watch?v=Pd-DUK0so9Y">
     <img src="https://img.youtube.com/vi/Pd-DUK0so9Y/hqdefault.jpg" width="480" alt="Watch how to find and apply missing MySQL indexes with Releem" />
   </a>
@@ -64,7 +74,7 @@ See the [configuration tuning process](https://docs.releem.com/recommendations/c
 </p>
 
 <p align="center">
-  <strong>Apply a configuration with the Releem Agent cli</strong><br /><br />
+  <strong>Apply a configuration with the Releem Agent CLI</strong><br /><br />
   <img src="https://raw.githubusercontent.com/releem/docs/master/assets/images/releem-applying.gif" width="80%" alt="Applying a configuration with the Releem Agent" />
 </p>
 
@@ -82,8 +92,8 @@ See the [configuration tuning process](https://docs.releem.com/recommendations/c
 ## 🚀 Getting started with Releem
 
 1. **Create your account.** [Sign up for Releem](https://releem.com/?utm_source=github&utm_medium=link&utm_campaign=signup#).
-2. **Connect your MySQL database.** Install the Releem Agent using the [installation guide](https://docs.releem.com/installation) for your environment.
-3. **Check the connection.** Confirm the Agent is connected and current metrics are arriving in the dashboard.
+2. **Connect your database.** Install the Releem Agent using the [installation guide](https://docs.releem.com/installation) for your environment.
+3. **Check the connection.** Confirm the Agent status is Connected and current metrics are arriving in the dashboard.
 4. **Review and apply recommendations.** Review query, index and configuration recommendations, then apply supported changes when you are ready.
 
 See [current plans](https://releem.com/pricing) for the hosted service.
